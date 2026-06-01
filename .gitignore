@@ -2,3 +2,5 @@
 **/.*.sw?
 mkfs
 fsck
+mkfs.briefs
+fsck.briefs
