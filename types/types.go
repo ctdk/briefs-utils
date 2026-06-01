@@ -25,6 +25,18 @@ const (
 	DefaultBlockSize   = 4096
 	DefaultInodeSize   = 512
 	DefaultJournalSize = 64 // blocks
+
+	// Inode magic
+	InodeMagic = 0x494E4F44 // "INOD"
+
+	// Inode flags
+	InodeFlagReserved    = 0x00000001
+	InodeFlagCompressed  = 0x00000002
+	InodeFlagIndexed     = 0x00000004
+
+	// Extent flags
+	ExtentFlagHole = 0x00000001
+	ExtentFlagEof  = 0x80000000
 )
 
 // SuperblockLayout is the on-disk format (first 4KB block).
@@ -207,4 +219,154 @@ func (sb *Superblock) MarshalBinary() []byte {
 	}
 
 	return data
+}
+
+// Extent represents a file extent (16 bytes).
+type Extent struct {
+	Offset uint64
+	Phys   uint64
+	Len    uint64
+	Flags  uint32
+	Pad    uint32
+}
+
+// Inode represents a filesystem inode (512 bytes).
+type Inode struct {
+	InodeNumber       uint64
+	Magic             uint32
+	Filemode          uint32
+	Uid               uint32
+	Gid               uint32
+	FileSize          uint64
+	CtimeSec          uint64
+	CtimeNsec         uint64
+	AtimeSec          uint64
+	AtimeNsec         uint64
+	MtimeSec          uint64
+	MtimeNsec         uint64
+	Nlinks            uint32
+	NumExtentsInline  uint32
+	ExtentInlineBase  uint64
+	NumExtentsTotal   uint64
+	InlineExtents     [8]Extent
+	XattrOffset       uint64
+	XattrSize         uint64
+	ParentInode       uint64
+	LinkCount         uint32
+	Flags             uint32
+	Reserved          [116]byte
+}
+
+// NewInode creates a new inode with default values.
+func NewInode(ino uint64, mode uint32) *Inode {
+	return &Inode{
+		InodeNumber: ino,
+		Magic:       InodeMagic,
+		Filemode:    mode,
+		Uid:         0, // root
+		Gid:         0, // root
+		FileSize:    0,
+		Nlinks:      1,
+	}
+}
+
+// IsDir returns true if the inode is a directory.
+func (in *Inode) IsDir() bool {
+	return in.Filemode&ModeDir != 0
+}
+
+// IsFile returns true if the inode is a regular file.
+func (in *Inode) IsFile() bool {
+	return in.Filemode&ModeFile != 0
+}
+
+// Write writes the inode to a file at the given offset.
+func (in *Inode) Write(file *os.File, offset uint64) error {
+	block := make([]byte, DefaultInodeSize)
+	pos := 0
+
+	binary.LittleEndian.PutUint64(block[pos:], in.InodeNumber); pos += 8
+	binary.LittleEndian.PutUint32(block[pos:], in.Magic); pos += 4
+	binary.LittleEndian.PutUint32(block[pos:], in.Filemode); pos += 4
+	binary.LittleEndian.PutUint32(block[pos:], in.Uid); pos += 4
+	binary.LittleEndian.PutUint32(block[pos:], in.Gid); pos += 4
+	binary.LittleEndian.PutUint64(block[pos:], in.FileSize); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.CtimeSec); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.CtimeNsec); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.AtimeSec); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.AtimeNsec); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.MtimeSec); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.MtimeNsec); pos += 8
+	binary.LittleEndian.PutUint32(block[pos:], in.Nlinks); pos += 4
+	binary.LittleEndian.PutUint32(block[pos:], in.NumExtentsInline); pos += 4
+	binary.LittleEndian.PutUint64(block[pos:], in.ExtentInlineBase); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.NumExtentsTotal); pos += 8
+
+	// Write inline extents
+	for i := 0; i < 8; i++ {
+		binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Offset); pos += 8
+		binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Phys); pos += 8
+		binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Len); pos += 8
+		binary.LittleEndian.PutUint32(block[pos:], in.InlineExtents[i].Flags); pos += 4
+		binary.LittleEndian.PutUint32(block[pos:], in.InlineExtents[i].Pad); pos += 4
+	}
+
+	binary.LittleEndian.PutUint64(block[pos:], in.XattrOffset); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.XattrSize); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.ParentInode); pos += 8
+	binary.LittleEndian.PutUint32(block[pos:], in.LinkCount); pos += 4
+	binary.LittleEndian.PutUint32(block[pos:], in.Flags); pos += 4
+
+	// Copy reserved bytes
+	copy(block[pos:pos+116], in.Reserved[:])
+
+	_, err := file.WriteAt(block, int64(offset*DefaultInodeSize))
+	return err
+}
+
+// MarshalBinary converts the inode to binary format.
+func (in *Inode) MarshalBinary() []byte {
+	block := make([]byte, DefaultInodeSize)
+	pos := 0
+
+	binary.LittleEndian.PutUint64(block[pos:], in.InodeNumber); pos += 8
+	binary.LittleEndian.PutUint32(block[pos:], in.Magic); pos += 4
+	binary.LittleEndian.PutUint32(block[pos:], in.Filemode); pos += 4
+	binary.LittleEndian.PutUint32(block[pos:], in.Uid); pos += 4
+	binary.LittleEndian.PutUint32(block[pos:], in.Gid); pos += 4
+	binary.LittleEndian.PutUint64(block[pos:], in.FileSize); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.CtimeSec); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.CtimeNsec); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.AtimeSec); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.AtimeNsec); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.MtimeSec); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.MtimeNsec); pos += 8
+	binary.LittleEndian.PutUint32(block[pos:], in.Nlinks); pos += 4
+	binary.LittleEndian.PutUint32(block[pos:], in.NumExtentsInline); pos += 4
+	binary.LittleEndian.PutUint64(block[pos:], in.ExtentInlineBase); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.NumExtentsTotal); pos += 8
+
+	// Write inline extents
+	for i := 0; i < 8; i++ {
+		binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Offset); pos += 8
+		binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Phys); pos += 8
+		binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Len); pos += 8
+		binary.LittleEndian.PutUint32(block[pos:], in.InlineExtents[i].Flags); pos += 4
+		binary.LittleEndian.PutUint32(block[pos:], in.InlineExtents[i].Pad); pos += 4
+	}
+
+	binary.LittleEndian.PutUint64(block[pos:], in.XattrOffset); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.XattrSize); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.ParentInode); pos += 8
+	binary.LittleEndian.PutUint32(block[pos:], in.LinkCount); pos += 4
+	binary.LittleEndian.PutUint32(block[pos:], in.Flags); pos += 4
+
+	copy(block[pos:pos+116], in.Reserved[:])
+
+	return block
+}
+
+// ValidateInode checks if the inode magic is correct.
+func (in *Inode) ValidateInode() bool {
+	return in.Magic == InodeMagic
 }
