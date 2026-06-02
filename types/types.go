@@ -5,7 +5,19 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"unsafe"
 )
+
+func init() {
+	var s SuperblockLayout
+	fmt.Printf("DEBUG: SuperblockLayout size = %d\n", unsafe.Sizeof(s))
+	fmt.Printf("DEBUG: UUID offset = %d\n", unsafe.Offsetof(s.UUID))
+	fmt.Printf("DEBUG: _Padding offset = %d\n", unsafe.Offsetof(s._Padding))
+	fmt.Printf("DEBUG: EATOffset offset = %d\n", unsafe.Offsetof(s.EATOffset))
+	fmt.Printf("DEBUG: EATBlocks offset = %d\n", unsafe.Offsetof(s.EATBlocks))
+	fmt.Printf("DEBUG: InodeBMOffset offset = %d\n", unsafe.Offsetof(s.InodeBMOffset))
+	fmt.Printf("DEBUG: DataBitmapOffset offset = %d\n", unsafe.Offsetof(s.DataBitmapOffset))
+}
 
 // Magic numbers for our filesystem structures.
 const (
@@ -43,9 +55,9 @@ const (
 type SuperblockLayout struct {
 	// Block 0: core fields
 	Magic       uint64
-	MajorVer    uint32
-	MinorVer    uint32
-	PatchVer    uint32
+	MajorVer    uint64  // Changed from uint32 to match C struct (8 bytes)
+	MinorVer    uint64  // Changed from uint32 to match C struct (8 bytes)
+	PatchVer    uint64  // Changed from uint32 to match C struct (8 bytes)
 	TotalBlocks uint64
 	DataBlocks  uint64
 	BlockSize   uint64
@@ -62,20 +74,22 @@ type SuperblockLayout struct {
 	FeatROCompat uint64
 	FeatIncompat uint64
 	UUID        [16]byte
+	// Padding to align EATOffset to 176 (C struct has 8 bytes padding here)
+	_Padding    [8]byte
 
 	// Block 0: metadata pointers
-	EATOffset      uint64
-	EATBlocks      uint64
-	TrieRootBlock  uint64
-	TrieBlocksUsed uint64
-	TrieNodePoolStart uint64
-	TrieNodePoolSize  uint64
-	InodeBMOffset  uint64
-	InodeBMBlocks  uint64
-	DSBMOffset     uint64
-	DSBMBlocks     uint64
-	JournalOffset  uint64
-	JournalBlocks  uint64
+	EATOffset   uint64  // offset 176
+	EATBlocks      uint64  // offset 184
+	TrieRootBlock  uint64  // offset 192
+	TrieBlocksUsed uint64  // offset 200
+	TrieNodePoolStart uint64  // offset 208
+	TrieNodePoolSize  uint64  // offset 216
+	InodeBMOffset  uint64  // offset 224
+	InodeBMBlocks  uint64  // offset 232
+	DataBitmapOffset uint64  // offset 240
+	DataBitmapBlocks uint64  // offset 248
+	JournalOffset  uint64  // offset 256
+	JournalBlocks  uint64  // offset 264
 	CheckpointSeq  uint64
 	JournalLogStart uint64
 	JournalLogEnd  uint64
@@ -127,6 +141,8 @@ func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, labe
 	copy(sb.Lay.Label[:], []byte(label))
 
 	return sb
+
+	return sb
 }
 
 // Write writes the superblock to a file and initializes the full filesystem image.
@@ -171,9 +187,9 @@ func (sb *Superblock) MarshalBinary() []byte {
 
 	// Write fields in order
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.Magic); pos += 8
-	binary.LittleEndian.PutUint32(data[pos:], sb.Lay.MajorVer); pos += 4
-	binary.LittleEndian.PutUint32(data[pos:], sb.Lay.MinorVer); pos += 4
-	binary.LittleEndian.PutUint32(data[pos:], sb.Lay.PatchVer); pos += 4
+	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.MajorVer); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.MinorVer); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.PatchVer); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.TotalBlocks); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.DataBlocks); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.BlockSize); pos += 8
@@ -192,6 +208,13 @@ func (sb *Superblock) MarshalBinary() []byte {
 
 	copy(data[pos:pos+16], sb.Lay.UUID[:]); pos += 16
 
+	// Add 8-byte padding to match C struct layout
+	// C struct has 8 bytes padding between UUID and EATOffset
+	for i := 0; i < 8; i++ {
+		data[pos] = 0
+		pos++
+	}
+
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.EATOffset); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.EATBlocks); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.TrieRootBlock); pos += 8
@@ -200,8 +223,8 @@ func (sb *Superblock) MarshalBinary() []byte {
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.TrieNodePoolSize); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.InodeBMOffset); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.InodeBMBlocks); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.DSBMOffset); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.DSBMBlocks); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.DataBitmapOffset); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.DataBitmapBlocks); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.JournalOffset); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.JournalBlocks); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.CheckpointSeq); pos += 8
@@ -320,7 +343,9 @@ func (in *Inode) Write(file *os.File, offset uint64) error {
 	// Copy reserved bytes
 	copy(block[pos:pos+116], in.Reserved[:])
 
-	_, err := file.WriteAt(block, int64(offset*DefaultInodeSize))
+	written, err := file.WriteAt(block, int64(offset*DefaultInodeSize))
+		fmt.Fprintf(os.Stderr, "Debug: Written %d bytes, err=%v\n", written, err)
+		fmt.Fprintf(os.Stderr, "Debug: File size after write: %d\n", func() int64 { fi, _ := file.Stat(); return fi.Size() }())
 	return err
 }
 

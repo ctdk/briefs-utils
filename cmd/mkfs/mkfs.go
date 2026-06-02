@@ -2,6 +2,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 
@@ -82,7 +83,7 @@ func main() {
 			}
 
 			// Data bitmap: 1 bit per data block
-			dataBlocks := uint64(totalBlocks) - 1 - inodeBitmapBlocks - journalBlocks // -1 for superblock
+			dataBlocks := uint64(totalBlocks) - 1 - inodeBitmapBlocks - journalBlocks
 			if dataBlocks < 1 {
 				return fmt.Errorf("filesystem too small")
 			}
@@ -95,57 +96,89 @@ func main() {
 			// Calculate final data blocks
 			finalDataBlocks := uint64(totalBlocks) - 1 - inodeBitmapBlocks - dataBitmapBlocks - journalBlocks
 
+			// EAT (extent allocation table) - 1 block after bitmaps
+
 			// Create superblock
 			sb := types.NewSuperblock(uint64(totalBlocks), blockSize, inodeSize, journalBlocks, label)
 			sb.Lay.FreeInodes = uint64(estInodes) - 1 // -1 for root inode
-			sb.Lay.InodeBMOffset = 1          // right after superblock
+			sb.Lay.InodeBMOffset = 1                  // right after superblock
+			fmt.Fprintf(os.Stderr, "Debug: Before - InodeBMOffset=%d, DataBitmapOffset=%d, DataBitmapBlocks=%d\n", sb.Lay.InodeBMOffset, sb.Lay.DataBitmapOffset, sb.Lay.DataBitmapBlocks)
 			sb.Lay.InodeBMBlocks = inodeBitmapBlocks
-			sb.Lay.DSBMOffset = 1 + inodeBitmapBlocks
-			sb.Lay.DSBMBlocks = dataBitmapBlocks
+			sb.Lay.DataBitmapOffset = 1 + inodeBitmapBlocks
+			sb.Lay.DataBitmapBlocks = dataBitmapBlocks
+			fmt.Fprintf(os.Stderr, "Debug: After - InodeBMOffset=%d, DataBitmapOffset=%d, DataBitmapBlocks=%d\n", sb.Lay.InodeBMOffset, sb.Lay.DataBitmapOffset, sb.Lay.DataBitmapBlocks)
 			sb.Lay.DataBlocks = finalDataBlocks
+			sb.Lay.EATOffset = 1 + inodeBitmapBlocks + dataBitmapBlocks + 1
+			fmt.Fprintf(os.Stderr, "Debug: EATOffset=%d, EATBlocks=%d\n", sb.Lay.EATOffset, sb.Lay.EATBlocks)
+			sb.Lay.EATBlocks = 1
 
-			// Write superblock first
-			if err := sb.Write(path); err != nil {
-				return fmt.Errorf("mkfs failed: %w", err)
-			}
-
-			// Open file to write bitmaps
-			file, err := os.OpenFile(path, os.O_WRONLY, 0644)
+			// Create and truncate file to full size
+			file, err := os.Create(path)
 			if err != nil {
-				return fmt.Errorf("open file: %w", err)
+				return fmt.Errorf("create file: %w", err)
 			}
 			defer file.Close()
 
-			// Write inode bitmap (all zeros = all free)
-			inodeBitmap := make([]byte, int(inodeBitmapBlocks)*int(blockSize))
-			if err := file.Truncate(int64(sb.Lay.TotalBlocks * sb.Lay.BlockSize)); err != nil {
+			totalSize := sb.Lay.TotalBlocks * sb.Lay.BlockSize
+			if err := file.Truncate(int64(totalSize)); err != nil {
 				return fmt.Errorf("truncate: %w", err)
 			}
+
+			// Write bitmaps first
+			inodeBitmap := make([]byte, int(inodeBitmapBlocks)*int(blockSize))
 			if _, err := file.WriteAt(inodeBitmap, int64(sb.Lay.InodeBMOffset*sb.Lay.BlockSize)); err != nil {
 				return fmt.Errorf("write inode bitmap: %w", err)
 			}
 
-			// Write data bitmap (all zeros = all free)
 			dataBitmap := make([]byte, int(dataBitmapBlocks)*int(blockSize))
-			if _, err := file.WriteAt(dataBitmap, int64(sb.Lay.DSBMOffset*sb.Lay.BlockSize)); err != nil {
+			if _, err := file.WriteAt(dataBitmap, int64(sb.Lay.DataBitmapOffset*sb.Lay.BlockSize)); err != nil {
 				return fmt.Errorf("write data bitmap: %w", err)
 			}
 
-			// Initialize root inode at block 0 of inode table
-			// Inode table follows data bitmap
-			inodeTableOffset := sb.Lay.DSBMOffset + sb.Lay.DSBMBlocks
+			// Write root inode at first slot of inode table
+			inodeTableBlock := sb.Lay.DataBitmapOffset + sb.Lay.DataBitmapBlocks
+			// Inode 1 (root) is at the first slot of inodeTableBlock
+			// Inode table starts at inodeTableBlock, each block has 8 inodes (512 bytes each)
+			// Inode 1 is at index (inodeTableBlock * 8) = 3 * 8 = 24
+			inodeIndex := inodeTableBlock * (sb.Lay.BlockSize / sb.Lay.InodeSize)
+			fmt.Fprintf(os.Stderr, "Debug: inodeTableBlock=%d, inodeIndex=%d\n", inodeTableBlock, inodeIndex)
 			rootInode := types.NewInode(1, types.ModeDir|0755)
-			if err := rootInode.Write(file, inodeTableOffset); err != nil {
+			fmt.Fprintf(os.Stderr, "Debug: Writing inode at offset %d\n", inodeIndex*512)
+			if err := rootInode.Write(file, inodeIndex); err != nil {
 				return fmt.Errorf("write root inode: %w", err)
+			fmt.Fprintf(os.Stderr, "Debug: Write completed\n")
 			}
 
 			// Mark root inode as allocated in bitmap
-			// Set bit 0 (inode 1) in inode bitmap
-			if inodeBitmapBlocks > 0 {
-				inodeBitmap[0] |= 1 // Set bit for inode 1
-				if _, err := file.WriteAt(inodeBitmap, int64(sb.Lay.InodeBMOffset*sb.Lay.BlockSize)); err != nil {
-					return fmt.Errorf("write updated inode bitmap: %w", err)
-				}
+			inodeBitmap[0] |= 1 // Set bit for inode 1
+			if _, err := file.WriteAt(inodeBitmap, int64(sb.Lay.InodeBMOffset*sb.Lay.BlockSize)); err != nil {
+				return fmt.Errorf("write updated inode bitmap: %w", err)
+			}
+
+			// Initialize EAT trie with root node
+			// EAT node is 32 bytes: range_start, range_len, free_count, left_child, right_child
+			eatNode := make([]byte, 32)
+			// range_start = 0 (start of data region)
+			binary.LittleEndian.PutUint64(eatNode[0:], 0)
+			// range_len = finalDataBlocks (total data blocks)
+			binary.LittleEndian.PutUint32(eatNode[8:], uint32(finalDataBlocks))
+			// free_count = finalDataBlocks (all free initially)
+			binary.LittleEndian.PutUint32(eatNode[12:], uint32(finalDataBlocks))
+			// left_child = 0 (no child - this is a leaf node initially)
+			binary.LittleEndian.PutUint64(eatNode[16:], 0)
+			// right_child = 0 (no child)
+			binary.LittleEndian.PutUint64(eatNode[24:], 0)
+
+			// Write EAT node at block 3 (offset 3 * 4096 = 12288)
+			if _, err := file.WriteAt(eatNode, int64(sb.Lay.EATOffset*sb.Lay.BlockSize)); err != nil {
+				return fmt.Errorf("write EAT trie node: %w", err)
+			}
+
+			// Write superblock last (at offset 0)
+			sbBlock := make([]byte, sb.Lay.BlockSize)
+			copy(sbBlock, sb.MarshalBinary())
+			if _, err := file.WriteAt(sbBlock, 0); err != nil {
+				return fmt.Errorf("write superblock: %w", err)
 			}
 
 			fmt.Fprintf(os.Stderr, "Created filesystem: %s (%d blocks × %d bytes)\n",
@@ -154,7 +187,8 @@ func main() {
 			fmt.Fprintf(os.Stderr, "  journal:  %d blocks\n", sb.JournalBlocks())
 			fmt.Fprintf(os.Stderr, "  data:     %d blocks\n", sb.DataBlocks())
 			fmt.Fprintf(os.Stderr, "  inode bitmap: %d blocks at offset %d\n", sb.Lay.InodeBMBlocks, sb.Lay.InodeBMOffset)
-			fmt.Fprintf(os.Stderr, "  data bitmap:  %d blocks at offset %d\n", sb.Lay.DSBMBlocks, sb.Lay.DSBMOffset)
+			fmt.Fprintf(os.Stderr, "  data bitmap:  %d blocks at offset %d\n", sb.Lay.DataBitmapBlocks, sb.Lay.DataBitmapOffset)
+			fmt.Fprintf(os.Stderr, "  EAT trie: %d blocks at offset %d\n", sb.Lay.EATBlocks, sb.Lay.EATOffset)
 
 			return nil
 		},
