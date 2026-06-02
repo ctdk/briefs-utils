@@ -4,6 +4,7 @@ package types
 import (
 	"encoding/binary"
 	"fmt"
+	"github.com/google/uuid"
 	"os"
 	"unsafe"
 )
@@ -138,7 +139,15 @@ func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, labe
 	sb.Lay.JournalLogEnd = sb.Lay.JournalOffset
 
 	// Set label
+	// Does this need to be forced uppercase?
 	copy(sb.Lay.Label[:], []byte(label))
+
+	// TODO: allow passing a UUID in as an argument. For now, just generate
+	// a new one every time.
+	fsUuid := uuid.New()
+	for i, v := range fsUuid {
+		sb.Lay.UUID[i] = v
+	}
 
 	return sb
 }
