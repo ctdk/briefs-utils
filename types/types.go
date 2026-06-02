@@ -141,8 +141,6 @@ func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, labe
 	copy(sb.Lay.Label[:], []byte(label))
 
 	return sb
-
-	return sb
 }
 
 // Write writes the superblock to a file and initializes the full filesystem image.
