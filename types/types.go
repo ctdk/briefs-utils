@@ -13,7 +13,6 @@ func init() {
 	var s SuperblockLayout
 	fmt.Printf("DEBUG: SuperblockLayout size = %d\n", unsafe.Sizeof(s))
 	fmt.Printf("DEBUG: UUID offset = %d\n", unsafe.Offsetof(s.UUID))
-	fmt.Printf("DEBUG: _Padding offset = %d\n", unsafe.Offsetof(s._Padding))
 	fmt.Printf("DEBUG: EATOffset offset = %d\n", unsafe.Offsetof(s.EATOffset))
 	fmt.Printf("DEBUG: EATBlocks offset = %d\n", unsafe.Offsetof(s.EATBlocks))
 	fmt.Printf("DEBUG: InodeBMOffset offset = %d\n", unsafe.Offsetof(s.InodeBMOffset))
@@ -75,11 +74,13 @@ type SuperblockLayout struct {
 	FeatROCompat uint64
 	FeatIncompat uint64
 	UUID        [16]byte
-	// Padding to align EATOffset to 176 (C struct has 8 bytes padding here)
-	_Padding    [8]byte
+	// C struct: __u8 uuid[16] ends at byte 168. __u64 eat_offset follows
+	// at byte 168 (8-byte aligned, no padding needed). The comments in
+	// the C header (/* 176 */) are incorrect.
+	// No _Padding field needed.
 
 	// Block 0: metadata pointers
-	EATOffset   uint64  // offset 176
+	EATOffset   uint64  // offset 168
 	EATBlocks      uint64  // offset 184
 	TrieRootBlock  uint64  // offset 192
 	TrieBlocksUsed uint64  // offset 200
@@ -215,13 +216,6 @@ func (sb *Superblock) MarshalBinary() []byte {
 
 	copy(data[pos:pos+16], sb.Lay.UUID[:]); pos += 16
 
-	// Add 8-byte padding to match C struct layout
-	// C struct has 8 bytes padding between UUID and EATOffset
-	for i := 0; i < 8; i++ {
-		data[pos] = 0
-		pos++
-	}
-
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.EATOffset); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.EATBlocks); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.TrieRootBlock); pos += 8
@@ -263,10 +257,11 @@ type Extent struct {
 // Inode represents a filesystem inode (512 bytes).
 type Inode struct {
 	InodeNumber       uint64
-	Magic             uint32
+	Magic             uint64   // C struct has __u64 magic
 	Filemode          uint32
 	Uid               uint32
 	Gid               uint32
+	_Pad0             uint32   // explicit padding for u64 alignment
 	FileSize          uint64
 	CtimeSec          uint64
 	CtimeNsec         uint64
@@ -284,7 +279,7 @@ type Inode struct {
 	ParentInode       uint64
 	LinkCount         uint32
 	Flags             uint32
-	Reserved          [116]byte
+	Reserved          [112]byte
 }
 
 // NewInode creates a new inode with default values.
@@ -310,16 +305,17 @@ func (in *Inode) IsFile() bool {
 	return in.Filemode&ModeFile != 0
 }
 
-// Write writes the inode to a file at the given offset.
-func (in *Inode) Write(file *os.File, offset uint64) error {
+// WriteAt writes the inode to a file at the given byte offset.
+func (in *Inode) WriteAt(file *os.File, offset int64) error {
 	block := make([]byte, DefaultInodeSize)
 	pos := 0
 
 	binary.LittleEndian.PutUint64(block[pos:], in.InodeNumber); pos += 8
-	binary.LittleEndian.PutUint32(block[pos:], in.Magic); pos += 4
+	binary.LittleEndian.PutUint64(block[pos:], in.Magic); pos += 8
 	binary.LittleEndian.PutUint32(block[pos:], in.Filemode); pos += 4
 	binary.LittleEndian.PutUint32(block[pos:], in.Uid); pos += 4
 	binary.LittleEndian.PutUint32(block[pos:], in.Gid); pos += 4
+	binary.LittleEndian.PutUint32(block[pos:], in._Pad0); pos += 4
 	binary.LittleEndian.PutUint64(block[pos:], in.FileSize); pos += 8
 	binary.LittleEndian.PutUint64(block[pos:], in.CtimeSec); pos += 8
 	binary.LittleEndian.PutUint64(block[pos:], in.CtimeNsec); pos += 8
@@ -347,55 +343,22 @@ func (in *Inode) Write(file *os.File, offset uint64) error {
 	binary.LittleEndian.PutUint32(block[pos:], in.LinkCount); pos += 4
 	binary.LittleEndian.PutUint32(block[pos:], in.Flags); pos += 4
 
-	// Copy reserved bytes
-	copy(block[pos:pos+116], in.Reserved[:])
+	copy(block[pos:pos+112], in.Reserved[:])
 
-	written, err := file.WriteAt(block, int64(offset*DefaultInodeSize))
-		fmt.Fprintf(os.Stderr, "Debug: Written %d bytes, err=%v\n", written, err)
-		fmt.Fprintf(os.Stderr, "Debug: File size after write: %d\n", func() int64 { fi, _ := file.Stat(); return fi.Size() }())
-	return err
+	written, err := file.WriteAt(block, offset)
+	if err != nil {
+		return err
+	}
+	if written != len(block) {
+		return fmt.Errorf("short write: expected %d, got %d", len(block), written)
+	}
+	return nil
 }
 
-// MarshalBinary converts the inode to binary format.
-func (in *Inode) MarshalBinary() []byte {
-	block := make([]byte, DefaultInodeSize)
-	pos := 0
-
-	binary.LittleEndian.PutUint64(block[pos:], in.InodeNumber); pos += 8
-	binary.LittleEndian.PutUint32(block[pos:], in.Magic); pos += 4
-	binary.LittleEndian.PutUint32(block[pos:], in.Filemode); pos += 4
-	binary.LittleEndian.PutUint32(block[pos:], in.Uid); pos += 4
-	binary.LittleEndian.PutUint32(block[pos:], in.Gid); pos += 4
-	binary.LittleEndian.PutUint64(block[pos:], in.FileSize); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.CtimeSec); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.CtimeNsec); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.AtimeSec); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.AtimeNsec); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.MtimeSec); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.MtimeNsec); pos += 8
-	binary.LittleEndian.PutUint32(block[pos:], in.Nlinks); pos += 4
-	binary.LittleEndian.PutUint32(block[pos:], in.NumExtentsInline); pos += 4
-	binary.LittleEndian.PutUint64(block[pos:], in.ExtentInlineBase); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.NumExtentsTotal); pos += 8
-
-	// Write inline extents
-	for i := 0; i < 8; i++ {
-		binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Offset); pos += 8
-		binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Phys); pos += 8
-		binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Len); pos += 8
-		binary.LittleEndian.PutUint32(block[pos:], in.InlineExtents[i].Flags); pos += 4
-		binary.LittleEndian.PutUint32(block[pos:], in.InlineExtents[i].Pad); pos += 4
-	}
-
-	binary.LittleEndian.PutUint64(block[pos:], in.XattrOffset); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.XattrSize); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.ParentInode); pos += 8
-	binary.LittleEndian.PutUint32(block[pos:], in.LinkCount); pos += 4
-	binary.LittleEndian.PutUint32(block[pos:], in.Flags); pos += 4
-
-	copy(block[pos:pos+116], in.Reserved[:])
-
-	return block
+// Write writes the inode to a file at the given offset (in 512-byte units).
+// Deprecated: Use WriteAt with byte offsets instead.
+func (in *Inode) Write(file *os.File, offset uint64) error {
+	return in.WriteAt(file, int64(offset*512))
 }
 
 // ValidateInode checks if the inode magic is correct.

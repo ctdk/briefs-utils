@@ -14,6 +14,25 @@ func roundUp(value, alignment uint64) uint64 {
 	return (value + alignment - 1) / alignment * alignment
 }
 
+// Calculate inode table layout
+// Inode table follows data bitmap, with 8 inodes per block (512 byte inodes in 4096 byte blocks)
+// Returns: (block offset, byte offset within block)
+func calculateInodeLocation(sb *types.Superblock, inodeNum uint64) (blockOffset uint64, byteOffset uint64) {
+	inodesPerBlock := sb.Lay.BlockSize / sb.Lay.InodeSize // 4096 / 512 = 8
+	
+	// Inode table starts right after data bitmap
+	inodeTableStartBlock := sb.Lay.DataBitmapOffset + sb.Lay.DataBitmapBlocks
+	
+	// Inode N is at index (N-1) in the table
+	inodeIndex := inodeNum - 1
+	
+	// Calculate which block and offset within that block
+	blockOffset = inodeTableStartBlock + (inodeIndex / inodesPerBlock)
+	byteOffset = (inodeIndex % inodesPerBlock) * sb.Lay.InodeSize
+	
+	return blockOffset, byteOffset
+}
+
 func main() {
 	app := &cli.App{
 		Name:  "mkfs.briefs",
@@ -136,17 +155,13 @@ func main() {
 			}
 
 			// Write root inode at first slot of inode table
-			inodeTableBlock := sb.Lay.DataBitmapOffset + sb.Lay.DataBitmapBlocks
-			// Inode 1 (root) is at the first slot of inodeTableBlock
-			// Inode table starts at inodeTableBlock, each block has 8 inodes (512 bytes each)
-			// Inode 1 is at index (inodeTableBlock * 8) = 3 * 8 = 24
-			inodeIndex := inodeTableBlock * (sb.Lay.BlockSize / sb.Lay.InodeSize)
-			fmt.Fprintf(os.Stderr, "Debug: inodeTableBlock=%d, inodeIndex=%d\n", inodeTableBlock, inodeIndex)
+			inodeTableBlock, inodeByteOffset := calculateInodeLocation(sb, 1)
 			rootInode := types.NewInode(1, types.ModeDir|0755)
-			fmt.Fprintf(os.Stderr, "Debug: Writing inode at offset %d\n", inodeIndex*512)
-			if err := rootInode.Write(file, inodeIndex); err != nil {
+			
+			// Write to file at calculated location
+			fileOffset := int64(inodeTableBlock*sb.Lay.BlockSize + inodeByteOffset)
+			if err := rootInode.WriteAt(file, fileOffset); err != nil {
 				return fmt.Errorf("write root inode: %w", err)
-			fmt.Fprintf(os.Stderr, "Debug: Write completed\n")
 			}
 
 			// Mark root inode as allocated in bitmap
