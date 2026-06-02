@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/google/uuid"
 	"os"
+	"time"
 	"unsafe"
 )
 
@@ -269,6 +270,8 @@ type Inode struct {
 	AtimeNsec         uint64
 	MtimeSec          uint64
 	MtimeNsec         uint64
+	CreationTimeSec   uint64
+	CreationTimeNsec  uint64
 	Nlinks            uint32
 	NumExtentsInline  uint32
 	ExtentInlineBase  uint64
@@ -279,11 +282,15 @@ type Inode struct {
 	ParentInode       uint64
 	LinkCount         uint32
 	Flags             uint32
-	Reserved          [112]byte
+	Reserved          [96]byte
 }
 
 // NewInode creates a new inode with default values.
 func NewInode(ino uint64, mode uint32) *Inode {
+	// Let's set the timestamps on new inodes.
+	t := time.Now()
+	sec := uint64(t.Unix()) // cast to uint64
+	nsec := uint64(t.Nanosecond())
 	return &Inode{
 		InodeNumber: ino,
 		Magic:       InodeMagic,
@@ -292,6 +299,14 @@ func NewInode(ino uint64, mode uint32) *Inode {
 		Gid:         0, // root
 		FileSize:    0,
 		Nlinks:      1,
+		CtimeSec:    sec,
+		CtimeNsec:   nsec,
+		AtimeSec:    sec,
+		AtimeNsec:   nsec,
+		MtimeSec:    sec,
+		MtimeNsec:   nsec,
+		CreationTimeSec: sec,
+		CreationTimeNsec: nsec,
 	}
 }
 
