@@ -50,6 +50,10 @@ const (
 	// Extent flags
 	ExtentFlagHole = 0x00000001
 	ExtentFlagEof  = 0x80000000
+
+	// Superblock reserved area padding. Matches _BRIEFS_SUPER_RESERVED in
+	// briefs.h in the kernel module.
+	BrieFsSuperReserved = 640
 )
 
 // SuperblockLayout is the on-disk format (first 4KB block).
@@ -100,6 +104,8 @@ type SuperblockLayout struct {
 
 	// utf8, null padded
 	Label [64]byte
+
+	Reserved [BrieFsSuperReserved]uint8
 }
 
 // Superblock represents the filesystem superblock.

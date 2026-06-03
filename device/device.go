@@ -77,6 +77,8 @@ func (bd *BlockDevice) TeraBytes() int64 {
 	return bd.size / tbSize
 }
 
+// Blocks() returns the number of blocks available on the device, *rounded down*
+// in case there's a misalignment.
 func (bd *BlockDevice) Blocks() int64 {
-	return int64(uint64(bd.size) / uint64(bd.blocksize))
+	return int64(uint64(bd.size) / bd.blocksize)
 }
