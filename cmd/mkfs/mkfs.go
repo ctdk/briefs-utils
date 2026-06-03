@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/ctdk/briefs-utils/device"
 	"github.com/ctdk/briefs-utils/types"
 	"github.com/urfave/cli/v2"
 )
@@ -47,7 +48,7 @@ func main() {
 			&cli.Int64Flag{
 				Name:     "size",
 				Aliases:  []string{"s"},
-				Required: true,
+				Value: 	  0,
 				Usage:    "filesystem size in blocks",
 			},
 			&cli.IntFlag{
@@ -79,6 +80,18 @@ func main() {
 			blockSize := uint64(c.Int("block-size"))
 			inodeSize := uint64(c.Int("inode-size"))
 			journalBlocks := uint64(c.Int("journal-size"))
+
+			// If the number of blocks isn't specified, probe the
+			// device to find the size.
+			if totalBlocks == 0 {
+				bd, err := device.GetDevice(path, blockSize)
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(os.Stderr, "DEBUG: Probed device %s. Size is %d bytes, %d blocks.\n", path, bd.Bytes(), bd.Blocks())
+				totalBlocks = bd.Blocks()
+			}
+
 			label := c.String("label")
 
 			// Calculate space needed for metadata
@@ -131,6 +144,9 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Debug: EATOffset=%d, EATBlocks=%d\n", sb.Lay.EATOffset, sb.Lay.EATBlocks)
 			sb.Lay.EATBlocks = 1
 
+			// Are we working with a file, or a device? If it's a
+			// file, don't try and truncate it.
+
 			// Create and truncate file to full size
 			file, err := os.Create(path)
 			if err != nil {
@@ -138,9 +154,25 @@ func main() {
 			}
 			defer file.Close()
 
-			totalSize := sb.Lay.TotalBlocks * sb.Lay.BlockSize
-			if err := file.Truncate(int64(totalSize)); err != nil {
-				return fmt.Errorf("truncate: %w", err)
+			// Make sure this isn't something we really, really
+			// shouldn't be trying to create a volume on, like a
+			// directory, character device, etc.
+			stat, err := file.Stat()
+			if err != nil {
+				return fmt.Errorf("stat file: %w", err)
+			}
+
+			// It is conceivable that we may need to take symbolic
+			// links into account. TODO: check on that.
+			if !(stat.Mode().IsRegular() || stat.Mode() & os.ModeDevice != 0 && stat.Mode() & os.ModeCharDevice == 0) {
+				return fmt.Errorf("not an appropriate file or device type to create a volume on")
+			}
+
+			if stat.Mode().IsRegular() {
+				totalSize := sb.Lay.TotalBlocks * sb.Lay.BlockSize
+				if err := file.Truncate(int64(totalSize)); err != nil {
+					return fmt.Errorf("truncate: %w", err)
+				}
 			}
 
 			// Write bitmaps first

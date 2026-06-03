@@ -20,14 +20,14 @@ const (
 type BlockDevice struct {
 	Path 		string
 	size 		int64
-	blocksize 	int64
+	blocksize 	uint64
 }
 
-func GetDevice(path string, blocksize int64) (*BlockDevice, err) {
+func GetDevice(path string, blocksize uint64) (*BlockDevice, error) {
 	d, err := os.Open(path)
 	if err != nil {
 		devErr := fmt.Errorf("error opening device %s: %w", err)
-		return nil, err
+		return nil, devErr
 	}
 	defer d.Close()
 
@@ -37,20 +37,20 @@ func GetDevice(path string, blocksize int64) (*BlockDevice, err) {
 	pos, err := d.Seek(0, io.SeekEnd)
 	if err != nil {
 		devErr := fmt.Errorf("error seeking to the end of %s: %w", err)
-		return nil, err
+		return nil, devErr
 	}
 
 	// is pos is 0 or somehow negative, that's definitely wrong
 	if pos <= 0 {
 		devErr := fmt.Errorf("error: somehow the last file position was %d, which is invalid")
-		return nil, err
+		return nil, devErr
 	}
 	bd := new(BlockDevice)
 	bd.Path = path
 	bd.size = pos
 	bd.blocksize = blocksize
 
-	return bd
+	return bd, nil
 }
 
 func (bd *BlockDevice) Bytes() int64 {
@@ -78,5 +78,5 @@ func (bd *BlockDevice) TeraBytes() int64 {
 }
 
 func (bd *BlockDevice) Blocks() int64 {
-	return bd.size / bd.blkSize
+	return int64(uint64(bd.size) / uint64(bd.blocksize))
 }
