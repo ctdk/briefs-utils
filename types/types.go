@@ -113,6 +113,180 @@ type Superblock struct {
 	Lay SuperblockLayout
 }
 
+// Block layout constants - defines the order of metadata on disk
+// Block 0: Superblock
+// Block 1+: Inode bitmap
+// Next:    Data bitmap
+// Next:    Inode table
+// Next:    EAT (extent allocation table) - reserved space
+// Next:    Trie root header (first block of trie node pool)
+// Next:    Trie node data blocks
+// Next:    Data region
+// Last:    Journal
+
+// TrieNode is the on-disk bitwise trie node (32 bytes).
+// Matches `struct trie_node` in the kernel module.
+type TrieNode struct {
+	RangeStart uint64
+	RangeLen   uint32
+	FreeCount  uint32
+	LeftChild  uint64
+	RightChild uint64
+}
+
+// TrieRoot is the trie root block header.
+// Matches `struct briefs_trie_root` in the kernel module.
+type TrieRoot struct {
+	Magic     uint32 // "TRIE" - 0x54524945
+	Version   uint32 // 1
+	RootNode  uint64 // block offset of root trie node (relative to trie pool start)
+	FreeList  uint64 // next free trie node block
+	NodeCount uint32 // total trie nodes in use
+	Reserved  [7]uint32
+}
+
+// MarshalBinary serializes a TrieNode to its 32-byte on-disk format.
+func (tn *TrieNode) MarshalBinary() []byte {
+	data := make([]byte, 32)
+	binary.LittleEndian.PutUint64(data[0:], tn.RangeStart)
+	binary.LittleEndian.PutUint32(data[8:], tn.RangeLen)
+	binary.LittleEndian.PutUint32(data[12:], tn.FreeCount)
+	binary.LittleEndian.PutUint64(data[16:], tn.LeftChild)
+	binary.LittleEndian.PutUint64(data[24:], tn.RightChild)
+	return data
+}
+
+// MarshalBinary serializes a TrieRoot to its 32-byte on-disk format.
+func (tr *TrieRoot) MarshalBinary() []byte {
+	data := make([]byte, 32)
+	binary.LittleEndian.PutUint32(data[0:], tr.Magic)
+	binary.LittleEndian.PutUint32(data[4:], tr.Version)
+	binary.LittleEndian.PutUint64(data[8:], tr.RootNode)
+	binary.LittleEndian.PutUint64(data[16:], tr.FreeList)
+	binary.LittleEndian.PutUint32(data[24:], tr.NodeCount)
+	return data
+}
+
+// nextPowerOf2 returns the smallest power of 2 >= n.
+func nextPowerOf2(n uint64) uint64 {
+	if n <= 1 {
+		return 1
+	}
+	n--
+	n |= n >> 1
+	n |= n >> 2
+	n |= n >> 4
+	n |= n >> 8
+	n |= n >> 16
+	n |= n >> 32
+	return n + 1
+}
+
+// AllocTreeBuilder builds a bitwise trie for free block tracking.
+type AllocTreeBuilder struct {
+	// Flat array of trie nodes, indexed by node index.
+	Nodes     []TrieNode
+	NextIndex uint64
+}
+
+// NewAllocTreeBuilder creates a tree builder for the given number of data blocks.
+// The tree will be a complete binary trie where leaves represent individual blocks.
+func NewAllocTreeBuilder(dataBlockCount uint64) *AllocTreeBuilder {
+	padded := nextPowerOf2(dataBlockCount)
+	// Total nodes in a complete binary trie covering `padded` leaf blocks:
+	// root (covers `padded`), 2 children (cover `padded/2`), 4 (cover `padded/4`), ..., padded leaves
+	// = 1 + 2 + 4 + ... + padded = 2 * padded - 1
+	totalNodes := 2*padded - 1
+	if totalNodes < 1 {
+		totalNodes = 1
+	}
+	return &AllocTreeBuilder{
+		Nodes:     make([]TrieNode, totalNodes),
+		NextIndex: 0,
+	}
+}
+
+// Build builds the trie. Returns a map of block-number-in-pool -> node data.
+// The returned trieNodeBlocks includes only the node data blocks (no header block).
+func (tb *AllocTreeBuilder) Build(dataBlockCount uint64) []TrieNode {
+	padded := nextPowerOf2(dataBlockCount)
+	tb.buildNode(0, padded, dataBlockCount)
+	return tb.Nodes
+}
+
+// buildNode recursively builds the trie starting at the current NextIndex.
+func (tb *AllocTreeBuilder) buildNode(rangeStart uint64, paddedRangeLen uint64, maxValid uint64) uint64 {
+	idx := tb.NextIndex
+	tb.NextIndex++
+
+	node := &tb.Nodes[idx]
+	node.RangeStart = rangeStart
+	node.RangeLen = uint32(paddedRangeLen)
+
+	if paddedRangeLen == 1 {
+		// Leaf node: free if this block is within the valid data region
+		if rangeStart < maxValid {
+			node.FreeCount = 1
+		} else {
+			node.FreeCount = 0
+		}
+		return idx
+	}
+
+	// Internal node: recurse into children
+	half := paddedRangeLen / 2
+
+	// Left child covers [rangeStart, rangeStart + half)
+	leftIdx := tb.buildNode(rangeStart, half, maxValid)
+	node.LeftChild = leftIdx
+
+	// Right child covers [rangeStart + half, rangeStart + paddedRangeLen)
+	rightIdx := tb.buildNode(rangeStart+half, half, maxValid)
+	node.RightChild = rightIdx
+
+	// Free count = sum of children
+	node.FreeCount = tb.Nodes[leftIdx].FreeCount + tb.Nodes[rightIdx].FreeCount
+
+	return idx
+}
+
+// NbBlocks returns the number of 4096-byte blocks needed for all trie nodes.
+// Each block holds 128 trie nodes (4096 / 32 = 128).
+func (tb *AllocTreeBuilder) NbBlocks() uint64 {
+	nodesPerBlock := uint64(4096 / 32)
+	nodeCount := uint64(len(tb.Nodes))
+	if nodeCount == 0 {
+		return 0
+	}
+	return (nodeCount + nodesPerBlock - 1) / nodesPerBlock
+}
+
+// WriteNodes packs the trie nodes into blocks. Returns one []byte per block.
+// The caller can write these blocks starting at (poolStartBlock + 1) since
+// block 0 of the pool is the trie root header.
+func (tb *AllocTreeBuilder) WriteNodes() [][]byte {
+	nb := tb.NbBlocks()
+	if nb == 0 {
+		return nil
+	}
+	blocks := make([][]byte, nb)
+	nodesPerBlock := uint64(4096 / 32)
+	for bi := uint64(0); bi < nb; bi++ {
+		buf := make([]byte, 4096)
+		start := bi * nodesPerBlock
+		end := start + nodesPerBlock
+		if end > uint64(len(tb.Nodes)) {
+			end = uint64(len(tb.Nodes))
+		}
+		for i := start; i < end; i++ {
+			nodeData := tb.Nodes[i].MarshalBinary()
+			copy(buf[(i-start)*32:], nodeData)
+		}
+		blocks[bi] = buf
+	}
+	return blocks
+}
+
 // Getters for easy access to superblock fields
 func (sb *Superblock) TotalBlocks() uint64 { return sb.Lay.TotalBlocks }
 func (sb *Superblock) BlockSize() uint64 { return sb.Lay.BlockSize }
@@ -121,7 +295,8 @@ func (sb *Superblock) JournalBlocks() uint64 { return sb.Lay.JournalBlocks }
 func (sb *Superblock) DataBlocks() uint64 { return sb.Lay.DataBlocks }
 func (sb *Superblock) TotalInodes() uint64 { return sb.Lay.FreeInodes + 100 } // rough estimate
 
-// NewSuperblock creates a new superblock with the given parameters.
+// NewSuperblock creates a new superblock with the given metadata.
+// mkfs.briefs will set the layout fields (bitmap offsets, etc.) after creation.
 func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, label string) *Superblock {
 	sb := &Superblock{}
 
@@ -130,15 +305,15 @@ func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, labe
 	sb.Lay.MinorVer = 0
 	sb.Lay.PatchVer = 1
 	sb.Lay.TotalBlocks = totalBlocks
-	sb.Lay.DataBlocks = totalBlocks - journalBlocks - 4  // superblock + bitmaps + journal
 	sb.Lay.BlockSize = blockSize
 	sb.Lay.InodeSize = inodeSize
 	sb.Lay.BlocksGrp = 1024  // TODO
 	sb.Lay.InodesGrp = 256   // TODO
+	sb.Lay.FSCreated = uint64(time.Now().Unix())
 	sb.Lay.FSLastMount = 0
 	sb.Lay.FSLastChkpt = 0
-	sb.Lay.FreeDataBlks = totalBlocks - journalBlocks - 4 // superblock + bitmaps + journal
-	sb.Lay.FreeInodes = 100 // TODO
+	sb.Lay.FreeInodes = 0 // set by mkfs
+	sb.Lay.FreeDataBlks = 0 // set by mkfs
 	sb.Lay.RootIno = 1
 
 	sb.Lay.JournalOffset = totalBlocks - journalBlocks
@@ -147,11 +322,9 @@ func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, labe
 	sb.Lay.JournalLogEnd = sb.Lay.JournalOffset
 
 	// Set label
-	// Does this need to be forced uppercase?
 	copy(sb.Lay.Label[:], []byte(label))
 
-	// TODO: allow passing a UUID in as an argument. For now, just generate
-	// a new one every time.
+	// Generate a UUID for this volume
 	fsUuid := uuid.New()
 	for i, v := range fsUuid {
 		sb.Lay.UUID[i] = v

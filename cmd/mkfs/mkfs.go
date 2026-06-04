@@ -15,22 +15,15 @@ func roundUp(value, alignment uint64) uint64 {
 	return (value + alignment - 1) / alignment * alignment
 }
 
-// Calculate inode table layout
-// Inode table follows data bitmap, with 8 inodes per block (512 byte inodes in 4096 byte blocks)
-// Returns: (block offset, byte offset within block)
+// Calculate on-disk location of an inode.
+// The inode table starts at: data_bitmap_offset + data_bitmap_blocks
+// (This matches what the kernel computes in briefs_iget.)
 func calculateInodeLocation(sb *types.Superblock, inodeNum uint64) (blockOffset uint64, byteOffset uint64) {
 	inodesPerBlock := sb.Lay.BlockSize / sb.Lay.InodeSize // 4096 / 512 = 8
-	
-	// Inode table starts right after data bitmap
 	inodeTableStartBlock := sb.Lay.DataBitmapOffset + sb.Lay.DataBitmapBlocks
-	
-	// Inode N is at index (N-1) in the table
 	inodeIndex := inodeNum - 1
-	
-	// Calculate which block and offset within that block
 	blockOffset = inodeTableStartBlock + (inodeIndex / inodesPerBlock)
 	byteOffset = (inodeIndex % inodesPerBlock) * sb.Lay.InodeSize
-	
 	return blockOffset, byteOffset
 }
 
@@ -48,7 +41,7 @@ func main() {
 			&cli.Int64Flag{
 				Name:     "size",
 				Aliases:  []string{"s"},
-				Value: 	  0,
+				Value:    0,
 				Usage:    "filesystem size in blocks",
 			},
 			&cli.IntFlag{
@@ -80,94 +73,190 @@ func main() {
 			blockSize := uint64(c.Int("block-size"))
 			inodeSize := uint64(c.Int("inode-size"))
 			journalBlocks := uint64(c.Int("journal-size"))
+			label := c.String("label")
 
-			// If the number of blocks isn't specified, probe the
-			// device to find the size.
+			// Probe device if no explicit size given
 			if totalBlocks == 0 {
 				bd, err := device.GetDevice(path, blockSize)
 				if err != nil {
 					return err
 				}
-				fmt.Fprintf(os.Stderr, "DEBUG: Probed device %s. Size is %d bytes, %d blocks.\n", path, bd.Bytes(), bd.Blocks())
+				fmt.Fprintf(os.Stderr, "Probed device %s: %d bytes, %d blocks.\n",
+					path, bd.Bytes(), bd.Blocks())
 				totalBlocks = bd.Blocks()
 			}
 
-			label := c.String("label")
+			// --- Block Layout (matches kernel expectations) ---
+			//
+			// Block 0:       Superblock          (1 block)
+			// Next:           Inode bitmap        (1 bit per inode)
+			// Next:           Data bitmap         (1 bit per data block)
+			// Next:           Inode table         (8 inodes per block)
+			// Next:           EAT                 (reserved, 1 block)
+			// Next:           Trie pool           (header + node blocks)
+			// Next:           Data region         (free blocks)
+			// Last:           Journal             (at the end of the volume)
+			//
+			// Kernel computes inode table start as:
+			//   data_bitmap_offset + data_bitmap_blocks
+			// which matches this layout.
 
-			// Calculate space needed for metadata
-			// Superblock: 1 block
-			// Inode bitmap: enough bits for all inodes
-			// Journal: N blocks (at end of filesystem)
-			
-			// Estimate inodes (we'll set this in superblock)
-			// For now, assume 1 inode per 16 data blocks, minimum 100
-			estInodes := totalBlocks / 16
+			estInodes := uint64(totalBlocks) / 16
 			if estInodes < 100 {
 				estInodes = 100
 			}
+			estInodes = roundUp(estInodes, 32)
 
-			// Calculate inode bitmap size (1 bit per inode, rounded to bytes, then to blocks)
-			inodeBitmapBits := estInodes
-			inodeBitmapBytes := (inodeBitmapBits + 7) / 8
-			inodeBitmapBlocks := roundUp(uint64(inodeBitmapBytes), blockSize) / blockSize
-			if inodeBitmapBlocks == 0 {
+			inodesPerBlock := blockSize / inodeSize // 8
+			inodeTableBlocks := roundUp(estInodes, inodesPerBlock) / inodesPerBlock
+
+			// Inode bitmap size
+			inodeBitmapBytes := (estInodes + 7) / 8
+			inodeBitmapBlocks := roundUp(inodeBitmapBytes, blockSize) / blockSize
+			if inodeBitmapBlocks < 1 {
 				inodeBitmapBlocks = 1
 			}
 
-			// Data bitmap: 1 bit per data block
-			dataBlocks := uint64(totalBlocks) - 1 - inodeBitmapBlocks - journalBlocks
-			if dataBlocks < 1 {
+			// Solve for trie pool size iteratively (depends on data block count)
+			triePoolHeader := uint64(1)
+
+			// Pass 1: estimate with rough trie size
+			estTrieDataBlocks := uint64(1) + uint64(uint64(totalBlocks)/20000)
+			if estTrieDataBlocks < 1 {
+				estTrieDataBlocks = 1
+			}
+			meta1 := uint64(1) + inodeBitmapBlocks + inodeTableBlocks + 1 + triePoolHeader + estTrieDataBlocks
+			estData1 := uint64(totalBlocks) - meta1 - journalBlocks
+			if estData1 < 1 {
 				return fmt.Errorf("filesystem too small")
 			}
-			dataBitmapBytes := (dataBlocks + 7) / 8
-			dataBitmapBlocks := roundUp(uint64(dataBitmapBytes), blockSize) / blockSize
-			if dataBitmapBlocks == 0 {
+
+			// Pass 2: refine data bitmap
+			dataBitmapBytes := (estData1 + 7) / 8
+			dataBitmapBlocks := roundUp(dataBitmapBytes, blockSize) / blockSize
+			if dataBitmapBlocks < 1 {
 				dataBitmapBlocks = 1
 			}
+			meta2 := uint64(1) + inodeBitmapBlocks + dataBitmapBlocks + inodeTableBlocks + 1 + triePoolHeader
+			estData2 := uint64(totalBlocks) - meta2 - journalBlocks
+			if estData2 < 1 {
+				return fmt.Errorf("filesystem too small")
+			}
 
-			// Calculate final data blocks
-			finalDataBlocks := uint64(totalBlocks) - 1 - inodeBitmapBlocks - dataBitmapBlocks - journalBlocks
+			// Pass 3: build trie with estimated data blocks
+			builder := types.NewAllocTreeBuilder(estData2)
+			builder.Build(estData2)
+			trieDataBlocks := builder.NbBlocks()
+			if trieDataBlocks < 1 {
+				trieDataBlocks = 1
+			}
 
-			// EAT (extent allocation table) - 1 block after bitmaps
+			// Pass 4: final calculation
+			meta3 := uint64(1) + inodeBitmapBlocks + dataBitmapBlocks + inodeTableBlocks + 1 +
+				triePoolHeader + trieDataBlocks
+			finalDataBlocks := uint64(totalBlocks) - meta3 - journalBlocks
+			if finalDataBlocks < 1 {
+				return fmt.Errorf("filesystem too small")
+			}
 
-			// Create superblock
+			// Build final trie
+			finalBuilder := types.NewAllocTreeBuilder(finalDataBlocks)
+			finalBuilder.Build(finalDataBlocks)
+			finalTrieDataBlocks := finalBuilder.NbBlocks()
+			if finalTrieDataBlocks < 1 {
+				finalTrieDataBlocks = 1
+			}
+
+			// --- Compute actual block offsets ---
+			nextBlock := uint64(0)
+
+			// Block 0: Superblock
+			nextBlock++ // now 1
+
+			// Inode bitmap
+			inodeBMOffset := nextBlock
+			inodeBMBlocks := inodeBitmapBlocks
+			nextBlock += inodeBMBlocks
+
+			// Data bitmap (kernel reads inode table start as this + blocks)
+			dataBMOffset := nextBlock
+			dataBMBlocks := dataBitmapBlocks
+			nextBlock += dataBMBlocks
+
+			// Inode table (kernel reads at: data_bitmap_offset + data_bitmap_blocks)
+			inodeTableOffset := nextBlock
+			nextBlock += inodeTableBlocks
+			// Sanity: kernel-derived inode table start must match
+			if inodeTableOffset != dataBMOffset+dataBMBlocks {
+				panic("inode table offset mismatch")
+			}
+
+			// EAT (placeholder)
+			eatOffset := nextBlock
+			eatBlocks := uint64(1)
+			nextBlock += eatBlocks
+
+			// Trie pool: header + node blocks
+			triePoolStart := nextBlock
+			trieRootBlock := nextBlock
+			nextBlock += triePoolHeader
+
+			trieDataStart := nextBlock
+			trieNodeBlocksCount := finalTrieDataBlocks
+			nextBlock += trieNodeBlocksCount
+
+			trieBlocksUsed := triePoolHeader + trieNodeBlocksCount
+			triePoolSize := trieBlocksUsed
+
+			// Data region start
+			dataRegionStart := nextBlock
+
+			// Journal at end of volume
+			journalOffset := uint64(totalBlocks) - journalBlocks
+
+			if journalOffset < nextBlock {
+				return fmt.Errorf("filesystem too small: metadata needs %d blocks up to block %d, journal at %d",
+					nextBlock, journalOffset-1, journalOffset)
+			}
+
+			// --- Build superblock ---
 			sb := types.NewSuperblock(uint64(totalBlocks), blockSize, inodeSize, journalBlocks, label)
-			sb.Lay.FreeInodes = uint64(estInodes) - 1 // -1 for root inode
-			sb.Lay.InodeBMOffset = 1                  // right after superblock
-			fmt.Fprintf(os.Stderr, "Debug: Before - InodeBMOffset=%d, DataBitmapOffset=%d, DataBitmapBlocks=%d\n", sb.Lay.InodeBMOffset, sb.Lay.DataBitmapOffset, sb.Lay.DataBitmapBlocks)
-			sb.Lay.InodeBMBlocks = inodeBitmapBlocks
-			sb.Lay.DataBitmapOffset = 1 + inodeBitmapBlocks
-			sb.Lay.DataBitmapBlocks = dataBitmapBlocks
-			fmt.Fprintf(os.Stderr, "Debug: After - InodeBMOffset=%d, DataBitmapOffset=%d, DataBitmapBlocks=%d\n", sb.Lay.InodeBMOffset, sb.Lay.DataBitmapOffset, sb.Lay.DataBitmapBlocks)
 			sb.Lay.DataBlocks = finalDataBlocks
-			sb.Lay.EATOffset = 1 + inodeBitmapBlocks + dataBitmapBlocks + 1
-			fmt.Fprintf(os.Stderr, "Debug: EATOffset=%d, EATBlocks=%d\n", sb.Lay.EATOffset, sb.Lay.EATBlocks)
-			sb.Lay.EATBlocks = 1
+			sb.Lay.FreeDataBlks = finalDataBlocks
+			sb.Lay.FreeInodes = estInodes - 1 // -1 for root inode
 
-			// Are we working with a file, or a device? If it's a
-			// file, don't try and truncate it.
+			sb.Lay.InodeBMOffset = inodeBMOffset
+			sb.Lay.InodeBMBlocks = inodeBMBlocks
+			sb.Lay.DataBitmapOffset = dataBMOffset
+			sb.Lay.DataBitmapBlocks = dataBMBlocks
 
-			// Create and truncate file to full size
+			sb.Lay.EATOffset = eatOffset
+			sb.Lay.EATBlocks = eatBlocks
+
+			sb.Lay.TrieRootBlock = trieRootBlock
+			sb.Lay.TrieBlocksUsed = trieBlocksUsed
+			sb.Lay.TrieNodePoolStart = triePoolStart
+			sb.Lay.TrieNodePoolSize = triePoolSize
+
+			sb.Lay.JournalOffset = journalOffset
+			sb.Lay.JournalLogStart = journalOffset
+			sb.Lay.JournalLogEnd = journalOffset
+
+			// --- Open output ---
 			file, err := os.Create(path)
 			if err != nil {
 				return fmt.Errorf("create file: %w", err)
 			}
 			defer file.Close()
 
-			// Make sure this isn't something we really, really
-			// shouldn't be trying to create a volume on, like a
-			// directory, character device, etc.
 			stat, err := file.Stat()
 			if err != nil {
-				return fmt.Errorf("stat file: %w", err)
+				return fmt.Errorf("stat: %w", err)
 			}
-
-			// It is conceivable that we may need to take symbolic
-			// links into account. TODO: check on that.
-			if !(stat.Mode().IsRegular() || stat.Mode() & os.ModeDevice != 0 && stat.Mode() & os.ModeCharDevice == 0) {
-				return fmt.Errorf("not an appropriate file or device type to create a volume on")
+			if !(stat.Mode().IsRegular() ||
+				(stat.Mode()&os.ModeDevice != 0 && stat.Mode()&os.ModeCharDevice == 0)) {
+				return fmt.Errorf("not an appropriate file or device type")
 			}
-
 			if stat.Mode().IsRegular() {
 				totalSize := sb.Lay.TotalBlocks * sb.Lay.BlockSize
 				if err := file.Truncate(int64(totalSize)); err != nil {
@@ -175,68 +264,106 @@ func main() {
 				}
 			}
 
-			// Write bitmaps first
-			inodeBitmap := make([]byte, int(inodeBitmapBlocks)*int(blockSize))
-			if _, err := file.WriteAt(inodeBitmap, int64(sb.Lay.InodeBMOffset*sb.Lay.BlockSize)); err != nil {
+			// --- Write metadata blocks ---
+
+			// 1. Superblock (block 0)
+			sbData := make([]byte, blockSize)
+			copy(sbData, sb.MarshalBinary())
+			if _, err := file.WriteAt(sbData, 0); err != nil {
+				return fmt.Errorf("write superblock: %w", err)
+			}
+
+			// 2. Inode bitmap (all zeros)
+			inodeBitmap := make([]byte, int(inodeBMBlocks)*int(blockSize))
+			if _, err := file.WriteAt(inodeBitmap, int64(inodeBMOffset*blockSize)); err != nil {
 				return fmt.Errorf("write inode bitmap: %w", err)
 			}
 
-			dataBitmap := make([]byte, int(dataBitmapBlocks)*int(blockSize))
-			if _, err := file.WriteAt(dataBitmap, int64(sb.Lay.DataBitmapOffset*sb.Lay.BlockSize)); err != nil {
+			// 3. Data bitmap (all zeros — all data blocks free)
+			dataBitmap := make([]byte, int(dataBMBlocks)*int(blockSize))
+			if _, err := file.WriteAt(dataBitmap, int64(dataBMOffset*blockSize)); err != nil {
 				return fmt.Errorf("write data bitmap: %w", err)
 			}
 
-			// Write root inode at first slot of inode table
-			inodeTableBlock, inodeByteOffset := calculateInodeLocation(sb, 1)
+			// 4. Root inode (inode 1) at first slot of inode table
 			rootInode := types.NewInode(1, types.ModeDir|0755)
-			
-			// Write to file at calculated location
-			fileOffset := int64(inodeTableBlock*sb.Lay.BlockSize + inodeByteOffset)
+			inodeBlock, inodeByteOffset := calculateInodeLocation(sb, 1)
+			fileOffset := int64(inodeBlock*blockSize + inodeByteOffset)
 			if err := rootInode.WriteAt(file, fileOffset); err != nil {
 				return fmt.Errorf("write root inode: %w", err)
 			}
 
-			// Mark root inode as allocated in bitmap
-			inodeBitmap[0] |= 1 // Set bit for inode 1
-			if _, err := file.WriteAt(inodeBitmap, int64(sb.Lay.InodeBMOffset*sb.Lay.BlockSize)); err != nil {
+			// Mark root inode allocated in bitmap
+			inodeBitmap[0] |= 1
+			if _, err := file.WriteAt(inodeBitmap, int64(inodeBMOffset*blockSize)); err != nil {
 				return fmt.Errorf("write updated inode bitmap: %w", err)
 			}
 
-			// Initialize EAT trie with root node
-			// EAT node is 32 bytes: range_start, range_len, free_count, left_child, right_child
-			eatNode := make([]byte, 32)
-			// range_start = 0 (start of data region)
-			binary.LittleEndian.PutUint64(eatNode[0:], 0)
-			// range_len = finalDataBlocks (total data blocks)
-			binary.LittleEndian.PutUint32(eatNode[8:], uint32(finalDataBlocks))
-			// free_count = finalDataBlocks (all free initially)
-			binary.LittleEndian.PutUint32(eatNode[12:], uint32(finalDataBlocks))
-			// left_child = 0 (no child - this is a leaf node initially)
-			binary.LittleEndian.PutUint64(eatNode[16:], 0)
-			// right_child = 0 (no child)
-			binary.LittleEndian.PutUint64(eatNode[24:], 0)
+			// 5. EAT block (placeholder — already zero from truncation)
 
-			// Write EAT node at block 3 (offset 3 * 4096 = 12288)
-			if _, err := file.WriteAt(eatNode, int64(sb.Lay.EATOffset*sb.Lay.BlockSize)); err != nil {
-				return fmt.Errorf("write EAT trie node: %w", err)
+			// 6. Trie root header block
+			// struct briefs_trie_root at start of block:
+			//   magic(4), version(4), root_node(8), free_list(8), node_count(4), reserved(28) = 56 bytes used, padded to 4096
+			trieRootBuf := make([]byte, blockSize)
+			tr := types.TrieRoot{
+				Magic:     0x54524945, // "TRIE"
+				Version:   1,
+				RootNode:  1, // first node data block within pool (block after header)
+				FreeList:  0,
+				NodeCount: uint32(len(finalBuilder.Nodes)),
+			}
+			copy(trieRootBuf[:32], tr.MarshalBinary())
+			if _, err := file.WriteAt(trieRootBuf, int64(trieRootBlock*blockSize)); err != nil {
+				return fmt.Errorf("write trie root header: %w", err)
 			}
 
-			// Write superblock last (at offset 0)
-			sbBlock := make([]byte, sb.Lay.BlockSize)
-			copy(sbBlock, sb.MarshalBinary())
-			if _, err := file.WriteAt(sbBlock, 0); err != nil {
-				return fmt.Errorf("write superblock: %w", err)
+			// 7. Trie node data blocks
+			trieBlocks := finalBuilder.WriteNodes()
+			for i, nodeBlock := range trieBlocks {
+				writeBlock := trieDataStart + uint64(i)
+				if _, err := file.WriteAt(nodeBlock, int64(writeBlock*blockSize)); err != nil {
+					return fmt.Errorf("write trie node block %d at %d: %w", i, writeBlock, err)
+				}
 			}
 
+			// 8. Journal — write a checkpoint in the first journal block
+			journalBuf := make([]byte, blockSize)
+			// Journal block header (16 bytes)
+			binary.LittleEndian.PutUint32(journalBuf[0:], 0x4A4E4C5A) // "JNLZ" magic
+			binary.LittleEndian.PutUint32(journalBuf[4:], 0)          // block_seq
+			binary.LittleEndian.PutUint32(journalBuf[8:], 1)          // record_count
+			// Checkpoint record header at offset 16
+			recOff := uint64(16)
+			binary.LittleEndian.PutUint32(journalBuf[recOff:], 9)     // type = JRN_CHECKPOINT
+			binary.LittleEndian.PutUint32(journalBuf[recOff+4:], 0)   // flags
+			binary.LittleEndian.PutUint32(journalBuf[recOff+8:], 80)  // data_len
+			binary.LittleEndian.PutUint32(journalBuf[recOff+12:], 0)  // checksum
+			// Checkpoint record data at offset 32 (80 bytes)
+			cpOff := recOff + 16
+			binary.LittleEndian.PutUint64(journalBuf[cpOff:], 1)    // checkpoint_seq = 1
+			binary.LittleEndian.PutUint32(journalBuf[cpOff+8:], 1)  // record_count
+			binary.LittleEndian.PutUint64(journalBuf[cpOff+16:], 0) // log_sequence_end
+			binary.LittleEndian.PutUint64(journalBuf[cpOff+24:], 0) // trie_root_node
+			binary.LittleEndian.PutUint64(journalBuf[cpOff+32:], finalDataBlocks) // free_data_count
+			binary.LittleEndian.PutUint64(journalBuf[cpOff+40:], estInodes-1)     // free_inode_count
+			if _, err := file.WriteAt(journalBuf, int64(journalOffset*blockSize)); err != nil {
+				return fmt.Errorf("write journal checkpoint: %w", err)
+			}
+
+			// --- Report ---
 			fmt.Fprintf(os.Stderr, "Created filesystem: %s (%d blocks × %d bytes)\n",
 				path, totalBlocks, blockSize)
-			fmt.Fprintf(os.Stderr, "  inodes:   %d\n", sb.TotalInodes())
-			fmt.Fprintf(os.Stderr, "  journal:  %d blocks\n", sb.JournalBlocks())
-			fmt.Fprintf(os.Stderr, "  data:     %d blocks\n", sb.DataBlocks())
-			fmt.Fprintf(os.Stderr, "  inode bitmap: %d blocks at offset %d\n", sb.Lay.InodeBMBlocks, sb.Lay.InodeBMOffset)
-			fmt.Fprintf(os.Stderr, "  data bitmap:  %d blocks at offset %d\n", sb.Lay.DataBitmapBlocks, sb.Lay.DataBitmapOffset)
-			fmt.Fprintf(os.Stderr, "  EAT trie: %d blocks at offset %d\n", sb.Lay.EATBlocks, sb.Lay.EATOffset)
-
+			fmt.Fprintf(os.Stderr, "  inodes:       %d\n", estInodes)
+			fmt.Fprintf(os.Stderr, "  journal:      %d blocks at %d\n", journalBlocks, journalOffset)
+			fmt.Fprintf(os.Stderr, "  data blocks:  %d (blocks %d..%d)\n",
+				finalDataBlocks, dataRegionStart, journalOffset-1)
+			fmt.Fprintf(os.Stderr, "  inode bitmap: %d blocks at offset %d\n", inodeBMBlocks, inodeBMOffset)
+			fmt.Fprintf(os.Stderr, "  data bitmap:  %d blocks at offset %d\n", dataBMBlocks, dataBMOffset)
+			fmt.Fprintf(os.Stderr, "  inode table:  %d blocks at offset %d\n", inodeTableBlocks, inodeTableOffset)
+			fmt.Fprintf(os.Stderr, "  EAT:          %d block(s) at offset %d\n", eatBlocks, eatOffset)
+			fmt.Fprintf(os.Stderr, "  trie pool:    %d blocks at offset %d (header + %d data, %d nodes)\n",
+				triePoolSize, triePoolStart, trieNodeBlocksCount, len(finalBuilder.Nodes))
+			fmt.Fprintf(os.Stderr, "  trie root:    block %d\n", trieRootBlock)
 			return nil
 		},
 	}
