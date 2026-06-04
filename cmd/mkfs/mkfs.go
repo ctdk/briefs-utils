@@ -360,7 +360,7 @@ func main() {
 			tr := types.TrieRoot{
 				Magic:     0x54524945, // "TRIE"
 				Version:   1,
-				RootNode:  1, // first node data block within pool (block after header)
+				RootNode:  0, // first node in the trie data (node at index 0 = root)
 				FreeList:  0,
 				NodeCount: uint32(len(finalBuilder.Nodes)),
 			}
