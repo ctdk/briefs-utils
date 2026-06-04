@@ -42,7 +42,7 @@ func GetDevice(path string, blocksize uint64) (*BlockDevice, error) {
 
 	// is pos is 0 or somehow negative, that's definitely wrong
 	if pos <= 0 {
-		devErr := fmt.Errorf("error: somehow the last file position was %d, which is invalid")
+		devErr := fmt.Errorf("error: somehow the last file position was %d, which is invalid", pos)
 		return nil, devErr
 	}
 	bd := new(BlockDevice)
