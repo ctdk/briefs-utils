@@ -172,17 +172,18 @@ func (tr *TrieRoot) MarshalBinary() []byte {
 	return data
 }
 
-// DirEntry is a compact on-disk directory entry (12 bytes).
+// DirEntry is a compact on-disk directory entry (16 bytes).
 // Names are stored in the trailing variable-length name region of the
 // directory block, referenced by NameOff/NameLen.
 // NameOff is the offset from the end of the block to the start of the
 // name entry (including the 2-byte length prefix).
 type DirEntry struct {
-	Inode   uint64
-	Type    uint8  // file type (S_IFMT bits)
-	Flags   uint8
-	NameLen uint16 // 1..BRIEFS_NAME_LEN (255)
-	NameOff uint16 // offset from block end into name region
+	Inode    uint64
+	Type     uint8  // file type (S_IFMT bits)
+	Flags    uint8
+	Reserved [2]byte // padding to 16-byte alignment
+	NameLen  uint16 // 1..BRIEFS_NAME_LEN (255)
+	NameOff  uint16 // offset from block end into name region
 }
 
 // DirBlock is a directory block header (16 bytes).
@@ -212,7 +213,7 @@ func NewDirBlock(entries []DirBlockEntry) []byte {
 
 	// Entry array starts at offset 16
 	hdrEnd := 16
-	entrySz := 12
+	entrySz := 16 // Go struct is padded to 16 bytes (12 bytes data + 4 padding)
 
 	// Write entries and pack names
 	namePos := blockSize // grows downward
@@ -231,13 +232,15 @@ func NewDirBlock(entries []DirBlockEntry) []byte {
 		binary.LittleEndian.PutUint16(buf[entryStart:], uint16(nameLen))
 		copy(buf[entryStart+2:], e.Name)
 
-		// Write DirEntry at position hdrEnd + i*12
+		// Write DirEntry at position hdrEnd + i*16
 		off := hdrEnd + i*entrySz
 		binary.LittleEndian.PutUint64(buf[off:], e.Inode)
 		buf[off+8] = e.Type
 		buf[off+9] = e.Flags
-		binary.LittleEndian.PutUint16(buf[off+10:], uint16(nameLen))
-		binary.LittleEndian.PutUint16(buf[off+12:], uint16(namePos-entryStart))
+		buf[off+10] = 0 // Reserved
+		buf[off+11] = 0 // Reserved
+		binary.LittleEndian.PutUint16(buf[off+12:], uint16(nameLen))
+		binary.LittleEndian.PutUint16(buf[off+14:], uint16(namePos-entryStart))
 
 		namePos = entryStart
 	}
