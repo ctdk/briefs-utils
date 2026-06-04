@@ -240,7 +240,7 @@ func NewDirBlock(entries []DirBlockEntry) []byte {
 		buf[off+10] = 0 // Reserved
 		buf[off+11] = 0 // Reserved
 		binary.LittleEndian.PutUint16(buf[off+12:], uint16(nameLen))
-		binary.LittleEndian.PutUint16(buf[off+14:], uint16(namePos-entryStart))
+		binary.LittleEndian.PutUint16(buf[off+14:], uint16(blockSize-entryStart))
 
 		namePos = entryStart
 	}
