@@ -317,7 +317,7 @@ func main() {
 
 			// 5. Root inode (inode 1) at first slot of inode table
 			rootInode := types.NewInode(1, types.ModeDir|0755)
-			rootInode.FileSize = uint64(2*80 + 16) // 2 entries * 80 + block header = 176 bytes
+			rootInode.FileSize = uint64(16 + 2*16) // 16-byte header + 2 entries × 16 bytes = 48
 			rootInode.Nlinks = 2                              // . and ..
 			rootInode.NumExtentsInline = 1
 			rootInode.NumExtentsTotal = 1
