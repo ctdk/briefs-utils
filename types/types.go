@@ -172,54 +172,90 @@ func (tr *TrieRoot) MarshalBinary() []byte {
 	return data
 }
 
-// DirEntry is an on-disk directory entry (80 bytes).
-// Matches `struct briefs_dir_entry` in the kernel module.
+// DirEntry is a compact on-disk directory entry (12 bytes).
+// Names are stored in the trailing variable-length name region of the
+// directory block, referenced by NameOff/NameLen.
+// NameOff is the offset from the end of the block to the start of the
+// name entry (including the 2-byte length prefix).
 type DirEntry struct {
-	Inode    uint64
-	NameLen  uint32
-	Type     uint32 // file type (S_IFMT bits)
-	Name     [64]byte
+	Inode   uint64
+	Type    uint8  // file type (S_IFMT bits)
+	Flags   uint8
+	NameLen uint16 // 1..BRIEFS_NAME_LEN (255)
+	NameOff uint16 // offset from block end into name region
 }
 
-// DirBlock is a directory block on disk (4096 bytes).
-// Matches `struct briefs_dir_block` in the kernel module.
+// DirBlock is a directory block header (16 bytes).
+// Followed by a variable-length array of DirEntry structs, then a
+// packed name region growing downward from block_size.
+//
+// Names are stored with a 2-byte length prefix for forward scanning:
+//   [len:2][name bytes...]
+// The region grows downward so the newest name is closest to block end.
+// NameOff = offset from block end to the start of the name entry
 type DirBlock struct {
 	Magic      uint32 // "DRYR" - 0x44525952
-	EntryCount uint32
-	Flags      uint32
-	Reserved   uint32
-	Entries    [4]DirEntry
+	NumEntries uint32
+	DataSize   uint32 // bytes used by entries (header + entries)
+	NamesSize  uint32 // bytes used by packed name region
 }
 
-// NewDirBlock creates a directory block with the given entries.
-func NewDirBlock(entries []DirEntry) DirBlock {
-	db := DirBlock{
-		Magic:      0x44525952, // "DRYR"
-		EntryCount: uint32(len(entries)),
-	}
-	for i, e := range entries {
-		if i < 4 {
-			db.Entries[i] = e
-		}
-	}
-	return db
-}
-
-// MarshalBinary serializes the directory block to 4096 bytes.
-func (db *DirBlock) MarshalBinary() []byte {
+// NewDirBlock creates a directory block buffer (4096 bytes) with the
+// given entries and their variable-length names packed.
+func NewDirBlock(entries []DirBlockEntry) []byte {
 	buf := make([]byte, 4096)
-	pos := 0
-	binary.LittleEndian.PutUint32(buf[pos:], db.Magic); pos += 4
-	binary.LittleEndian.PutUint32(buf[pos:], db.EntryCount); pos += 4
-	binary.LittleEndian.PutUint32(buf[pos:], db.Flags); pos += 4
-	binary.LittleEndian.PutUint32(buf[pos:], db.Reserved); pos += 4
-	for i := 0; i < 4; i++ {
-		binary.LittleEndian.PutUint64(buf[pos:], db.Entries[i].Inode); pos += 8
-		binary.LittleEndian.PutUint32(buf[pos:], db.Entries[i].NameLen); pos += 4
-		binary.LittleEndian.PutUint32(buf[pos:], db.Entries[i].Type); pos += 4
-		copy(buf[pos:pos+64], db.Entries[i].Name[:]); pos += 64
+	blockSize := 4096
+
+	// Write header
+	binary.LittleEndian.PutUint32(buf[0:], 0x44525952) // "DRYR"
+	binary.LittleEndian.PutUint32(buf[4:], uint32(len(entries)))
+
+	// Entry array starts at offset 16
+	hdrEnd := 16
+	entrySz := 12
+
+	// Write entries and pack names
+	namePos := blockSize // grows downward
+	for i, e := range entries {
+		nameLen := len(e.Name)
+		if nameLen < 1 || nameLen > 255 {
+			continue
+		}
+
+		// Pack name: [len:2][name:nameLen] prepended from end
+		entryStart := namePos - (2 + nameLen)
+		if entryStart < hdrEnd+(i+1)*entrySz {
+			// Out of space — stop
+			break
+		}
+		binary.LittleEndian.PutUint16(buf[entryStart:], uint16(nameLen))
+		copy(buf[entryStart+2:], e.Name)
+
+		// Write DirEntry at position hdrEnd + i*12
+		off := hdrEnd + i*entrySz
+		binary.LittleEndian.PutUint64(buf[off:], e.Inode)
+		buf[off+8] = e.Type
+		buf[off+9] = e.Flags
+		binary.LittleEndian.PutUint16(buf[off+10:], uint16(nameLen))
+		binary.LittleEndian.PutUint16(buf[off+12:], uint16(namePos-entryStart))
+
+		namePos = entryStart
 	}
+
+	dirDataSize := uint32(hdrEnd + len(entries)*entrySz)
+	namesSize := uint32(blockSize - namePos)
+	binary.LittleEndian.PutUint32(buf[8:], dirDataSize)
+	binary.LittleEndian.PutUint32(buf[12:], namesSize)
+
 	return buf
+}
+
+// DirBlockEntry is a logical directory entry (before serialization).
+type DirBlockEntry struct {
+	Inode uint64
+	Type  uint8
+	Flags uint8
+	Name  string
 }
 
 // Extent helpers

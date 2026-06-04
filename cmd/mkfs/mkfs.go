@@ -291,25 +291,21 @@ func main() {
 			rootDirBlock := dataRegionStart
 
 			// Build the directory block with . and .. entries (both point to inode 1)
-			typeMask := uint32(types.ModeDir)
+			typeMask := uint8(types.ModeDir >> 9) // S_IFDIR bit (040000 >> 9 = 004)
 
-			dotEntry := types.DirEntry{
-				Inode:   1,
-				NameLen: 1,
-				Type:    typeMask,
+			dotEntry := types.DirBlockEntry{
+				Inode: 1,
+				Type:  typeMask,
+				Name:  ".",
 			}
-			dotEntry.Name[0] = '.'
 
-			dotDotEntry := types.DirEntry{
-				Inode:   1,
-				NameLen: 2,
-				Type:    typeMask,
+			dotDotEntry := types.DirBlockEntry{
+				Inode: 1,
+				Type:  typeMask,
+				Name:  "..",
 			}
-			dotDotEntry.Name[0] = '.'
-			dotDotEntry.Name[1] = '.'
 
-			dirBlock := types.NewDirBlock([]types.DirEntry{dotEntry, dotDotEntry})
-			dirBlockData := dirBlock.MarshalBinary()
+			dirBlockData := types.NewDirBlock([]types.DirBlockEntry{dotEntry, dotDotEntry})
 			if _, err := file.WriteAt(dirBlockData, int64(rootDirBlock*blockSize)); err != nil {
 				return fmt.Errorf("write root directory block at %d: %w", rootDirBlock, err)
 			}
