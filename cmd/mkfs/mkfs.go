@@ -285,8 +285,48 @@ func main() {
 				return fmt.Errorf("write data bitmap: %w", err)
 			}
 
-			// 4. Root inode (inode 1) at first slot of inode table
+			// 4. Root directory block
+			// Allocate the first data block for the root directory's contents.
+			// The kernel will look at root inode -> inline extent -> dir block.
+			rootDirBlock := dataRegionStart
+
+			// Build the directory block with . and .. entries (both point to inode 1)
+			typeMask := uint32(types.ModeDir)
+
+			dotEntry := types.DirEntry{
+				Inode:   1,
+				NameLen: 1,
+				Type:    typeMask,
+			}
+			dotEntry.Name[0] = '.'
+
+			dotDotEntry := types.DirEntry{
+				Inode:   1,
+				NameLen: 2,
+				Type:    typeMask,
+			}
+			dotDotEntry.Name[0] = '.'
+			dotDotEntry.Name[1] = '.'
+
+			dirBlock := types.NewDirBlock([]types.DirEntry{dotEntry, dotDotEntry})
+			dirBlockData := dirBlock.MarshalBinary()
+			if _, err := file.WriteAt(dirBlockData, int64(rootDirBlock*blockSize)); err != nil {
+				return fmt.Errorf("write root directory block at %d: %w", rootDirBlock, err)
+			}
+
+			// Mark the root directory block as allocated in the data bitmap
+			dataBitmapByte := rootDirBlock / 8
+			dataBitmapBit := rootDirBlock % 8
+			dataBitmap[dataBitmapByte] |= uint8(1 << dataBitmapBit)
+
+			// 5. Root inode (inode 1) at first slot of inode table
 			rootInode := types.NewInode(1, types.ModeDir|0755)
+			rootInode.FileSize = uint64(2*80 + 16) // 2 entries * 80 + block header = 176 bytes
+			rootInode.Nlinks = 2                              // . and ..
+			rootInode.NumExtentsInline = 1
+			rootInode.NumExtentsTotal = 1
+			rootInode.SetInlineExtent(0, 0, rootDirBlock, 1, 0)
+
 			inodeBlock, inodeByteOffset := calculateInodeLocation(sb, 1)
 			fileOffset := int64(inodeBlock*blockSize + inodeByteOffset)
 			if err := rootInode.WriteAt(file, fileOffset); err != nil {
@@ -299,7 +339,23 @@ func main() {
 				return fmt.Errorf("write updated inode bitmap: %w", err)
 			}
 
-			// 5. EAT block (placeholder — already zero from truncation)
+			// Write updated data bitmap (root dir block allocated)
+			if _, err := file.WriteAt(dataBitmap, int64(dataBMOffset*blockSize)); err != nil {
+				return fmt.Errorf("write updated data bitmap: %w", err)
+			}
+
+			// Update superblock's free counts (1 data block used, 1 inode used)
+			sb.Lay.FreeDataBlks = finalDataBlocks - 1
+			sb.Lay.FreeInodes = estInodes - 1
+
+			// Write updated superblock
+			updatedSbData := make([]byte, blockSize)
+			copy(updatedSbData, sb.MarshalBinary())
+			if _, err := file.WriteAt(updatedSbData, 0); err != nil {
+				return fmt.Errorf("write updated superblock: %w", err)
+			}
+
+			// 6. EAT block (placeholder — already zero from truncation)
 
 			// 6. Trie root header block
 			// struct briefs_trie_root at start of block:
@@ -344,7 +400,7 @@ func main() {
 			binary.LittleEndian.PutUint32(journalBuf[cpOff+8:], 1)  // record_count
 			binary.LittleEndian.PutUint64(journalBuf[cpOff+16:], 0) // log_sequence_end
 			binary.LittleEndian.PutUint64(journalBuf[cpOff+24:], 0) // trie_root_node
-			binary.LittleEndian.PutUint64(journalBuf[cpOff+32:], finalDataBlocks) // free_data_count
+			binary.LittleEndian.PutUint64(journalBuf[cpOff+32:], finalDataBlocks-1) // free_data_count
 			binary.LittleEndian.PutUint64(journalBuf[cpOff+40:], estInodes-1)     // free_inode_count
 			if _, err := file.WriteAt(journalBuf, int64(journalOffset*blockSize)); err != nil {
 				return fmt.Errorf("write journal checkpoint: %w", err)
@@ -355,15 +411,15 @@ func main() {
 				path, totalBlocks, blockSize)
 			fmt.Fprintf(os.Stderr, "  inodes:       %d\n", estInodes)
 			fmt.Fprintf(os.Stderr, "  journal:      %d blocks at %d\n", journalBlocks, journalOffset)
-			fmt.Fprintf(os.Stderr, "  data blocks:  %d (blocks %d..%d)\n",
-				finalDataBlocks, dataRegionStart, journalOffset-1)
+			fmt.Fprintf(os.Stderr, "  data blocks:  %d (blocks %d..%d, %d free)\n",
+				finalDataBlocks, dataRegionStart, journalOffset-1, finalDataBlocks-1)
 			fmt.Fprintf(os.Stderr, "  inode bitmap: %d blocks at offset %d\n", inodeBMBlocks, inodeBMOffset)
 			fmt.Fprintf(os.Stderr, "  data bitmap:  %d blocks at offset %d\n", dataBMBlocks, dataBMOffset)
 			fmt.Fprintf(os.Stderr, "  inode table:  %d blocks at offset %d\n", inodeTableBlocks, inodeTableOffset)
 			fmt.Fprintf(os.Stderr, "  EAT:          %d block(s) at offset %d\n", eatBlocks, eatOffset)
 			fmt.Fprintf(os.Stderr, "  trie pool:    %d blocks at offset %d (header + %d data, %d nodes)\n",
 				triePoolSize, triePoolStart, trieNodeBlocksCount, len(finalBuilder.Nodes))
-			fmt.Fprintf(os.Stderr, "  trie root:    block %d\n", trieRootBlock)
+			fmt.Fprintf(os.Stderr, "  root dir:     block %d, . and .. entries written\n", rootDirBlock)
 			return nil
 		},
 	}

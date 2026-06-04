@@ -167,6 +167,79 @@ func (tr *TrieRoot) MarshalBinary() []byte {
 	return data
 }
 
+// DirEntry is an on-disk directory entry (80 bytes).
+// Matches `struct briefs_dir_entry` in the kernel module.
+type DirEntry struct {
+	Inode    uint64
+	NameLen  uint32
+	Type     uint32 // file type (S_IFMT bits)
+	Name     [64]byte
+}
+
+// DirBlock is a directory block on disk (4096 bytes).
+// Matches `struct briefs_dir_block` in the kernel module.
+type DirBlock struct {
+	Magic      uint32 // "DRYR" - 0x44525952
+	EntryCount uint32
+	Flags      uint32
+	Reserved   uint32
+	Entries    [4]DirEntry
+}
+
+// NewDirBlock creates a directory block with the given entries.
+func NewDirBlock(entries []DirEntry) DirBlock {
+	db := DirBlock{
+		Magic:      0x44525952, // "DRYR"
+		EntryCount: uint32(len(entries)),
+	}
+	for i, e := range entries {
+		if i < 4 {
+			db.Entries[i] = e
+		}
+	}
+	return db
+}
+
+// MarshalBinary serializes the directory block to 4096 bytes.
+func (db *DirBlock) MarshalBinary() []byte {
+	buf := make([]byte, 4096)
+	pos := 0
+	binary.LittleEndian.PutUint32(buf[pos:], db.Magic); pos += 4
+	binary.LittleEndian.PutUint32(buf[pos:], db.EntryCount); pos += 4
+	binary.LittleEndian.PutUint32(buf[pos:], db.Flags); pos += 4
+	binary.LittleEndian.PutUint32(buf[pos:], db.Reserved); pos += 4
+	for i := 0; i < 4; i++ {
+		binary.LittleEndian.PutUint64(buf[pos:], db.Entries[i].Inode); pos += 8
+		binary.LittleEndian.PutUint32(buf[pos:], db.Entries[i].NameLen); pos += 4
+		binary.LittleEndian.PutUint32(buf[pos:], db.Entries[i].Type); pos += 4
+		copy(buf[pos:pos+64], db.Entries[i].Name[:]); pos += 64
+	}
+	return buf
+}
+
+// Extent helpers
+
+// SetInlineExtent sets one of the 8 inline extents on an inode.
+func (in *Inode) SetInlineExtent(index int, offset, phys, length, flags uint64) {
+	if index < 0 || index >= 8 {
+		return
+	}
+	in.InlineExtents[index] = Extent{
+		Offset: offset,
+		Phys:   phys,
+		Len:    length,
+		Flags:  uint32(flags),
+		Pad:    0,
+	}
+	// Update inline extent count if this is the last one
+	if index+1 > int(in.NumExtentsInline) {
+		in.NumExtentsInline = uint32(index + 1)
+	}
+	if index+1 > int(in.NumExtentsTotal) {
+		in.NumExtentsTotal = uint64(index + 1)
+	}
+}
+
 // nextPowerOf2 returns the smallest power of 2 >= n.
 func nextPowerOf2(n uint64) uint64 {
 	if n <= 1 {
@@ -517,6 +590,8 @@ func (in *Inode) WriteAt(file *os.File, offset int64) error {
 	binary.LittleEndian.PutUint64(block[pos:], in.AtimeNsec); pos += 8
 	binary.LittleEndian.PutUint64(block[pos:], in.MtimeSec); pos += 8
 	binary.LittleEndian.PutUint64(block[pos:], in.MtimeNsec); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.CreationTimeSec); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.CreationTimeNsec); pos += 8
 	binary.LittleEndian.PutUint32(block[pos:], in.Nlinks); pos += 4
 	binary.LittleEndian.PutUint32(block[pos:], in.NumExtentsInline); pos += 4
 	binary.LittleEndian.PutUint64(block[pos:], in.ExtentInlineBase); pos += 8
@@ -537,7 +612,7 @@ func (in *Inode) WriteAt(file *os.File, offset int64) error {
 	binary.LittleEndian.PutUint32(block[pos:], in.LinkCount); pos += 4
 	binary.LittleEndian.PutUint32(block[pos:], in.Flags); pos += 4
 
-	copy(block[pos:pos+112], in.Reserved[:])
+	copy(block[pos:pos+96], in.Reserved[:])
 
 	written, err := file.WriteAt(block, offset)
 	if err != nil {
