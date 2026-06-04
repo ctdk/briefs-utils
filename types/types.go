@@ -22,7 +22,7 @@ func init() {
 
 // Magic numbers for our filesystem structures.
 const (
-	MagicSuperblock = 0x50656c6963616e62 // "Pelicanb"
+	MagicSuperblock = 0x504C434E        // "PLCN"
 	MagicInode      = 0x494E4F44        // "INOD"
 	MagicTrieNode   = 0x54524945        // "TRIE"
 	MagicDirEntry   = 0x44495245        // "DIRE"
