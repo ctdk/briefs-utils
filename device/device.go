@@ -66,11 +66,11 @@ func (bd *BlockDevice) KiloBytes() int64 {
 }
 
 func (bd *BlockDevice) MegaBytes() int64 {
-	return bd.size / kbSize
+	return bd.size / mbSize
 }
 
 func (bd *BlockDevice) GigaBytes() int64 {
-	return bd.size / kbSize
+	return bd.size / gbSize
 }
 
 func (bd *BlockDevice) TeraBytes() int64 {
