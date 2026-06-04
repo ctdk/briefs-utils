@@ -54,6 +54,11 @@ const (
 	// Superblock reserved area padding. Matches _BRIEFS_SUPER_RESERVED in
 	// briefs.h in the kernel module.
 	BrieFsSuperReserved = 640
+
+	// BrieFS version numbers for this version of briefs-utils
+	BrieFSMajorVersion = 0
+	BrieFSMinorVersion = 1
+	BrieFSPatchVersion = 0
 )
 
 // SuperblockLayout is the on-disk format (first 4KB block).
@@ -375,8 +380,8 @@ func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, labe
 
 	sb.Lay.Magic = MagicSuperblock
 	sb.Lay.MajorVer = 0
-	sb.Lay.MinorVer = 0
-	sb.Lay.PatchVer = 1
+	sb.Lay.MinorVer = 1
+	sb.Lay.PatchVer = 0
 	sb.Lay.TotalBlocks = totalBlocks
 	sb.Lay.BlockSize = blockSize
 	sb.Lay.InodeSize = inodeSize
