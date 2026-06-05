@@ -27,6 +27,14 @@ func calculateInodeLocation(sb *types.Superblock, inodeNum uint64) (blockOffset 
 	return blockOffset, byteOffset
 }
 
+// TODO: mkfs.briefs should use the same general argument and flag format that
+// other mkfs programs use, i.e. "mkfs.briefs <options> /dev/sda1" instead of
+// "mkfs.briefs <options> -o /dev/sda1". Will deal with later, since it looks
+// like that'll require a bit of wiring to get the help message showing the
+// right things.
+//
+// On the plus side, I learned that it's easy to make man pages with apps that
+// use github.com/urfave/cli for flag/arg processing. Huzzah!
 func main() {
 	app := &cli.App{
 		Name:  "mkfs.briefs",
