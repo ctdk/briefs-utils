@@ -162,6 +162,8 @@ func main() {
 			// Build final trie
 			finalBuilder := types.NewAllocTreeBuilder(finalDataBlocks)
 			finalBuilder.Build(finalDataBlocks)
+			// Mark block 0 (data-relative) as allocated for the root directory block
+			finalBuilder.MarkRangeAllocated(0, 1)
 			finalTrieDataBlocks := finalBuilder.NbBlocks()
 			if finalTrieDataBlocks < 1 {
 				finalTrieDataBlocks = 1
@@ -317,7 +319,7 @@ func main() {
 
 			// 5. Root inode (inode 1) at first slot of inode table
 			rootInode := types.NewInode(1, types.ModeDir|0755)
-			rootInode.FileSize = uint64(16 + 2*16) // 16-byte header + 2 entries × 16 bytes = 48
+			rootInode.FileSize = uint64(16 + 2*16 + 7) // data_size (48) + names_size (7) = 55
 			rootInode.Nlinks = 2                              // . and ..
 			rootInode.NumExtentsInline = 1
 			rootInode.NumExtentsTotal = 1

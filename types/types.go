@@ -378,6 +378,50 @@ func (tb *AllocTreeBuilder) NbBlocks() uint64 {
 	return (nodeCount + nodesPerBlock - 1) / nodesPerBlock
 }
 
+// recountInternal recalculates the free_count for an internal node from its children.
+func (tb *AllocTreeBuilder) recountInternal(nodeIdx uint64) {
+	node := &tb.Nodes[nodeIdx]
+	if node.RangeLen == 1 {
+		return
+	}
+	node.FreeCount = tb.Nodes[node.LeftChild].FreeCount + tb.Nodes[node.RightChild].FreeCount
+}
+
+// MarkRangeAllocated marks a range of blocks (data-relative) as allocated in the trie.
+func (tb *AllocTreeBuilder) MarkRangeAllocated(offset, count uint64) {
+	if count == 0 {
+		return
+	}
+	tb.markAllocRec(0, offset, count)
+}
+
+func (tb *AllocTreeBuilder) markAllocRec(nodeIdx, offset, count uint64) {
+	if count == 0 {
+		return
+	}
+	node := &tb.Nodes[nodeIdx]
+	if node.RangeLen == 1 {
+		// Leaf: mark allocated
+		node.FreeCount = 0
+		return
+	}
+	half := uint64(node.RangeLen) / 2
+	if offset+count <= half {
+		// Entirely in left child
+		tb.markAllocRec(node.LeftChild, offset, count)
+	} else if offset >= half {
+		// Entirely in right child
+		tb.markAllocRec(node.RightChild, offset-half, count)
+	} else {
+		// Spans both children
+		leftCount := half - offset
+		rightCount := count - leftCount
+		tb.markAllocRec(node.LeftChild, offset, leftCount)
+		tb.markAllocRec(node.RightChild, 0, rightCount)
+	}
+	tb.recountInternal(nodeIdx)
+}
+
 // WriteNodes packs the trie nodes into blocks. Returns one []byte per block.
 // The caller can write these blocks starting at (poolStartBlock + 1) since
 // block 0 of the pool is the trie root header.
