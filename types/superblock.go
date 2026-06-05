@@ -59,7 +59,7 @@ type SuperblockLayout struct {
 	// utf8, null padded
 	Label [64]byte
 
-	Reserved [BrieFsSuperReserved]uint8
+	Reserved [BrieFSSuperReserved]uint8
 }
 
 // Superblock represents the filesystem superblock.
@@ -104,7 +104,8 @@ func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, labe
 	// Set label
 	copy(sb.Lay.Label[:], []byte(label))
 
-	// Generate a UUID for this volume
+	// Generate a UUID for this volume. TODO: Allow passing in a UUID for
+	// this volume.
 	fsUuid := uuid.New()
 	for i, v := range fsUuid {
 		sb.Lay.UUID[i] = v
@@ -137,21 +138,16 @@ func (sb *Superblock) Write(path string) error {
 		return fmt.Errorf("write superblock: %w", err)
 	}
 
-	// TODO: Initialize bitmap blocks
-	// TODO: Initialize inode table
-	// TODO: Initialize journal with checkpoint record
-	// TODO: Initialize trie node pool
-
-	// For now, just zeros for remaining blocks
-	// (This is sufficient for testing - the C fsck can validate the format)
-
 	return nil
 }
 
 // MarshalBinary converts the superblock to binary format.
 func (sb *Superblock) MarshalBinary() []byte {
-	data := make([]byte, 4096)
+	data := make([]byte, BrieFSSuperSize)
 	pos := 0
+
+	// There are definitely more elegant ways to do this. Is it worth doing
+	// this more elegantly?
 
 	// Write fields in order
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.Magic); pos += 8
@@ -198,7 +194,7 @@ func (sb *Superblock) MarshalBinary() []byte {
 	copy(data[pos:pos+64], sb.Lay.Label[:]); pos += 64
 
 	// Pad to 4096 bytes
-	for i := pos; i < 4096; i++ {
+	for i := pos; i < BrieFSSuperSize; i++ {
 		data[i] = 0
 	}
 

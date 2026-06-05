@@ -47,7 +47,13 @@ const (
 
 	// Superblock reserved area padding. Matches _BRIEFS_SUPER_RESERVED in
 	// briefs.h in the kernel module.
-	BrieFsSuperReserved = 640
+	BrieFSSuperReserved = 640
+
+	// Size of the superblock in bytes. This matches the expectation on the
+	// C side of things. The golang side treating the superblock as being
+	// 4096 bytes works and all, but it's better to have both sides of this
+	// equation doing the same thing.
+	BrieFSSuperSize = 1024
 
 	// BrieFS version numbers for this version of briefs-utils
 	BrieFSMajorVersion = 0
