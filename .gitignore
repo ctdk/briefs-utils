@@ -1,6 +1,7 @@
 .*.sw?
 **/.*.sw?
-mkfs
-fsck
+./mkfs
+./fsck
 mkfs.briefs
 fsck.briefs
+*.exe
