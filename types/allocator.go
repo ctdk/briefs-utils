@@ -12,13 +12,15 @@ type AllocTreeBuilder struct {
 	NextIndex uint64
 }
 
-// NewAllocTreeBuilder creates a tree builder for the given number of data blocks.
-// The tree will be a complete binary trie where leaves represent individual blocks.
+// NewAllocTreeBuilder creates a tree builder for the given number of data 
+// blocks. The tree will be a complete binary trie where leaves represent
+// individual blocks.
 func NewAllocTreeBuilder(dataBlockCount uint64) *AllocTreeBuilder {
 	padded := nextPowerOf2(dataBlockCount)
 	// Total nodes in a complete binary trie covering `padded` leaf blocks:
-	// root (covers `padded`), 2 children (cover `padded/2`), 4 (cover `padded/4`), ..., padded leaves
-	// = 1 + 2 + 4 + ... + padded = 2 * padded - 1
+	// root (covers `padded`), 2 children (cover `padded/2`),
+	// 4 (cover `padded/4`), ..., padded leaves = 1 + 2 + 4 + ... 
+	// + padded = 2 * padded - 1
 	totalNodes := 2*padded - 1
 	if totalNodes < 1 {
 		totalNodes = 1
