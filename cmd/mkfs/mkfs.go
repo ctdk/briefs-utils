@@ -11,6 +11,8 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
+var versionStr = fmt.Sprintf("v%d.%d.%d", types.BrieFSMajorVersion, types.BrieFSMinorVersion, types.BrieFSPatchVersion)
+
 func roundUp(value, alignment uint64) uint64 {
 	return (value + alignment - 1) / alignment * alignment
 }
@@ -39,6 +41,7 @@ func main() {
 	app := &cli.App{
 		Name:  "mkfs.briefs",
 		Usage: "Create a new BrieFS filesystem",
+		Version: versionStr,
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:     "output",
