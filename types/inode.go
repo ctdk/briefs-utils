@@ -4,10 +4,13 @@ package types
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"time"
 )
+
+var InlineExtentRangeErr = errors.New("index out of range for inode inline extents")
 
 // Inode represents a filesystem inode (512 bytes).
 type Inode struct {
@@ -79,6 +82,8 @@ func (in *Inode) WriteAt(file *os.File, offset int64) error {
 	block := make([]byte, DefaultInodeSize)
 	pos := 0
 
+	// Same thing as with the superblock: There are definitely more elegant
+	// ways to do this. Is it worth pursuing that?
 	binary.LittleEndian.PutUint64(block[pos:], in.InodeNumber); pos += 8
 	binary.LittleEndian.PutUint64(block[pos:], in.Magic); pos += 8
 	binary.LittleEndian.PutUint32(block[pos:], in.Filemode); pos += 4
@@ -140,9 +145,9 @@ func (in *Inode) ValidateInode() bool {
 // Extent helpers
 
 // SetInlineExtent sets one of the 8 inline extents on an inode.
-func (in *Inode) SetInlineExtent(index int, offset, phys, length, flags uint64) {
+func (in *Inode) SetInlineExtent(index int, offset, phys, length, flags uint64) error {
 	if index < 0 || index >= 8 {
-		return
+		return InlineExtentRangeErr
 	}
 	in.InlineExtents[index] = Extent{
 		Offset: offset,
@@ -158,4 +163,6 @@ func (in *Inode) SetInlineExtent(index int, offset, phys, length, flags uint64) 
 	if index+1 > int(in.NumExtentsTotal) {
 		in.NumExtentsTotal = uint64(index + 1)
 	}
+
+	return nil
 }

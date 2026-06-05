@@ -323,7 +323,9 @@ func main() {
 			rootInode.Nlinks = 2                              // . and ..
 			rootInode.NumExtentsInline = 1
 			rootInode.NumExtentsTotal = 1
-			rootInode.SetInlineExtent(0, 0, rootDirBlock, 1, 0)
+			if err := rootInode.SetInlineExtent(0, 0, rootDirBlock, 1, 0); err != nil {
+				return err
+			}
 
 			inodeBlock, inodeByteOffset := calculateInodeLocation(sb, 1)
 			fileOffset := int64(inodeBlock*blockSize + inodeByteOffset)
