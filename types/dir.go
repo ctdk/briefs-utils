@@ -54,12 +54,16 @@ func NewDirBlock(entries []DirBlockEntry) []byte {
 	namePos := blockSize // grows downward
 	for i, e := range entries {
 		nameLen := len(e.Name)
-		if nameLen < 1 || nameLen > 255 {
+
+		// TODO: This should probably be an error.
+		if nameLen < 1 || nameLen > BrieFSMaxNameLen {
 			continue
 		}
 
 		// Pack name: [len:2][name:nameLen] prepended from end
 		entryStart := namePos - (2 + nameLen)
+
+		// TODO: also should be an error
 		if entryStart < hdrEnd+(i+1)*entrySz {
 			// Out of space — stop
 			break
