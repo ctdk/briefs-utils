@@ -57,7 +57,7 @@ type SuperblockLayout struct {
 	ReservedJournal [4]uint64
 
 	// utf8, null padded
-	Label [64]byte
+	Label [BrieFSVolLabelLen]byte
 
 	Reserved [BrieFSSuperReserved]uint8
 }
@@ -191,7 +191,7 @@ func (sb *Superblock) MarshalBinary() []byte {
 	copy(data[pos:pos+32], []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}); pos += 32
 
-	copy(data[pos:pos+64], sb.Lay.Label[:]); pos += 64
+	copy(data[pos:pos+BrieFSVolLabelLen], sb.Lay.Label[:]); pos += BrieFSVolLabelLen
 
 	// Pad to 4096 bytes
 	for i := pos; i < BrieFSSuperSize; i++ {

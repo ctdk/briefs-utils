@@ -55,6 +55,16 @@ const (
 	// equation doing the same thing.
 	BrieFSSuperSize = 1024
 
+	// BrieFS max name length. Theoretically there's nothing keeping this
+	// from being nearly infinite in length, but POSIX caps the name length
+	// to 255.
+	BrieFSMaxNameLen = 255
+
+	// Volume labels are straight up allocated 64 bytes, though. I don't
+	// know if that's for a reason or what, but I don't care that much. This
+	// const at least helps keep the magic numbers down.
+	BrieFSVolLabelLen = 64
+
 	// BrieFS version numbers for this version of briefs-utils
 	BrieFSMajorVersion = 0
 	BrieFSMinorVersion = 1
