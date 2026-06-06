@@ -279,45 +279,31 @@ func main() {
 				return fmt.Errorf("write data bitmap: %w", err)
 			}
 
-			// 4. Root directory block
-			// Allocate the first data block for the root directory's contents.
-			// The kernel will look at root inode -> inline extent -> dir block.
-			rootDirBlock := dataRegionStart
+			// 4. Root directory trie root
+			// Allocate a block for the directory trie root node
+			rootTrieBlock := dataRegionStart
+			// Initialize as a "TRN " intermediate node (empty root)
+			trieBlock := make([]byte, blockSize)
+			binary.LittleEndian.PutUint32(trieBlock[0:], 0x54524E20) // "TRN " magic
+			// child_count (offset 4): 0
+			// first_child (offset 8): 0
+			// next_sibling (offset 16): 0
+			trieBlock[24] = 0  // depth = 0
+			trieBlock[25] = 3  // node_type = NODE_TYPE_INTERM (3)
 
-			// Build the directory block with . and .. entries (both point to inode 1)
-			typeMask := uint8(types.ModeDir >> 9) // S_IFDIR bit (040000 >> 9 = 004)
-
-			dotEntry := types.DirBlockEntry{
-				Inode: 1,
-				Type:  typeMask,
-				Name:  ".",
+			if _, err := file.WriteAt(trieBlock, int64(rootTrieBlock*blockSize)); err != nil {
+				return fmt.Errorf("write root trie block at %d: %w", rootTrieBlock, err)
 			}
 
-			dotDotEntry := types.DirBlockEntry{
-				Inode: 1,
-				Type:  typeMask,
-				Name:  "..",
-			}
-
-			dirBlockData := types.NewDirBlock([]types.DirBlockEntry{dotEntry, dotDotEntry})
-			if _, err := file.WriteAt(dirBlockData, int64(rootDirBlock*blockSize)); err != nil {
-				return fmt.Errorf("write root directory block at %d: %w", rootDirBlock, err)
-			}
-
-			// Mark the root directory block as allocated in the data bitmap
-			dataBitmapByte := rootDirBlock / 8
-			dataBitmapBit := rootDirBlock % 8
+			// Mark the root trie block as allocated in the data bitmap
+			dataBitmapByte := rootTrieBlock / 8
+			dataBitmapBit := rootTrieBlock % 8
 			dataBitmap[dataBitmapByte] |= uint8(1 << dataBitmapBit)
 
 			// 5. Root inode (inode 1) at first slot of inode table
 			rootInode := types.NewInode(1, types.ModeDir|0755)
-			rootInode.FileSize = uint64(16 + 2*16 + 7) // data_size (48) + names_size (7) = 55
-			rootInode.Nlinks = 2                              // . and ..
-			rootInode.NumExtentsInline = 1
-			rootInode.NumExtentsTotal = 1
-			if err := rootInode.SetInlineExtent(0, 0, rootDirBlock, 1, 0); err != nil {
-				return err
-			}
+			rootInode.Nlinks = 2
+			rootInode.DirTrieRoot = rootTrieBlock
 
 			inodeBlock, inodeByteOffset := calculateInodeLocation(sb, 1)
 			fileOffset := int64(inodeBlock*blockSize + inodeByteOffset)
@@ -389,7 +375,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "  EAT:          %d block(s) at offset %d\n", eatBlocks, eatOffset)
 			fmt.Fprintf(os.Stderr, "  alloc pool:   %d blocks at offset %d (3-level bitmap)\n",
 				allocPoolSize, allocPoolStart)
-			fmt.Fprintf(os.Stderr, "  root dir:     block %d, . and .. entries written\n", rootDirBlock)
+			fmt.Fprintf(os.Stderr, "  root dir:     trie root at block %d\n", rootTrieBlock)
 			return nil
 		},
 	}
