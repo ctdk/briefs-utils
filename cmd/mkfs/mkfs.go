@@ -128,57 +128,37 @@ func main() {
 				inodeBitmapBlocks = 1
 			}
 
-			// Solve for trie pool size iteratively (depends on data block count)
-			triePoolHeader := uint64(1)
-
-			// Pass 1: estimate with rough trie size
-			estTrieDataBlocks := uint64(1) + uint64(uint64(totalBlocks)/20000)
-			if estTrieDataBlocks < 1 {
-				estTrieDataBlocks = 1
+			// Allocator pool size is deterministic — no iteration needed.
+			// Start with a rough estimate of data blocks to size the data bitmap,
+			// then compute the exact allocator size.
+			estAllocBlocks := uint64(1) + uint64(totalBlocks/100000)
+			if estAllocBlocks < 2 {
+				estAllocBlocks = 2
 			}
-			meta1 := uint64(1) + inodeBitmapBlocks + inodeTableBlocks + 1 + triePoolHeader + estTrieDataBlocks
-			estData1 := uint64(totalBlocks) - meta1 - journalBlocks
+
+			estData1 := uint64(totalBlocks) - inodeBitmapBlocks - inodeTableBlocks - 1 - estAllocBlocks - journalBlocks
 			if estData1 < 1 {
 				return fmt.Errorf("filesystem too small")
 			}
-
-			// Pass 2: refine data bitmap
 			dataBitmapBytes := (estData1 + 7) / 8
 			dataBitmapBlocks := roundUp(dataBitmapBytes, blockSize) / blockSize
 			if dataBitmapBlocks < 1 {
 				dataBitmapBlocks = 1
 			}
-			meta2 := uint64(1) + inodeBitmapBlocks + dataBitmapBlocks + inodeTableBlocks + 1 + triePoolHeader
-			estData2 := uint64(totalBlocks) - meta2 - journalBlocks
-			if estData2 < 1 {
-				return fmt.Errorf("filesystem too small")
-			}
 
-			// Pass 3: build trie with estimated data blocks
-			builder := types.NewAllocTreeBuilder(estData2)
-			builder.Build(estData2)
-			trieDataBlocks := builder.NbBlocks()
-			if trieDataBlocks < 1 {
-				trieDataBlocks = 1
-			}
-
-			// Pass 4: final calculation
-			meta3 := uint64(1) + inodeBitmapBlocks + dataBitmapBlocks + inodeTableBlocks + 1 +
-				triePoolHeader + trieDataBlocks
-			finalDataBlocks := uint64(totalBlocks) - meta3 - journalBlocks
+			// Compute final data blocks and exact allocator size (one pass)
+			finalDataBlocks := uint64(totalBlocks) - 1 - inodeBitmapBlocks - dataBitmapBlocks - inodeTableBlocks - 1 - journalBlocks
+			builder := types.NewAllocBuilder(finalDataBlocks)
+			allocBlocks := builder.NbBlocks()
+			finalDataBlocks = uint64(totalBlocks) - 1 - inodeBitmapBlocks - dataBitmapBlocks - inodeTableBlocks - 1 - allocBlocks - journalBlocks
 			if finalDataBlocks < 1 {
 				return fmt.Errorf("filesystem too small")
 			}
 
-			// Build final trie
-			finalBuilder := types.NewAllocTreeBuilder(finalDataBlocks)
-			finalBuilder.Build(finalDataBlocks)
-			// Mark block 0 (data-relative) as allocated for the root directory block
-			finalBuilder.MarkRangeAllocated(0, 1)
-			finalTrieDataBlocks := finalBuilder.NbBlocks()
-			if finalTrieDataBlocks < 1 {
-				finalTrieDataBlocks = 1
-			}
+			// Build final allocator with correct block count
+			finalBuilder := types.NewAllocBuilder(finalDataBlocks)
+			finalBuilder.MarkAllocated(0) // root dir block
+			allocBlocksFinal := finalBuilder.NbBlocks()
 
 			// --- Compute actual block offsets ---
 			nextBlock := uint64(0)
@@ -209,17 +189,15 @@ func main() {
 			eatBlocks := uint64(1)
 			nextBlock += eatBlocks
 
-			// Trie pool: header + node blocks
-			triePoolStart := nextBlock
-			trieRootBlock := nextBlock
-			nextBlock += triePoolHeader
+			// Allocator pool: header + level data (deterministic size)
+			allocPoolStart := nextBlock
+			allocHeaderBlock := nextBlock
+			nextBlock += 1 // header block
 
-			trieDataStart := nextBlock
-			trieNodeBlocksCount := finalTrieDataBlocks
-			nextBlock += trieNodeBlocksCount
+			allocDataBlocks := allocBlocksFinal - 1
+			nextBlock += allocDataBlocks
 
-			trieBlocksUsed := triePoolHeader + trieNodeBlocksCount
-			triePoolSize := trieBlocksUsed
+			allocPoolSize := allocBlocksFinal
 
 			// Data region start
 			dataRegionStart := nextBlock
@@ -246,10 +224,10 @@ func main() {
 			sb.Lay.EATOffset = eatOffset
 			sb.Lay.EATBlocks = eatBlocks
 
-			sb.Lay.TrieRootBlock = trieRootBlock
-			sb.Lay.TrieBlocksUsed = trieBlocksUsed
-			sb.Lay.TrieNodePoolStart = triePoolStart
-			sb.Lay.TrieNodePoolSize = triePoolSize
+			sb.Lay.TrieRootBlock = allocHeaderBlock
+			sb.Lay.TrieBlocksUsed = allocPoolSize
+			sb.Lay.TrieNodePoolStart = allocPoolStart
+			sb.Lay.TrieNodePoolSize = allocPoolSize
 
 			sb.Lay.JournalOffset = journalOffset
 			sb.Lay.JournalLogStart = journalOffset
@@ -368,28 +346,12 @@ func main() {
 
 			// 6. EAT block (placeholder — already zero from truncation)
 
-			// 6. Trie root header block
-			// struct briefs_trie_root at start of block:
-			//   magic(4), version(4), root_node(8), free_list(8), node_count(4), reserved(28) = 56 bytes used, padded to 4096
-			trieRootBuf := make([]byte, blockSize)
-			tr := types.TrieRoot{
-				Magic:     0x54524945, // "TRIE"
-				Version:   1,
-				RootNode:  0, // first node in the trie data (node at index 0 = root)
-				FreeList:  0,
-				NodeCount: uint32(len(finalBuilder.Nodes)),
-			}
-			copy(trieRootBuf[:32], tr.MarshalBinary())
-			if _, err := file.WriteAt(trieRootBuf, int64(trieRootBlock*blockSize)); err != nil {
-				return fmt.Errorf("write trie root header: %w", err)
-			}
-
-			// 7. Trie node data blocks
-			trieBlocks := finalBuilder.WriteNodes()
-			for i, nodeBlock := range trieBlocks {
-				writeBlock := trieDataStart + uint64(i)
-				if _, err := file.WriteAt(nodeBlock, int64(writeBlock*blockSize)); err != nil {
-					return fmt.Errorf("write trie node block %d at %d: %w", i, writeBlock, err)
+			// 7. Allocator pool blocks (header + level data)
+			allocWrites := finalBuilder.WriteBlocks()
+			for i, blk := range allocWrites {
+				writeBlock := allocPoolStart + uint64(i)
+				if _, err := file.WriteAt(blk, int64(writeBlock*blockSize)); err != nil {
+					return fmt.Errorf("write allocator block %d at %d: %w", i, writeBlock, err)
 				}
 			}
 
@@ -428,8 +390,8 @@ func main() {
 			fmt.Fprintf(os.Stderr, "  data bitmap:  %d blocks at offset %d\n", dataBMBlocks, dataBMOffset)
 			fmt.Fprintf(os.Stderr, "  inode table:  %d blocks at offset %d\n", inodeTableBlocks, inodeTableOffset)
 			fmt.Fprintf(os.Stderr, "  EAT:          %d block(s) at offset %d\n", eatBlocks, eatOffset)
-			fmt.Fprintf(os.Stderr, "  trie pool:    %d blocks at offset %d (header + %d data, %d nodes)\n",
-				triePoolSize, triePoolStart, trieNodeBlocksCount, len(finalBuilder.Nodes))
+			fmt.Fprintf(os.Stderr, "  alloc pool:   %d blocks at offset %d (3-level bitmap)\n",
+				allocPoolSize, allocPoolStart)
 			fmt.Fprintf(os.Stderr, "  root dir:     block %d, . and .. entries written\n", rootDirBlock)
 			return nil
 		},
