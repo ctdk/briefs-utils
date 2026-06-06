@@ -121,12 +121,10 @@ func main() {
 			inodesPerBlock := blockSize / inodeSize // 8
 			inodeTableBlocks := roundUp(estInodes, inodesPerBlock) / inodesPerBlock
 
-			// Inode bitmap size
-			inodeBitmapBytes := (estInodes + 7) / 8
-			inodeBitmapBlocks := roundUp(inodeBitmapBytes, blockSize) / blockSize
-			if inodeBitmapBlocks < 1 {
-				inodeBitmapBlocks = 1
-			}
+			// Inode bitmap size (3-level bitmap pyramid)
+			inodeAllocBuilder := types.NewAllocBuilder(estInodes)
+			inodeBitmapBlocks := inodeAllocBuilder.NbBlocks()
+			inodeAllocBlocks := inodeBitmapBlocks
 
 			// Allocator pool size is deterministic — no iteration needed.
 			// Start with a rough estimate of data blocks to size the data bitmap,
@@ -147,10 +145,10 @@ func main() {
 			}
 
 			// Compute final data blocks and exact allocator size (one pass)
-			finalDataBlocks := uint64(totalBlocks) - 1 - inodeBitmapBlocks - dataBitmapBlocks - inodeTableBlocks - 1 - journalBlocks
+			finalDataBlocks := uint64(totalBlocks) - 1 - inodeAllocBlocks - dataBitmapBlocks - inodeTableBlocks - 1 - journalBlocks
 			builder := types.NewAllocBuilder(finalDataBlocks)
 			allocBlocks := builder.NbBlocks()
-			finalDataBlocks = uint64(totalBlocks) - 1 - inodeBitmapBlocks - dataBitmapBlocks - inodeTableBlocks - 1 - allocBlocks - journalBlocks
+			finalDataBlocks = uint64(totalBlocks) - 1 - inodeAllocBlocks - dataBitmapBlocks - inodeTableBlocks - 1 - allocBlocks - journalBlocks
 			if finalDataBlocks < 1 {
 				return fmt.Errorf("filesystem too small")
 			}
@@ -264,10 +262,15 @@ func main() {
 				return fmt.Errorf("write superblock: %w", err)
 			}
 
-			// 2. Inode bitmap (all zeros)
-			inodeBitmap := make([]byte, int(inodeBMBlocks)*int(blockSize))
-			if _, err := file.WriteAt(inodeBitmap, int64(inodeBMOffset*blockSize)); err != nil {
-				return fmt.Errorf("write inode bitmap: %w", err)
+			// 2. Inode bitmap pyramid (3-level allocator)
+			// Mark root inode (index 0) as allocated
+			inodeAllocBuilder.MarkAllocated(0)
+			inodeBitmapWrites := inodeAllocBuilder.WriteBlocks()
+			for i, blk := range inodeBitmapWrites {
+				writeBlock := inodeBMOffset + uint64(i)
+				if _, err := file.WriteAt(blk, int64(writeBlock*blockSize)); err != nil {
+					return fmt.Errorf("write inode allocator block %d at %d: %w", i, writeBlock, err)
+				}
 			}
 
 			// 3. Data bitmap (all zeros — all data blocks free)
@@ -320,12 +323,6 @@ func main() {
 			fileOffset := int64(inodeBlock*blockSize + inodeByteOffset)
 			if err := rootInode.WriteAt(file, fileOffset); err != nil {
 				return fmt.Errorf("write root inode: %w", err)
-			}
-
-			// Mark root inode allocated in bitmap
-			inodeBitmap[0] |= 1
-			if _, err := file.WriteAt(inodeBitmap, int64(inodeBMOffset*blockSize)); err != nil {
-				return fmt.Errorf("write updated inode bitmap: %w", err)
 			}
 
 			// Write updated data bitmap (root dir block allocated)
@@ -386,7 +383,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "  journal:      %d blocks at %d\n", journalBlocks, journalOffset)
 			fmt.Fprintf(os.Stderr, "  data blocks:  %d (blocks %d..%d, %d free)\n",
 				finalDataBlocks, dataRegionStart, journalOffset-1, finalDataBlocks-1)
-			fmt.Fprintf(os.Stderr, "  inode bitmap: %d blocks at offset %d\n", inodeBMBlocks, inodeBMOffset)
+			fmt.Fprintf(os.Stderr, "  inode bitmap: %d blocks at offset %d (3-level bitmap pyramid)\n", inodeBMBlocks, inodeBMOffset)
 			fmt.Fprintf(os.Stderr, "  data bitmap:  %d blocks at offset %d\n", dataBMBlocks, dataBMOffset)
 			fmt.Fprintf(os.Stderr, "  inode table:  %d blocks at offset %d\n", inodeTableBlocks, inodeTableOffset)
 			fmt.Fprintf(os.Stderr, "  EAT:          %d block(s) at offset %d\n", eatBlocks, eatOffset)
