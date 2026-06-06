@@ -68,7 +68,7 @@ const (
 	// BrieFS version numbers for this version of briefs-utils
 	BrieFSMajorVersion = 0
 	BrieFSMinorVersion = 2
-	BrieFSPatchVersion = 0
+	BrieFSPatchVersion = 5
 )
 
 // Block layout constants - defines the order of metadata on disk
