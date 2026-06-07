@@ -20,7 +20,7 @@ func init() {
 const (
 	MagicSuperblock = 0x504C434E        // "PLCN"
 	MagicInode      = 0x494E4F44        // "INOD"
-	MagicTrieNode   = 0x54524945        // "TRIE"
+	MagicTrieNode   = 0x54524E20        // "TRN "
 	MagicDirEntry   = 0x44495245        // "DIRE"
 	MagicJournal    = 0x4A4E4C5A        // "JNLZ"
 	MagicCheckpoint = 0x43485053        // "CHPS"

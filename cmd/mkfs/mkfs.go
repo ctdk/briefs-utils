@@ -284,7 +284,7 @@ func main() {
 			rootTrieBlock := dataRegionStart
 			// Initialize as a "TRN " intermediate node (empty root)
 			trieBlock := make([]byte, blockSize)
-			binary.LittleEndian.PutUint32(trieBlock[0:], 0x54524E20) // "TRN " magic
+			binary.LittleEndian.PutUint32(trieBlock[0:], types.MagicTrieNode) // "TRN " magic
 			// child_count (offset 4): 0
 			// first_child (offset 8): 0
 			// next_sibling (offset 16): 0
