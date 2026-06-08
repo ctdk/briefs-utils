@@ -1,6 +1,8 @@
 BrieFS Utils
 ===========
 
+![The briefs-utils logo - a pelican wearing briefs (aka The Pelican's Briefs), but holding a hammer.](images/briefs-utils-logo-1.png)
+
 The filesystem utils for BrieFS (`mkfs.briefs`, `fsck.briefs`).
 
 mkfs.briefs
