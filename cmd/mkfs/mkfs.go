@@ -289,7 +289,7 @@ func main() {
 			// first_child (offset 8): 0
 			// next_sibling (offset 16): 0
 			trieBlock[24] = 0  // depth = 0
-			trieBlock[25] = 3  // node_type = NODE_TYPE_INTERM (3)
+			trieBlock[25] = 4  // node_type = NODE_TYPE_INTERM (4)
 
 			if _, err := file.WriteAt(trieBlock, int64(rootTrieBlock*blockSize)); err != nil {
 				return fmt.Errorf("write root trie block at %d: %w", rootTrieBlock, err)
