@@ -36,6 +36,12 @@ const (
 	DefaultInodeSize   = 512
 	DefaultJournalSize = 64 // blocks
 
+	// Trie node types — mirrors briefs.h NODE_TYPE_* / NODE_STATUS_*
+	NodeTypeFile     = 0x01
+	NodeTypeDir      = 0x02
+	NodeTypeInterm   = 0x04
+	NodeStatusLeaf   = 0x08
+
 	// Inode flags
 	InodeFlagReserved    = 0x00000001
 	InodeFlagCompressed  = 0x00000002
