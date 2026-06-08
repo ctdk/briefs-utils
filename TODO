@@ -1,0 +1,7 @@
+* Change mkfs.briefs' argument syntax to match the standard used by other 
+  filesystems' mkfs programs.
+* Add more filesystem options to mkfs.briefs as they become available.
+* Make fsck.briefs actually do something useful.
+* Make man pages.
+* The codebase is starting to feel a bit hairy. It could stand another round of
+  refactoring.

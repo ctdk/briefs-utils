@@ -20,7 +20,7 @@ func init() {
 const (
 	MagicSuperblock = 0x504C434E        // "PLCN"
 	MagicInode      = 0x494E4F44        // "INOD"
-	MagicTrieNode   = 0x54524945        // "TRIE"
+	MagicTrieNode   = 0x54524E20        // "TRN "
 	MagicDirEntry   = 0x44495245        // "DIRE"
 	MagicJournal    = 0x4A4E4C5A        // "JNLZ"
 	MagicCheckpoint = 0x43485053        // "CHPS"
@@ -35,6 +35,12 @@ const (
 	DefaultBlockSize   = 4096
 	DefaultInodeSize   = 512
 	DefaultJournalSize = 64 // blocks
+
+	// Trie node types — mirrors briefs.h NODE_TYPE_* / NODE_STATUS_*
+	NodeTypeFile     = 0x01
+	NodeTypeDir      = 0x02
+	NodeTypeInterm   = 0x04
+	NodeStatusLeaf   = 0x08
 
 	// Inode flags
 	InodeFlagReserved    = 0x00000001
@@ -67,7 +73,7 @@ const (
 
 	// BrieFS version numbers for this version of briefs-utils
 	BrieFSMajorVersion = 0
-	BrieFSMinorVersion = 3
+	BrieFSMinorVersion = 4
 	BrieFSPatchVersion = 0
 )
 

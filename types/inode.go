@@ -40,7 +40,8 @@ type Inode struct {
 	LinkCount         uint32
 	Flags             uint32
 	DirTrieRoot       uint64
-	Reserved          [88]byte
+	Rdev              uint64
+	Reserved          [80]byte
 }
 
 // NewInode creates a new inode with default values.
@@ -120,8 +121,9 @@ func (in *Inode) WriteAt(file *os.File, offset int64) error {
 	binary.LittleEndian.PutUint32(block[pos:], in.LinkCount); pos += 4
 	binary.LittleEndian.PutUint32(block[pos:], in.Flags); pos += 4
 	binary.LittleEndian.PutUint64(block[pos:], in.DirTrieRoot); pos += 8
+	binary.LittleEndian.PutUint64(block[pos:], in.Rdev); pos += 8
 
-	copy(block[pos:pos+88], in.Reserved[:])
+	copy(block[pos:pos+80], in.Reserved[:])
 
 	written, err := file.WriteAt(block, offset)
 	if err != nil {
