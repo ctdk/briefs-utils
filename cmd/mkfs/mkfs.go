@@ -225,7 +225,7 @@ func main() {
 
 			sb.Lay.InodeBMOffset = inodeBMOffset
 			sb.Lay.InodeBMBlocks = inodeBMBlocks
-			// removed: data bitmap (inode_table_offset used instead)
+			sb.Lay.InodeTableOffset = inodeTableOffset
 	
 			sb.Lay.EATOffset = eatOffset
 			sb.Lay.EATBlocks = eatBlocks
