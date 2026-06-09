@@ -86,6 +86,15 @@ func main() {
 			journalBlocks := uint64(c.Int("journal-size"))
 			label := c.String("label")
 
+			// Validate that blockSize and inodeSize are powers of
+			// two.
+			if !isPowerOfTwo(blockSize) {
+				return fmt.Errorf("block-size must be a power of two, which %d isn't", blockSize)
+			}
+			if !isPowerOfTwo(inodeSize) {
+				return fmt.Errorf("inode-size must be a power of two, which %d isn't", inodeSize)
+			}
+
 			// Probe device if no explicit size given
 			if totalBlocks == 0 {
 				bd, err := device.GetDevice(path, blockSize)
@@ -383,4 +392,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func isPowerOfTwo(n uint64) bool {
+	return ((n == 0) || ((n & (n - 1)) == 0))
 }
