@@ -37,7 +37,7 @@ type Inode struct {
 	XattrOffset       uint64
 	XattrSize         uint64
 	ParentInode       uint64
-	LinkCount         uint32
+	Unused            uint32
 	Flags             uint32
 	DirTrieRoot       uint64
 	Rdev              uint64
