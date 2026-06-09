@@ -13,7 +13,7 @@ func init() {
 	fmt.Printf("DEBUG: EATOffset offset = %d\n", unsafe.Offsetof(s.EATOffset))
 	fmt.Printf("DEBUG: EATBlocks offset = %d\n", unsafe.Offsetof(s.EATBlocks))
 	fmt.Printf("DEBUG: InodeBMOffset offset = %d\n", unsafe.Offsetof(s.InodeBMOffset))
-	fmt.Printf("DEBUG: DataBitmapOffset offset = %d\n", unsafe.Offsetof(s.DataBitmapOffset))
+	fmt.Printf("DEBUG: InodeTableOffset offset = %d\n", unsafe.Offsetof(s.InodeTableOffset))
 }
 
 // Magic numbers for our filesystem structures.
@@ -73,7 +73,7 @@ const (
 
 	// BrieFS version numbers for this version of briefs-utils
 	BrieFSMajorVersion = 0
-	BrieFSMinorVersion = 4
+	BrieFSMinorVersion = 5
 	BrieFSPatchVersion = 1
 )
 

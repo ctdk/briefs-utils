@@ -80,8 +80,8 @@ func verifySuperblock(file *os.File, blockSize uint64) (*types.SuperblockLayout,
 	sb.TrieNodePoolSize = binary.LittleEndian.Uint64(buf[208:])
 	sb.InodeBMOffset = binary.LittleEndian.Uint64(buf[216:])
 	sb.InodeBMBlocks = binary.LittleEndian.Uint64(buf[224:])
-	sb.DataBitmapOffset = binary.LittleEndian.Uint64(buf[232:])
-	sb.DataBitmapBlocks = binary.LittleEndian.Uint64(buf[240:])
+	sb.InodeTableOffset = binary.LittleEndian.Uint64(buf[240:])
+	// old data_bitmap_offset + data_bitmap_blocks (now replaced by InodeTableOffset)
 	sb.JournalOffset = binary.LittleEndian.Uint64(buf[248:])
 	sb.JournalBlocks = binary.LittleEndian.Uint64(buf[256:])
 	sb.CheckpointSeq = binary.LittleEndian.Uint64(buf[264:])
@@ -242,7 +242,7 @@ func main() {
 			}
 
 			// 3. Inode table
-			inodeTableStart := sb.DataBitmapOffset + sb.DataBitmapBlocks
+			inodeTableStart := sb.InodeTableOffset
 				var inodeTableBlocks uint64
 	{
 		// Read inode allocator header to get actual inode count

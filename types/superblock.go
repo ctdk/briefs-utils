@@ -47,9 +47,8 @@ type SuperblockLayout struct {
 	TrieNodePoolSize  uint64  // offset 216
 	InodeBMOffset  uint64  // offset 224
 	InodeBMBlocks  uint64  // offset 232
-	DataBitmapOffset uint64  // offset 240
-	DataBitmapBlocks uint64  // offset 248
-	JournalOffset  uint64  // offset 256
+	InodeTableOffset uint64  // offset 240 (replaces data_bitmap_offset + data_bitmap_blocks)
+	JournalOffset  uint64  // offset 248
 	JournalBlocks  uint64  // offset 264
 	CheckpointSeq  uint64
 	JournalLogStart uint64
@@ -180,8 +179,9 @@ func (sb *Superblock) MarshalBinary() []byte {
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.TrieNodePoolSize); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.InodeBMOffset); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.InodeBMBlocks); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.DataBitmapOffset); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.DataBitmapBlocks); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.InodeTableOffset); pos += 8
+	// old data_bitmap_offset + data_bitmap_blocks (now replaced by InodeTableOffset)
+	pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.JournalOffset); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.JournalBlocks); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.CheckpointSeq); pos += 8

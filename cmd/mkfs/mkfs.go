@@ -18,11 +18,11 @@ func roundUp(value, alignment uint64) uint64 {
 }
 
 // Calculate on-disk location of an inode.
-// The inode table starts at: data_bitmap_offset + data_bitmap_blocks
+// The inode table starts at: inode_table_offset
 // (This matches what the kernel computes in briefs_iget.)
 func calculateInodeLocation(sb *types.Superblock, inodeNum uint64) (blockOffset uint64, byteOffset uint64) {
 	inodesPerBlock := sb.Lay.BlockSize / sb.Lay.InodeSize // 4096 / 512 = 8
-	inodeTableStartBlock := sb.Lay.DataBitmapOffset + sb.Lay.DataBitmapBlocks
+	inodeTableStartBlock := sb.Lay.InodeTableOffset
 	inodeIndex := inodeNum - 1
 	blockOffset = inodeTableStartBlock + (inodeIndex / inodesPerBlock)
 	byteOffset = (inodeIndex % inodesPerBlock) * sb.Lay.InodeSize
@@ -174,7 +174,7 @@ func main() {
 			dataBMBlocks := dataBitmapBlocks
 			nextBlock += dataBMBlocks
 
-			// Inode table (kernel reads at: data_bitmap_offset + data_bitmap_blocks)
+			// Inode table (at inode_table_offset)
 			inodeTableOffset := nextBlock
 			nextBlock += inodeTableBlocks
 			// Sanity: kernel-derived inode table start must match
@@ -216,9 +216,8 @@ func main() {
 
 			sb.Lay.InodeBMOffset = inodeBMOffset
 			sb.Lay.InodeBMBlocks = inodeBMBlocks
-			sb.Lay.DataBitmapOffset = dataBMOffset
-			sb.Lay.DataBitmapBlocks = dataBMBlocks
-
+			// removed: data bitmap (inode_table_offset used instead)
+	
 			sb.Lay.EATOffset = eatOffset
 			sb.Lay.EATBlocks = eatBlocks
 
