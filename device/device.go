@@ -176,12 +176,12 @@ func getDeviceNumber(path string) (uint64, error) {
 	return uint64(stat.Dev), nil
 }
 
-func major(dev uint64) uint64 {
-	return (dev >> 20) & 0xfff
+func major(dev uint64) uint32 {
+	return unix.Major(dev)
 }
 
-func minor(dev uint64) uint64 {
-	return dev & 0xfffff
+func minor(dev uint64) uint32 {
+	return unix.Minor(dev)
 }
 
 // filepathAbs is a direct implementation of filepath.Abs without importing path/filepath.
