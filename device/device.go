@@ -132,19 +132,6 @@ func CheckMounted(path string) error {
 			}
 		}
 
-		// For block devices, also check via device number comparison.
-		// If our path resolves to the same device as a mounted device,
-		// it's mounted.
-		if strings.HasPrefix(mountDev, "/dev/") {
-			mountedDevNo, err := getDeviceNumber(mountDev)
-			if err == nil {
-				targetDevNo, err := getDeviceNumber(realPath)
-				if err == nil && mountedDevNo == targetDevNo {
-					return fmt.Errorf("%s (device %d:%d) is mounted on %s",
-						path, major(mountedDevNo), minor(mountedDevNo), mountPoint)
-				}
-			}
-		}
 	}
 
 	return nil
@@ -165,23 +152,6 @@ func resolveLoopBackingFile(loopDev string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
-}
-
-// getDeviceNumber returns the major:minor device number for a path.
-func getDeviceNumber(path string) (uint64, error) {
-	var stat unix.Stat_t
-	if err := unix.Stat(path, &stat); err != nil {
-		return 0, err
-	}
-	return uint64(stat.Dev), nil
-}
-
-func major(dev uint64) uint32 {
-	return unix.Major(dev)
-}
-
-func minor(dev uint64) uint32 {
-	return unix.Minor(dev)
 }
 
 // filepathAbs is a direct implementation of filepath.Abs without importing path/filepath.
