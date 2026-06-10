@@ -42,6 +42,15 @@ func main() {
 		Name:  "mkfs.briefs",
 		Usage: "Create a new BrieFS filesystem",
 		Version: versionStr,
+		Before: func(c *cli.Context) error {
+			path := c.String("output")
+			if err := device.CheckMounted(path); err != nil {
+				// Reformatting a mounted filesystem is incredibly
+				// dangerous. Refuse to continue.
+				return fmt.Errorf("refusing to create filesystem: %w\n", err)
+			}
+			return nil
+		},
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:     "output",

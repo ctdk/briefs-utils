@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/ctdk/briefs-utils/device"
 	"github.com/ctdk/briefs-utils/types"
 	"github.com/urfave/cli/v2"
 )
@@ -173,6 +174,15 @@ func main() {
 		Name:    "fsck.briefs",
 		Usage:   "Check and repair a BrieFS filesystem",
 		Version: versionStr,
+		Before: func(c *cli.Context) error {
+			path := c.String("device")
+			if err := device.CheckMounted(path); err != nil {
+				// Running fsck on a mounted filesystem risks
+				// double-blind corruption. Refuse to continue.
+				return fmt.Errorf("refusing to check filesystem: %w\n", err)
+			}
+			return nil
+		},
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:     "device",
