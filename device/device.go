@@ -8,8 +8,6 @@ import (
 	"io"
 	"os"
 	"strings"
-
-	"golang.org/x/sys/unix"
 )
 
 const (
