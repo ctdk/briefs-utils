@@ -306,7 +306,6 @@ func (n *brieFSNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off
 
 	blockSize := n.bfs.blockSize
 	blkSize := int64(blockSize)
-	dataStart := n.bfs.dataRegionStart
 	endOff := off + int64(len(dest))
 	if endOff > int64(diskInode.FileSize) {
 		endOff = int64(diskInode.FileSize)
@@ -345,8 +344,7 @@ func (n *brieFSNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off
 
 		// Read blocks
 		for blkOff := readStart; blkOff < readEnd; blkOff += blkSize {
-			relBlk := uint64((blkOff - extStart) / blkSize)
-			absBlock := dataStart + ext.Phys + relBlk
+			absBlock := ext.Phys + uint64((blkOff - extStart)/blkSize)
 			buf, err := n.bfs.dev.ReadBlock(absBlock)
 			if err != nil {
 				return nil, syscall.EIO
