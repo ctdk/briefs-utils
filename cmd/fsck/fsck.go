@@ -81,14 +81,16 @@ func verifySuperblock(file *os.File, blockSize uint64) (*types.SuperblockLayout,
 	sb.TrieNodePoolSize = binary.LittleEndian.Uint64(buf[208:])
 	sb.InodeBMOffset = binary.LittleEndian.Uint64(buf[216:])
 	sb.InodeBMBlocks = binary.LittleEndian.Uint64(buf[224:])
-	sb.InodeTableOffset = binary.LittleEndian.Uint64(buf[240:])
-	// old data_bitmap_offset + data_bitmap_blocks (now replaced by InodeTableOffset)
-	sb.JournalOffset = binary.LittleEndian.Uint64(buf[248:])
-	sb.JournalBlocks = binary.LittleEndian.Uint64(buf[256:])
-	sb.CheckpointSeq = binary.LittleEndian.Uint64(buf[264:])
-	sb.JournalLogStart = binary.LittleEndian.Uint64(buf[272:])
-	sb.JournalLogEnd = binary.LittleEndian.Uint64(buf[280:])
-	copy(sb.Label[:], buf[320:320+64])
+	sb.InodeTableOffset = binary.LittleEndian.Uint64(buf[232:])
+	sb.JournalOffset = binary.LittleEndian.Uint64(buf[240:])
+	sb.JournalBlocks = binary.LittleEndian.Uint64(buf[248:])
+	sb.CheckpointSeq = binary.LittleEndian.Uint64(buf[256:])
+	sb.JournalLogStart = binary.LittleEndian.Uint64(buf[264:])
+	sb.JournalLogEnd = binary.LittleEndian.Uint64(buf[272:])
+	for i := 0; i < 4; i++ {
+		sb.ReservedJournal[i] = binary.LittleEndian.Uint64(buf[280+i*8:])
+	}
+	copy(sb.Label[:], buf[312:312+64])
 
 	return sb, nil
 }
