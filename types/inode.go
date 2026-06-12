@@ -135,6 +135,57 @@ func (in *Inode) WriteAt(file *os.File, offset int64) error {
 	return nil
 }
 
+// UnmarshalInode deserializes a 512-byte buffer into an Inode.
+// Fields are read in the same order as WriteAt writes them.
+func UnmarshalInode(data []byte) (*Inode, error) {
+	if len(data) < DefaultInodeSize {
+		return nil, fmt.Errorf("inode data too short: %d bytes (need %d)", len(data), DefaultInodeSize)
+	}
+
+	in := &Inode{}
+	pos := 0
+
+	in.InodeNumber = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.Magic = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.Filemode = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	in.Uid = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	in.Gid = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	in._Pad0 = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	in.FileSize = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.CtimeSec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.CtimeNsec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.AtimeSec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.AtimeNsec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.MtimeSec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.MtimeNsec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.CreationTimeSec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.CreationTimeNsec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.Nlinks = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	in.NumExtentsInline = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	in.ExtentInlineBase = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.NumExtentsTotal = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+
+	for i := 0; i < 8; i++ {
+		in.InlineExtents[i].Offset = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+		in.InlineExtents[i].Phys = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+		in.InlineExtents[i].Len = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+		in.InlineExtents[i].Flags = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+		in.InlineExtents[i].Pad = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	}
+
+	in.XattrOffset = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.XattrSize = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.ParentInode = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.Unused = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	in.Flags = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	in.DirTrieRoot = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	in.Rdev = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+
+	copy(in.Reserved[:], data[pos:pos+80])
+
+	return in, nil
+}
+
 // Write writes the inode to a file at the given offset (in 512-byte units).
 // Deprecated: Use WriteAt with byte offsets instead.
 func (in *Inode) Write(file *os.File, offset uint64) error {
