@@ -118,6 +118,7 @@ func (in *Inode) WriteAt(file *os.File, offset int64) error {
 	binary.LittleEndian.PutUint64(block[pos:], in.XattrOffset); pos += 8
 	binary.LittleEndian.PutUint64(block[pos:], in.XattrSize); pos += 8
 	binary.LittleEndian.PutUint64(block[pos:], in.ParentInode); pos += 8
+	binary.LittleEndian.PutUint32(block[pos:], in.Unused); pos += 4
 	binary.LittleEndian.PutUint32(block[pos:], in.Flags); pos += 4
 	binary.LittleEndian.PutUint64(block[pos:], in.DirTrieRoot); pos += 8
 	binary.LittleEndian.PutUint64(block[pos:], in.Rdev); pos += 8
