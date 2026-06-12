@@ -3,5 +3,6 @@
 * Add more filesystem options to mkfs.briefs as they become available.
 * Make fsck.briefs actually do something useful.
 * Make man pages.
-* The codebase is starting to feel a bit hairy. It could stand another round of
+* The codebase is starting to feel a bit hairy. It could stand another round ofj
   refactoring.
+* The FUSE bridge is read-only right now. It should be read-write.

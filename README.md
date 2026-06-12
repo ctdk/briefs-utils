@@ -3,7 +3,7 @@ BrieFS Utils
 
 ![The briefs-utils logo - a pelican wearing briefs (aka The Pelican's Briefs), but holding a hammer.](images/briefs-utils-logo-1.png)
 
-The filesystem utils for BrieFS (`mkfs.briefs`, `fsck.briefs`).
+The filesystem utils for BrieFS (`mkfs.briefs`, `fsck.briefs`, `fuse.briefs`).
 
 mkfs.briefs
 -----------
@@ -18,7 +18,7 @@ USAGE:
    mkfs.briefs [global options] command [command options]
 
 VERSION:
-   v0.4.0
+   v0.5.0
 
 COMMANDS:
    help, h  Shows a list of commands or help for one command
@@ -47,7 +47,7 @@ USAGE:
    fsck.briefs [global options] command [command options]
 
 VERSION:
-   v0.4.0
+   v0.5.0
 
 COMMANDS:
    help, h  Shows a list of commands or help for one command
@@ -58,6 +58,31 @@ GLOBAL OPTIONS:
    --repair                  attempt to repair found errors (not yet implemented) (default: false)
    --help, -h                show help
    --version, -v             print the version
+```
+
+fuse.briefs
+-----------
+
+A FUSE bridge for BrieFS so you can mount BrieFS volumes without the commitment of loading and/or battling with a kernel module. Currently read-only and basic.
+
+```
+NAME:
+   briefs-fuse - Mount a BrieFS filesystem image via FUSE
+
+USAGE:
+   briefs-fuse [global options] command [command options]
+
+VERSION:
+   v0.5.0
+
+COMMANDS:
+   help, h  Shows a list of commands or help for one command
+
+GLOBAL OPTIONS:
+   --image value, -i value       filesystem image file or block device
+   --mountpoint value, -m value  mount point directory
+   --debug, -d                   enable FUSE debug output (default: false)
+   --help, -h                    show help
 ```
 
 RELATED
