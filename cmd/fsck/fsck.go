@@ -18,6 +18,13 @@ type fsckState struct {
 	errors int
 	file   *os.File
 	sb     *types.SuperblockLayout
+	// Collected during inode table scan for cross-referencing
+	inodes      map[uint64]*types.Inode // ino -> inode
+	dirs        []dirInfo               // directories with trie roots
+	usedBlocks  map[uint64]bool         // all blocks referenced by extents or trie nodes
+	entryCounts map[uint64]int          // ino -> number of directory entries referencing it
+	// Tracks directories where trie walk had structural errors (bad magic, etc.)
+	failedTrieDirs map[uint64]bool // ino -> true if trie walk had unrecoverable errors
 }
 
 func (fs *fsckState) errorf(format string, args ...interface{}) {
@@ -350,6 +357,13 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 	inodesPerBlock := blockSize / inodeSize
 	ino := uint64(1)
 
+	// Initialize maps for cross-referencing
+	fs.inodes = make(map[uint64]*types.Inode)
+	fs.dirs = nil
+	fs.usedBlocks = make(map[uint64]bool)
+	fs.entryCounts = make(map[uint64]int)
+	fs.failedTrieDirs = make(map[uint64]bool)
+
 	fmt.Fprintf(os.Stderr, "  inodes per block: %d\n", inodesPerBlock)
 
 	for bi := uint64(0); bi < inodeTableBlocks; bi++ {
@@ -373,10 +387,29 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 			if err != nil {
 				fs.errorf("%v", err)
 			} else if in != nil {
-				// Basic sanity: directory must have a trie root
-				if in.IsDir() && in.DirTrieRoot == 0 {
-					fs.errorf("ino %d: directory with no trie root", ino)
+				// Store for cross-referencing
+				fs.inodes[ino] = in
+
+				// Collect extents for block cross-reference
+				for ei := uint32(0); ei < in.NumExtentsInline; ei++ {
+					ext := in.InlineExtents[ei]
+					if ext.Len > 0 && ext.Phys > 0 {
+						for bk := uint64(0); bk < ext.Len; bk++ {
+							fs.usedBlocks[ext.Phys+bk] = true
+						}
+					}
 				}
+
+				// Collect trie root for directory trie walking
+				if in.IsDir() {
+					if in.DirTrieRoot == 0 {
+						fs.errorf("ino %d: directory with no trie root", ino)
+					} else {
+						fs.dirs = append(fs.dirs, dirInfo{ino: ino, trieRoot: in.DirTrieRoot})
+						fs.usedBlocks[in.DirTrieRoot] = true
+					}
+				}
+
 				// File with zero size but extents
 				if in.IsFile() && in.FileSize == 0 && in.NumExtentsTotal > 0 {
 					fs.warnf("ino %d: file with zero size but %d extents", ino, in.NumExtentsTotal)
@@ -426,6 +459,7 @@ type trieEntry struct {
 
 // verifyDirectoryTrie walks a directory's trie, validating structure and collecting entries.
 // Returns the list of entries found, or nil if the trie is empty.
+// Also records trie node blocks in fs.usedBlocks and counts entries per inode.
 func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootBlock uint64, blockSize uint64) []trieEntry {
 	if rootBlock == 0 {
 		return nil
@@ -452,6 +486,9 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootBlock uint64, bloc
 		}
 		visited[block] = true
 
+		// Record this trie node block as used
+		fs.usedBlocks[block] = true
+
 		buf := make([]byte, blockSize)
 		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
 			fs.errorf("ino %d dir trie: read block %d: %v", parentIno, block, err)
@@ -464,15 +501,16 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootBlock uint64, bloc
 		if node.Magic != types.MagicTrieNode {
 			fs.errorf("ino %d dir trie: block %d: bad magic 0x%08X (expected 0x%08X)",
 				parentIno, block, node.Magic, types.MagicTrieNode)
+			fs.failedTrieDirs[parentIno] = true
 			continue
 		}
 
 		// Validate node type
-		if node.NodeType == 0 {
-			fs.errorf("ino %d dir trie: block %d: zero node type", parentIno, block)
-			continue
-		}
-		if node.NodeType&types.NodeTypeInterm != 0 && node.NodeType != types.NodeTypeInterm &&
+		// node_type == 0 is valid for pure leaf nodes (the file type is in f_type).
+		// node_type can be NODE_TYPE_INTERM (0x04) for internal nodes,
+		// or NODE_TYPE_INTERM | NODE_STATUS_LEAF (0x0C) for internal nodes
+		// that also store a leaf entry.
+		if node.NodeType != 0 && node.NodeType != types.NodeTypeInterm &&
 			node.NodeType != (types.NodeTypeInterm|types.NodeStatusLeaf) {
 			fs.errorf("ino %d dir trie: block %d: invalid node type 0x%02X", parentIno, block, node.NodeType)
 		}
@@ -523,6 +561,8 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootBlock uint64, bloc
 					Name:   name,
 					Parent: parentIno,
 				})
+				// Count this entry for link count cross-referencing
+				fs.entryCounts[node.Inode]++
 			}
 
 			// If this node also has children, push it back with emitted=true
@@ -620,6 +660,9 @@ type dirInfo struct {
 	ino      uint64
 	trieRoot uint64
 }
+
+// verifyJournal checks the journal header block.
+func verifyJournal(file *os.File, journalOffset, journalBlocks, blockSize uint64) error {
 	buf := make([]byte, blockSize)
 	if _, err := file.ReadAt(buf, int64(journalOffset*blockSize)); err != nil {
 		return fmt.Errorf("read journal block %d: %w", journalOffset, err)
@@ -629,6 +672,366 @@ type dirInfo struct {
 		return fmt.Errorf("bad journal magic at block %d: 0x%08X", journalOffset, magic)
 	}
 	return nil
+}
+
+// verifyBlockCrossReference checks that every block referenced by inode extents
+// and trie nodes is marked allocated in the data allocator bitmap, and that
+// every allocated block in the bitmap is referenced by something.
+//
+// The data allocator tracks data-relative block numbers (0 = first block of
+// the data region). The absolute block number of the first data block is
+// TrieNodePoolStart + TrieNodePoolSize.
+func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
+	dataRegionStart := fs.sb.TrieNodePoolStart + fs.sb.TrieNodePoolSize
+
+	// Read the data allocator L2 bitmap
+	dataL0w, dataL1w, dataL2w, dataBlockCount, _, err := readAllocatorHeader(fs.file, fs.sb.TrieNodePoolStart, blockSize)
+	if err != nil {
+		fs.errorf("block cross-ref: read data allocator header: %v", err)
+		return
+	}
+
+	// Read L2 words
+	l0Blocks := (dataL0w + 511) / 512
+	l1Blocks := (dataL1w + 511) / 512
+	l2Start := fs.sb.TrieNodePoolStart + 1 + l0Blocks + l1Blocks
+	l2Blocks := (dataL2w + 511) / 512
+
+	l2 := make([]uint64, dataL2w)
+	for bi := uint64(0); bi < l2Blocks; bi++ {
+		buf := make([]byte, blockSize)
+		if _, err := fs.file.ReadAt(buf, int64((l2Start+bi)*blockSize)); err != nil {
+			fs.errorf("block cross-ref: read L2 block %d: %v", l2Start+bi, err)
+			return
+		}
+		start := bi * 512
+		for j := uint64(0); j < 512 && start+j < dataL2w; j++ {
+			l2[start+j] = binary.LittleEndian.Uint64(buf[j*8:])
+		}
+	}
+
+	// Build a set of data-relative blocks that the allocator says are allocated
+	allocAllocated := make(map[uint64]bool)
+	for i := uint64(0); i < dataBlockCount; i++ {
+		w := i / 64
+		b := i % 64
+		if w < dataL2w && (l2[w]&(1<<b)) == 0 {
+			allocAllocated[i] = true
+		}
+	}
+
+	// Check 1: Blocks used by inodes/tries that are NOT marked allocated
+	orphans := 0
+	for absBlk := range fs.usedBlocks {
+		if absBlk < dataRegionStart || absBlk >= dataRegionStart+dataBlockCount {
+			// Block is outside the data region — metadata, which is fine
+			continue
+		}
+		relBlk := absBlk - dataRegionStart
+		if !allocAllocated[relBlk] {
+			if orphans < 20 {
+				fs.errorf("block %d (data-relative %d): used by inode/trie but NOT marked allocated in bitmap",
+					absBlk, relBlk)
+			} else if orphans == 20 {
+				fs.errorf("(more orphan block errors suppressed)")
+			}
+			orphans++
+		}
+	}
+	if orphans > 0 {
+		fmt.Fprintf(os.Stderr, "  block cross-ref: %d block(s) used but not marked allocated\n", orphans)
+	}
+
+	// Check 2: Blocks marked allocated in bitmap but NOT referenced by any inode/trie.
+	// If any directory trie had structural errors, leaked blocks could be
+	// legitimate blocks from unreadable subtrees, so we downgrade to WARNING.
+	leaked := 0
+	hasFailedTries := len(fs.failedTrieDirs) > 0
+	for relBlk := range allocAllocated {
+		absBlk := dataRegionStart + relBlk
+		if !fs.usedBlocks[absBlk] {
+			if leaked < 20 {
+				if hasFailedTries {
+					fs.warnf("block %d (data-relative %d): marked allocated but not found during trie walk (may be from failed trie traversal)",
+						absBlk, relBlk)
+				} else {
+					fs.errorf("block %d (data-relative %d): marked allocated in bitmap but NOT referenced by any inode/trie",
+						absBlk, relBlk)
+				}
+			} else if leaked == 20 {
+				if hasFailedTries {
+					fs.warnf("(more unverifiable block warnings suppressed)")
+				} else {
+					fs.errorf("(more leaked block errors suppressed)")
+				}
+			}
+			leaked++
+		}
+	}
+	if leaked > 0 {
+		if hasFailedTries {
+			fmt.Fprintf(os.Stderr, "  block cross-ref: %d block(s) allocated but not verified (trie errors may explain these)\n", leaked)
+		} else {
+			fmt.Fprintf(os.Stderr, "  block cross-ref: %d block(s) allocated but not referenced\n", leaked)
+		}
+	}
+
+	if orphans == 0 && leaked == 0 {
+		fmt.Fprintf(os.Stderr, "  block cross-ref: all used blocks match allocator bitmap\n")
+	}
+}
+
+// verifyLinkCounts checks that each inode's nlink matches the number of
+// directory entries referencing it.
+func verifyLinkCounts(fs *fsckState) {
+	mismatches := 0
+	for ino, in := range fs.inodes {
+		expected := fs.entryCounts[ino]
+		// For directories, nlink includes . and .. which are not stored in the trie.
+		// nlink for a dir = 2 (., ..) + number of subdirectories
+		// We can't easily count subdirectories from here, so we only check files.
+		if in.IsFile() {
+			if int(in.Nlinks) != expected {
+				if mismatches < 20 {
+					fs.errorf("ino %d: nlink=%d but %d directory entries reference it", ino, in.Nlinks, expected)
+				} else if mismatches == 20 {
+					fs.errorf("(more link count errors suppressed)")
+				}
+				mismatches++
+			}
+		}
+	}
+	if mismatches == 0 {
+		fmt.Fprintf(os.Stderr, "  link counts: all file link counts match directory entries\n")
+	}
+}
+
+// verifyDirEntryCrossReference checks that every directory entry's inode
+// exists in the inode table and that the file type matches.
+func verifyDirEntryCrossReference(fs *fsckState, entries []trieEntry) {
+	badInos := 0
+	badTypes := 0
+
+	for _, e := range entries {
+		// Check inode exists
+		in, ok := fs.inodes[e.Inode]
+		if !ok {
+			if badInos < 20 {
+				fs.errorf("dir entry '%s' in ino %d: references ino %d which does not exist",
+					e.Name, e.Parent, e.Inode)
+			} else if badInos == 20 {
+				fs.errorf("(more bad inode reference errors suppressed)")
+			}
+			badInos++
+			continue
+		}
+
+		// Check file type matches
+		// ftype is stored as (S_IFMT >> 12): 4 for directories, 8 for regular files.
+		var expectedFType uint8
+		if in.IsDir() {
+			expectedFType = 4 // S_IFDIR >> 12
+		} else if in.IsFile() {
+			expectedFType = 8 // S_IFREG >> 12
+		}
+		if expectedFType != 0 && e.FType != expectedFType {
+			if badTypes < 20 {
+				fs.errorf("dir entry '%s' in ino %d: ftype=%d but inode %d has mode 0x%04X (expected %d)",
+					e.Name, e.Parent, e.FType, e.Inode, in.Filemode, expectedFType)
+			} else if badTypes == 20 {
+				fs.errorf("(more type mismatch errors suppressed)")
+			}
+			badTypes++
+		}
+	}
+
+	if badInos > 0 || badTypes > 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  dir entry cross-ref: all entries reference valid inodes\n")
+}
+
+// verifyOrphanedInodes checks for inodes that have nlink > 0 but no
+// directory entries referencing them (orphaned).
+func verifyOrphanedInodes(fs *fsckState) {
+	orphans := 0
+	for ino, in := range fs.inodes {
+		if ino == fs.sb.RootIno {
+			continue // root is special
+		}
+		if in.Nlinks > 0 && fs.entryCounts[ino] == 0 {
+			if orphans < 20 {
+				fs.errorf("ino %d: nlink=%d but no directory entries reference it (orphaned)", ino, in.Nlinks)
+			} else if orphans == 20 {
+				fs.errorf("(more orphaned inode errors suppressed)")
+			}
+			orphans++
+		}
+	}
+	if orphans == 0 {
+		fmt.Fprintf(os.Stderr, "  orphan check: no orphaned inodes found\n")
+	}
+}
+
+// verifyExtentOverlaps checks that extents don't overlap with each other
+// or with metadata regions.
+func verifyExtentOverlaps(fs *fsckState) {
+	type extentRef struct {
+		ino  uint64
+		phys uint64
+		len  uint64
+	}
+	var allExtents []extentRef
+
+	for ino, in := range fs.inodes {
+		for ei := uint32(0); ei < in.NumExtentsInline; ei++ {
+			ext := in.InlineExtents[ei]
+			if ext.Len > 0 && ext.Phys > 0 {
+				allExtents = append(allExtents, extentRef{ino: ino, phys: ext.Phys, len: ext.Len})
+			}
+		}
+	}
+
+	overlaps := 0
+	for i := 0; i < len(allExtents); i++ {
+		ei := allExtents[i]
+		eiEnd := ei.phys + ei.len
+
+		// Check against metadata regions
+		// Superblock: block 0
+		if ei.phys == 0 || (ei.phys < 1 && eiEnd > 0) {
+			if overlaps < 20 {
+				fs.errorf("ino %d: extent at phys=%d len=%d overlaps with superblock (block 0)",
+					ei.ino, ei.phys, ei.len)
+			}
+			overlaps++
+		}
+
+		// Check against journal
+		journalStart := fs.sb.JournalOffset
+		journalEnd := journalStart + fs.sb.JournalBlocks
+		if ei.phys < journalEnd && eiEnd > journalStart {
+			if overlaps < 20 {
+				fs.errorf("ino %d: extent at phys=%d len=%d overlaps with journal (blocks %d-%d)",
+					ei.ino, ei.phys, ei.len, journalStart, journalEnd-1)
+			}
+			overlaps++
+		}
+
+		// Check against inode table
+		itStart := fs.sb.InodeTableOffset
+		itEnd := itStart + (uint64(len(fs.inodes))*fs.sb.InodeSize+fs.sb.BlockSize-1)/fs.sb.BlockSize
+		if ei.phys < itEnd && eiEnd > itStart {
+			if overlaps < 20 {
+				fs.errorf("ino %d: extent at phys=%d len=%d overlaps with inode table (blocks %d-%d)",
+					ei.ino, ei.phys, ei.len, itStart, itEnd-1)
+			}
+			overlaps++
+		}
+
+		// Check against other extents
+		for j := i + 1; j < len(allExtents); j++ {
+			ej := allExtents[j]
+			ejEnd := ej.phys + ej.len
+			if ei.phys < ejEnd && eiEnd > ej.phys {
+				if overlaps < 20 {
+					fs.errorf("ino %d extent and ino %d extent overlap: [%d,%d) vs [%d,%d)",
+						ei.ino, ej.ino, ei.phys, eiEnd, ej.phys, ejEnd)
+				} else if overlaps == 20 {
+					fs.errorf("(more extent overlap errors suppressed)")
+				}
+				overlaps++
+			}
+		}
+	}
+
+	if overlaps == 0 {
+		fmt.Fprintf(os.Stderr, "  extent overlap: no overlapping extents found\n")
+	}
+}
+
+// verifyReachability walks from the root inode through the directory tree
+// and reports any inodes that are not reachable.
+func verifyReachability(fs *fsckState, entries []trieEntry) {
+	// Build a map of parent -> children from directory entries
+	children := make(map[uint64]map[uint64]bool) // parent ino -> set of child inos
+	for _, e := range entries {
+		if children[e.Parent] == nil {
+			children[e.Parent] = make(map[uint64]bool)
+		}
+		children[e.Parent][e.Inode] = true
+	}
+
+	// BFS from root
+	reachable := make(map[uint64]bool)
+	queue := []uint64{fs.sb.RootIno}
+	reachable[fs.sb.RootIno] = true
+
+	for len(queue) > 0 {
+		parent := queue[0]
+		queue = queue[1:]
+
+		for child := range children[parent] {
+			if !reachable[child] {
+				reachable[child] = true
+				queue = append(queue, child)
+			}
+		}
+	}
+
+	// Report unreachable inodes
+	unreachable := 0
+	for ino := range fs.inodes {
+		if ino == fs.sb.RootIno {
+			continue
+		}
+		if !reachable[ino] {
+			if unreachable < 20 {
+				fs.errorf("ino %d: not reachable from root directory", ino)
+			} else if unreachable == 20 {
+				fs.errorf("(more unreachable inode errors suppressed)")
+			}
+			unreachable++
+		}
+	}
+
+	if unreachable == 0 {
+		fmt.Fprintf(os.Stderr, "  reachability: all inodes reachable from root\n")
+	}
+}
+
+// verifyDuplicateNames checks for duplicate directory entries within the same
+// directory (same name, different inode).
+func verifyDuplicateNames(fs *fsckState, entries []trieEntry) {
+	// Group entries by parent directory
+	byParent := make(map[uint64][]trieEntry)
+	for _, e := range entries {
+		byParent[e.Parent] = append(byParent[e.Parent], e)
+	}
+
+	dups := 0
+	for parent, ents := range byParent {
+		seen := make(map[string]uint64) // name -> first ino seen
+		for _, e := range ents {
+			if firstIno, ok := seen[e.Name]; ok {
+				if firstIno != e.Inode {
+					if dups < 20 {
+						fs.errorf("ino %d: duplicate name '%s' (inodes %d and %d)",
+							parent, e.Name, firstIno, e.Inode)
+					} else if dups == 20 {
+						fs.errorf("(more duplicate name errors suppressed)")
+					}
+					dups++
+				}
+			} else {
+				seen[e.Name] = e.Inode
+			}
+		}
+	}
+
+	if dups == 0 {
+		fmt.Fprintf(os.Stderr, "  duplicate names: no duplicate directory entries found\n")
+	}
 }
 
 func main() {
@@ -798,7 +1201,29 @@ func main() {
 				fmt.Fprintf(os.Stderr, "  journal magic OK\n")
 			}
 
-			// 5. Summary
+			// 5. Directory trie walk
+			fmt.Fprintf(os.Stderr, "\nDirectory tries:\n")
+			allEntries := verifyAllDirTries(fs, blockSize, fs.dirs)
+			fmt.Fprintf(os.Stderr, "  directories scanned: %d\n", len(fs.dirs))
+			fmt.Fprintf(os.Stderr, "  total entries found: %d\n", len(allEntries))
+			if len(fs.failedTrieDirs) > 0 {
+				fmt.Fprintf(os.Stderr, "  WARNING: %d director(ies) had unrecoverable trie errors:\n", len(fs.failedTrieDirs))
+				for ino := range fs.failedTrieDirs {
+					fmt.Fprintf(os.Stderr, "    ino %d\n", ino)
+				}
+			}
+
+			// 6. Cross-referencing checks
+			fmt.Fprintf(os.Stderr, "\nCross-referencing:\n")
+			verifyBlockCrossReference(fs, blockSize)
+			verifyDirEntryCrossReference(fs, allEntries)
+			verifyDuplicateNames(fs, allEntries)
+			verifyLinkCounts(fs)
+			verifyOrphanedInodes(fs)
+			verifyExtentOverlaps(fs)
+			verifyReachability(fs, allEntries)
+
+			// 7. Summary
 			fmt.Fprintf(os.Stderr, "\n")
 			if fs.errors > 0 {
 				fmt.Fprintf(os.Stderr, "FSCK COMPLETE: %d error(s) found\n", fs.errors)
