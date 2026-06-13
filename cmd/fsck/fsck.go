@@ -661,8 +661,9 @@ type dirInfo struct {
 	trieRoot uint64
 }
 
-// verifyJournal checks the journal header block.
-func verifyJournal(file *os.File, journalOffset, journalBlocks, blockSize uint64) error {
+// verifyJournal checks the journal header block and detects dirty filesystems
+// (un-replayed journal records).
+func verifyJournal(file *os.File, journalOffset, journalBlocks, checkpointSeq, logStart, logEnd uint64, blockSize uint64) error {
 	buf := make([]byte, blockSize)
 	if _, err := file.ReadAt(buf, int64(journalOffset*blockSize)); err != nil {
 		return fmt.Errorf("read journal block %d: %w", journalOffset, err)
@@ -671,6 +672,23 @@ func verifyJournal(file *os.File, journalOffset, journalBlocks, blockSize uint64
 	if magic != types.MagicJournal {
 		return fmt.Errorf("bad journal magic at block %d: 0x%08X", journalOffset, magic)
 	}
+
+	// Check if the filesystem is dirty (has un-replayed journal records).
+	// The journal uses a log-structured layout where logStart/logEnd track
+	// the range of blocks in use. If logStart != logEnd or checkpointSeq
+	// is low, there may be un-replayed entries.
+	if logStart != logEnd {
+		logRange := logEnd
+		if logEnd >= logStart {
+			logRange = logEnd - logStart
+		} else {
+			// Wrapped around
+			logRange = logEnd + journalBlocks - logStart
+		}
+		return fmt.Errorf("filesystem has un-replayed journal records (log range %d blocks, checkpoint seq %d)\n      journal replay required before fsck",
+			logRange, checkpointSeq)
+	}
+
 	return nil
 }
 
@@ -684,30 +702,10 @@ func verifyJournal(file *os.File, journalOffset, journalBlocks, blockSize uint64
 func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 	dataRegionStart := fs.sb.TrieNodePoolStart + fs.sb.TrieNodePoolSize
 
-	// Read the data allocator L2 bitmap
-	dataL0w, dataL1w, dataL2w, dataBlockCount, _, err := readAllocatorHeader(fs.file, fs.sb.TrieNodePoolStart, blockSize)
+	l2, dataL2w, dataBlockCount, err := readAllocatorL2(fs.file, fs.sb.TrieNodePoolStart, blockSize)
 	if err != nil {
-		fs.errorf("block cross-ref: read data allocator header: %v", err)
+		fs.errorf("block cross-ref: %v", err)
 		return
-	}
-
-	// Read L2 words
-	l0Blocks := (dataL0w + 511) / 512
-	l1Blocks := (dataL1w + 511) / 512
-	l2Start := fs.sb.TrieNodePoolStart + 1 + l0Blocks + l1Blocks
-	l2Blocks := (dataL2w + 511) / 512
-
-	l2 := make([]uint64, dataL2w)
-	for bi := uint64(0); bi < l2Blocks; bi++ {
-		buf := make([]byte, blockSize)
-		if _, err := fs.file.ReadAt(buf, int64((l2Start+bi)*blockSize)); err != nil {
-			fs.errorf("block cross-ref: read L2 block %d: %v", l2Start+bi, err)
-			return
-		}
-		start := bi * 512
-		for j := uint64(0); j < 512 && start+j < dataL2w; j++ {
-			l2[start+j] = binary.LittleEndian.Uint64(buf[j*8:])
-		}
 	}
 
 	// Build a set of data-relative blocks that the allocator says are allocated
@@ -1034,6 +1032,131 @@ func verifyDuplicateNames(fs *fsckState, entries []trieEntry) {
 	}
 }
 
+// readAllocatorL2 reads the L2 bitmap words from an allocator pool.
+func readAllocatorL2(file *os.File, poolBlock, blockSize uint64) (l2 []uint64, l2w uint64, blockCount uint64, err error) {
+	buf := make([]byte, blockSize)
+	if _, err := file.ReadAt(buf, int64(poolBlock*blockSize)); err != nil {
+		return nil, 0, 0, fmt.Errorf("read allocator header at %d: %w", poolBlock, err)
+	}
+	l0w := binary.LittleEndian.Uint64(buf[8:])
+	l1w := binary.LittleEndian.Uint64(buf[16:])
+	l2w = binary.LittleEndian.Uint64(buf[24:])
+	blockCount = binary.LittleEndian.Uint64(buf[32:])
+
+	l0Blocks := (l0w + 511) / 512
+	l1Blocks := (l1w + 511) / 512
+	l2Start := poolBlock + 1 + l0Blocks + l1Blocks
+	l2Blocks := (l2w + 511) / 512
+
+	l2 = make([]uint64, l2w)
+	for bi := uint64(0); bi < l2Blocks; bi++ {
+		b := make([]byte, blockSize)
+		if _, err := file.ReadAt(b, int64((l2Start+bi)*blockSize)); err != nil {
+			return nil, 0, 0, fmt.Errorf("read L2 block %d: %w", l2Start+bi, err)
+		}
+		start := bi * 512
+		for j := uint64(0); j < 512 && start+j < l2w; j++ {
+			l2[start+j] = binary.LittleEndian.Uint64(b[j*8:])
+		}
+	}
+	return
+}
+
+// verifyInodeBitmapCrossReference checks that every allocated inode bitmap slot
+// corresponds to an inode with valid magic on disk, and every unallocated slot
+// truly lacks valid magic.
+func verifyInodeBitmapCrossReference(fs *fsckState, blockSize, inodeSize uint64) {
+	inodeTableStart := fs.sb.InodeTableOffset
+	inodesPerBlock := blockSize / inodeSize
+
+	l2, _, blockCount, err := readAllocatorL2(fs.file, fs.sb.InodeBMOffset, blockSize)
+	if err != nil {
+		fs.errorf("inode bitmap cross-ref: %v", err)
+		return
+	}
+
+	// Check each inode slot
+	badAllocated := 0 // bitmap says allocated, but no valid inode magic
+	badFree := 0      // bitmap says free, but has valid inode magic
+	ino := uint64(1)
+
+	for bi := uint64(0); bi < (blockCount+inodesPerBlock-1)/inodesPerBlock; bi++ {
+		absBlock := inodeTableStart + bi
+		buf := make([]byte, blockSize)
+		if _, err := fs.file.ReadAt(buf, int64(absBlock*blockSize)); err != nil {
+			fs.errorf("inode bitmap cross-ref: read inode table block %d: %v", absBlock, err)
+			ino += inodesPerBlock
+			continue
+		}
+
+		for j := uint64(0); j < inodesPerBlock && ino <= blockCount; j++ {
+			offset := j * inodeSize
+			magic := binary.LittleEndian.Uint64(buf[offset+8:])
+
+			w := (ino - 1) / 64
+			b := (ino - 1) % 64
+			allocated := w < uint64(len(l2)) && (l2[w]&(1<<b)) == 0
+
+			hasMagic := magic == types.MagicInode
+
+			if allocated && !hasMagic {
+				if badAllocated < 20 {
+					fs.errorf("ino %d: bitmap says allocated but inode has no valid magic (0x%016X)", ino, magic)
+				} else if badAllocated == 20 {
+					fs.errorf("(more inode bitmap/table mismatch errors suppressed)")
+				}
+				badAllocated++
+			}
+			if !allocated && hasMagic {
+				if badFree < 20 {
+					fs.errorf("ino %d: bitmap says free but inode has valid magic (0x%016X)", ino, magic)
+				} else if badFree == 20 {
+					fs.errorf("(more inode bitmap/table mismatch errors suppressed)")
+				}
+				badFree++
+			}
+			ino++
+		}
+	}
+
+	if badAllocated == 0 && badFree == 0 {
+		fmt.Fprintf(os.Stderr, "  inode bitmap cross-ref: all bitmap entries match inode table\n")
+	}
+}
+
+// verifySuperblockFreeCounts cross-checks the superblock free counts against
+// the allocator headers and the actual inode/found counts.
+func verifySuperblockFreeCounts(fs *fsckState, totalInodesFound int) {
+	// Read data allocator free count
+	_, _, _, _, dataFree, err := readAllocatorHeader(fs.file, fs.sb.TrieNodePoolStart, fs.sb.BlockSize)
+	if err == nil {
+		if dataFree != fs.sb.FreeDataBlks {
+			fs.errorf("superblock free data blocks mismatch: superblock says %d, allocator says %d",
+				fs.sb.FreeDataBlks, dataFree)
+		}
+	}
+
+	// Read inode allocator free count
+	_, _, _, _, inodeFree, err := readAllocatorHeader(fs.file, fs.sb.InodeBMOffset, fs.sb.BlockSize)
+	if err == nil {
+		if inodeFree != fs.sb.FreeInodes {
+			fs.errorf("superblock free inodes mismatch: superblock says %d, allocator says %d",
+				fs.sb.FreeInodes, inodeFree)
+		}
+	}
+
+	// Cross-check: total inodes = (blockCount - inodeFree), should be totalInodesFound
+	inodeHeader := make([]byte, fs.sb.BlockSize)
+	if _, err := fs.file.ReadAt(inodeHeader, int64(fs.sb.InodeBMOffset*fs.sb.BlockSize)); err == nil {
+		inodeBlockCount := binary.LittleEndian.Uint64(inodeHeader[32:])
+		expectedInodes := int(inodeBlockCount - inodeFree)
+		if expectedInodes != totalInodesFound {
+			fs.errorf("inode count mismatch: bitmap says %d in-use, inode table scan found %d",
+				expectedInodes, totalInodesFound)
+		}
+	}
+}
+
 func main() {
 	app := &cli.App{
 		Name:    "fsck.briefs",
@@ -1072,11 +1195,14 @@ func main() {
 			}
 			defer file.Close()
 
-			fi, err := file.Stat()
+			// Probe the device size using seeking (works for both regular
+			// files and block devices; os.Stat().Size() returns 0 for
+			// block devices).
+			bd, err := device.GetDevice(path, 4096)
 			if err != nil {
-				return fmt.Errorf("stat device: %w", err)
+				return fmt.Errorf("probe device size: %w", err)
 			}
-			deviceSize := fi.Size()
+			deviceSize := bd.Bytes()
 
 			fs := &fsckState{
 				file: file,
@@ -1195,7 +1321,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "  start block: %d\n", sb.JournalOffset)
 			fmt.Fprintf(os.Stderr, "  blocks:      %d\n", sb.JournalBlocks)
 			fmt.Fprintf(os.Stderr, "  checkpoint:  %d\n", sb.CheckpointSeq)
-			if err := verifyJournal(file, sb.JournalOffset, sb.JournalBlocks, blockSize); err != nil {
+			if err := verifyJournal(file, sb.JournalOffset, sb.JournalBlocks, sb.CheckpointSeq, sb.JournalLogStart, sb.JournalLogEnd, blockSize); err != nil {
 				fs.warnf("journal check: %v", err)
 			} else {
 				fmt.Fprintf(os.Stderr, "  journal magic OK\n")
@@ -1215,7 +1341,9 @@ func main() {
 
 			// 6. Cross-referencing checks
 			fmt.Fprintf(os.Stderr, "\nCross-referencing:\n")
+			verifyInodeBitmapCrossReference(fs, blockSize, sb.InodeSize)
 			verifyBlockCrossReference(fs, blockSize)
+			verifySuperblockFreeCounts(fs, totalInodes)
 			verifyDirEntryCrossReference(fs, allEntries)
 			verifyDuplicateNames(fs, allEntries)
 			verifyLinkCounts(fs)
