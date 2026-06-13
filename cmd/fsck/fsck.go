@@ -430,7 +430,22 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 // including both inline extents and overflow chain blocks.
 func collectInodeExtents(fs *fsckState, ino uint64, in *types.Inode, blockSize uint64) {
 	// Helper to record the blocks from a single extent.
+	// Skips hole extents (ExtentFlagHole) which have no physical backing.
 	addExtentBlocks := func(ext types.Extent) {
+		// Validate extent flags
+		if ext.Flags&types.ExtentFlagHole != 0 {
+			// Hole extent — no physical blocks, skip
+			return
+		}
+		if ext.Flags&types.ExtentFlagEof != 0 {
+			// EOF marker — should only appear on the last extent
+			// (we can't easily verify that here, but it's valid)
+		}
+		if ext.Flags & ^(uint32(types.ExtentFlagHole|types.ExtentFlagEof)) != 0 {
+			fs.warnf("ino %d: extent with unknown flags 0x%08X (phys=%d, len=%d)",
+				ino, ext.Flags, ext.Phys, ext.Len)
+		}
+
 		if ext.Len > 0 && ext.Phys > 0 {
 			for bk := uint64(0); bk < ext.Len; bk++ {
 				fs.usedBlocks[ext.Phys+bk] = true
@@ -581,6 +596,27 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootBlock uint64, bloc
 			fs.errorf("ino %d dir trie: block %d: invalid node type 0x%02X", parentIno, block, node.NodeType)
 		}
 
+		// Validate node flags
+		if node.Flags&types.NodeFlagDeleted != 0 {
+			// NODE_FLAG_DELETED means this entry is pending cleanup.
+			// The node is still in the trie but should be ignored for
+			// directory entry purposes.  We still walk its children
+			// (if any) since they may be valid.
+			fs.warnf("ino %d dir trie: block %d: NODE_FLAG_DELETED set (pending cleanup)",
+				parentIno, block)
+		}
+		if block == rootBlock && node.Flags&types.NodeFlagRoot != 0 {
+			// NODE_FLAG_ROOT is defined but not currently set by any code.
+			// If it's set, that's fine — just note it.
+		}
+		if block != rootBlock && node.Flags&types.NodeFlagRoot != 0 {
+			fs.errorf("ino %d dir trie: block %d: NODE_FLAG_ROOT set on non-root node", parentIno, block)
+		}
+		if node.Flags & ^(uint64(types.NodeFlagDeleted|types.NodeFlagRoot)) != 0 {
+			fs.warnf("ino %d dir trie: block %d: unknown flags 0x%016X",
+				parentIno, block, node.Flags)
+		}
+
 		// Validate depth
 		if block == rootBlock && node.Depth != 0 {
 			fs.errorf("ino %d dir trie: root block %d: depth is %d, expected 0", parentIno, block, node.Depth)
@@ -616,19 +652,22 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootBlock uint64, bloc
 
 		// Extract leaf entry if this node has one
 		if trieIsLeaf(node.NodeType) {
-			name := extractTrieNodeName(buf, node)
-			if name == "" {
-				fs.errorf("ino %d dir trie: block %d: empty or invalid name (name_len=%d, name_offset=%d)",
-					parentIno, block, node.NameLen, node.NameOffset)
-			} else {
-				entries = append(entries, trieEntry{
-					Inode:  node.Inode,
-					FType:  node.FType,
-					Name:   name,
-					Parent: parentIno,
-				})
-				// Count this entry for link count cross-referencing
-				fs.entryCounts[node.Inode]++
+			// Skip deleted entries — they're pending cleanup
+			if node.Flags&types.NodeFlagDeleted == 0 {
+				name := extractTrieNodeName(buf, node)
+				if name == "" {
+					fs.errorf("ino %d dir trie: block %d: empty or invalid name (name_len=%d, name_offset=%d)",
+						parentIno, block, node.NameLen, node.NameOffset)
+				} else {
+					entries = append(entries, trieEntry{
+						Inode:  node.Inode,
+						FType:  node.FType,
+						Name:   name,
+						Parent: parentIno,
+					})
+					// Count this entry for link count cross-referencing
+					fs.entryCounts[node.Inode]++
+				}
 			}
 
 			// If this node also has children, push it back with emitted=true
@@ -947,13 +986,21 @@ func verifyExtentOverlaps(fs *fsckState) {
 	}
 	var allExtents []extentRef
 
+	addExtent := func(ino uint64, ext types.Extent) {
+		// Skip hole extents — no physical backing
+		if ext.Flags&types.ExtentFlagHole != 0 {
+			return
+		}
+		if ext.Len > 0 && ext.Phys > 0 {
+			allExtents = append(allExtents, extentRef{ino: ino, phys: ext.Phys, len: ext.Len})
+		}
+	}
+
 	for ino, in := range fs.inodes {
 		// Walk inline extents
 		for ei := uint32(0); ei < in.NumExtentsInline; ei++ {
 			ext := in.InlineExtents[ei]
-			if ext.Len > 0 && ext.Phys > 0 {
-				allExtents = append(allExtents, extentRef{ino: ino, phys: ext.Phys, len: ext.Len})
-			}
+			addExtent(ino, ext)
 		}
 
 		// Walk overflow chain extents
@@ -968,9 +1015,7 @@ func verifyExtentOverlaps(fs *fsckState) {
 				hdr := types.UnmarshalExtentChainHeader(buf)
 				for i := uint32(0); i < hdr.NumExtentsInBlock && i < uint32(extentsPerBlock); i++ {
 					ext := types.ReadChainExtent(buf, int(i))
-					if ext.Len > 0 && ext.Phys > 0 {
-						allExtents = append(allExtents, extentRef{ino: ino, phys: ext.Phys, len: ext.Len})
-					}
+					addExtent(ino, ext)
 				}
 				chainBlock = hdr.NextOverflowBlock
 			}

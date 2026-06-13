@@ -43,6 +43,10 @@ const (
 	NodeTypeInterm   = 0x04
 	NodeStatusLeaf   = 0x08
 
+	// Trie node flags — mirrors briefs.h NODE_FLAG_*
+	NodeFlagDeleted  = 0x00000004
+	NodeFlagRoot     = 0x00000008
+
 	// Inode flags
 	InodeFlagReserved    = 0x00000001
 	InodeFlagCompressed  = 0x00000002
