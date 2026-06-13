@@ -42,6 +42,80 @@ const trieNodeTypeDir = 0x02
 const trieNodeTypeInterm = 0x04
 const trieNodeStatusLeaf = 0x08
 
+// TrieNodeData holds the parsed fields from a trie node block.
+// This is a convenience struct for callers that need to inspect trie nodes
+// directly (e.g., the FUSE bridge for readdir or lookup).
+type TrieNodeData struct {
+	Magic       uint32
+	ChildCount  uint32
+	FirstChild  uint64
+	NextSibling uint64
+	Depth       uint8
+	NodeType    uint8
+	ByteVal     uint8
+	FType       uint8
+	Flags       uint64
+	Inode       uint64
+	NameLen     uint16
+	NameOffset  uint16
+}
+
+// ParseTrieNode parses a trie node from a raw block buffer.
+func ParseTrieNode(buf []byte) (*TrieNodeData, error) {
+	if len(buf) < trieNodeHeaderSize {
+		return nil, fmt.Errorf("buffer too small for trie node: %d < %d", len(buf), trieNodeHeaderSize)
+	}
+	magic := readTrieMagic(buf)
+	if magic != types.MagicTrieNode {
+		return nil, fmt.Errorf("bad trie magic: 0x%08x (expected 0x%08x)", magic, types.MagicTrieNode)
+	}
+	return &TrieNodeData{
+		Magic:       magic,
+		ChildCount:  readTrieChildCount(buf),
+		FirstChild:  readTrieFirstChild(buf),
+		NextSibling: readTrieNextSibling(buf),
+		Depth:       readTrieDepth(buf),
+		NodeType:    readTrieNodeType(buf),
+		ByteVal:     readTrieByteVal(buf),
+		FType:       readTrieFType(buf),
+		Flags:       readTrieFlags(buf),
+		Inode:       readTrieInode(buf),
+		NameLen:     readTrieNameLen(buf),
+		NameOffset:  readTrieNameOffset(buf),
+	}, nil
+}
+
+// TrieReadNode reads a trie node block from disk and validates the magic.
+// Returns the parsed node data and the raw buffer.
+func TrieReadNode(dev *BlockDevice, block uint64) (*TrieNodeData, []byte, error) {
+	buf, err := dev.ReadBlock(block)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read trie node block %d: %w", block, err)
+	}
+	node, err := ParseTrieNode(buf)
+	if err != nil {
+		return nil, buf, fmt.Errorf("parse trie node at block %d: %w", block, err)
+	}
+	return node, buf, nil
+}
+
+// TrieIsLeaf returns true if the node is a leaf (pure leaf or INTERM with STATUS_LEAF).
+func TrieIsLeaf(buf []byte) bool {
+	nt := readTrieNodeType(buf)
+	return nt != trieNodeTypeInterm || (nt&trieNodeStatusLeaf != 0)
+}
+
+// TrieReadLeafName reads the leaf name from the trailing region of a trie block.
+// Returns the name bytes (not including the 2-byte length prefix).
+func TrieReadLeafName(buf []byte, blockSize uint64) ([]byte, error) {
+	return readTrieLeafName(buf, blockSize)
+}
+
+// TrieReadLeafNameStr reads the leaf name as a string.
+func TrieReadLeafNameStr(buf []byte, blockSize uint64) (string, error) {
+	return readTrieLeafNameStr(buf, blockSize)
+}
+
 // readTrieMagic returns the magic from a trie node block.
 func readTrieMagic(buf []byte) uint32 {
 	return binary.LittleEndian.Uint32(buf[0:])
@@ -152,7 +226,7 @@ func TrieLookup(dev *BlockDevice, dirTrieRoot uint64, name string) (ino uint64, 
 
 		if pos == nameLen-1 {
 			// Last byte — the target node should be a child of cur.
-			child, err := trieFindChild(dev, cur, bval)
+			child, err := TrieFindChild(dev, cur, bval)
 			if err != nil {
 				return 0, 0, err
 			}
@@ -203,7 +277,7 @@ func TrieLookup(dev *BlockDevice, dirTrieRoot uint64, name string) (ino uint64, 
 		}
 
 		// Not the last byte — find or traverse INTERM child
-		child, err := trieFindChild(dev, cur, bval)
+		child, err := TrieFindChild(dev, cur, bval)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -216,9 +290,9 @@ func TrieLookup(dev *BlockDevice, dirTrieRoot uint64, name string) (ino uint64, 
 	return 0, 0, fmt.Errorf("not found")
 }
 
-// trieFindChild finds a child node by byte value in the sibling chain.
+// TrieFindChild finds a child node by byte value in the sibling chain.
 // Returns 0 if not found.
-func trieFindChild(dev *BlockDevice, parentBlock uint64, byteVal byte) (uint64, error) {
+func TrieFindChild(dev *BlockDevice, parentBlock uint64, byteVal byte) (uint64, error) {
 	buf, err := dev.ReadBlock(parentBlock)
 	if err != nil {
 		return 0, err
@@ -248,8 +322,8 @@ func trieFindChild(dev *BlockDevice, parentBlock uint64, byteVal byte) (uint64, 
 	return 0, nil
 }
 
-// trieFindChild returns all children of a trie node.
-func trieGetChildren(dev *BlockDevice, parentBlock uint64) ([]uint64, error) {
+// TrieGetChildren returns all children of a trie node.
+func TrieGetChildren(dev *BlockDevice, parentBlock uint64) ([]uint64, error) {
 	buf, err := dev.ReadBlock(parentBlock)
 	if err != nil {
 		return nil, err
