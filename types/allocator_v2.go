@@ -15,6 +15,8 @@ package types
 // the same way until words == 1 (the root single word).
 import (
 	"encoding/binary"
+	"fmt"
+	"io"
 )
 
 // AllocMagic is the magic number for the allocator pool header block.
@@ -229,4 +231,93 @@ func (b *AllocBuilder) packWords(blocks [][]byte, words []uint64, startBlock uin
 		}
 		blocks[startBlock+i/wordsPerBlock] = buf
 	}
+}
+
+// UnmarshalBinary deserializes an AllocHeader from a byte slice.
+func (h *AllocHeader) UnmarshalBinary(data []byte) error {
+	if len(data) < 48 {
+		return fmt.Errorf("allocator header data too short: %d < 48", len(data))
+	}
+	h.Magic = binary.LittleEndian.Uint32(data[0:])
+	h.Version = binary.LittleEndian.Uint32(data[4:])
+	h.L0Words = binary.LittleEndian.Uint64(data[8:])
+	h.L1Words = binary.LittleEndian.Uint64(data[16:])
+	h.L2Words = binary.LittleEndian.Uint64(data[24:])
+	h.BlockCount = binary.LittleEndian.Uint64(data[32:])
+	h.FreeCount = binary.LittleEndian.Uint64(data[40:])
+	return nil
+}
+
+// ReadAllocatorHeader reads and parses an allocator pool header from disk.
+func ReadAllocatorHeader(r io.ReaderAt, poolBlock, blockSize uint64) (*AllocHeader, error) {
+	buf := make([]byte, blockSize)
+	if _, err := r.ReadAt(buf, int64(poolBlock*blockSize)); err != nil {
+		return nil, fmt.Errorf("read allocator header at block %d: %w", poolBlock, err)
+	}
+	h := &AllocHeader{}
+	if err := h.UnmarshalBinary(buf); err != nil {
+		return nil, err
+	}
+	if h.Magic != AllocMagic {
+		return nil, fmt.Errorf("bad allocator magic at block %d: 0x%08X (expected 0x%08X)",
+			poolBlock, h.Magic, AllocMagic)
+	}
+	return h, nil
+}
+
+// ReadAllocatorBitmap reads all three levels of an allocator bitmap from disk.
+// Returns the L0, L1, and L2 word arrays, and the pool header.
+func ReadAllocatorBitmap(r io.ReaderAt, poolBlock, blockSize uint64) (l0, l1, l2 []uint64, hdr *AllocHeader, err error) {
+	hdr, err = ReadAllocatorHeader(r, poolBlock, blockSize)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	wordsPerBlock := blockSize / 8
+
+	// Read L0 blocks
+	l0Blocks := (hdr.L0Words + wordsPerBlock - 1) / wordsPerBlock
+	l0 = make([]uint64, hdr.L0Words)
+	for i := uint64(0); i < l0Blocks; i++ {
+		buf := make([]byte, blockSize)
+		if _, err := r.ReadAt(buf, int64((poolBlock+1+i)*blockSize)); err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("read L0 block %d: %w", poolBlock+1+i, err)
+		}
+		start := i * wordsPerBlock
+		for j := uint64(0); j < wordsPerBlock && start+j < hdr.L0Words; j++ {
+			l0[start+j] = binary.LittleEndian.Uint64(buf[j*8:])
+		}
+	}
+
+	// Read L1 blocks
+	l1Start := poolBlock + 1 + l0Blocks
+	l1Blocks := (hdr.L1Words + wordsPerBlock - 1) / wordsPerBlock
+	l1 = make([]uint64, hdr.L1Words)
+	for i := uint64(0); i < l1Blocks; i++ {
+		buf := make([]byte, blockSize)
+		if _, err := r.ReadAt(buf, int64((l1Start+i)*blockSize)); err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("read L1 block %d: %w", l1Start+i, err)
+		}
+		start := i * wordsPerBlock
+		for j := uint64(0); j < wordsPerBlock && start+j < hdr.L1Words; j++ {
+			l1[start+j] = binary.LittleEndian.Uint64(buf[j*8:])
+		}
+	}
+
+	// Read L2 blocks
+	l2Start := l1Start + l1Blocks
+	l2Blocks := (hdr.L2Words + wordsPerBlock - 1) / wordsPerBlock
+	l2 = make([]uint64, hdr.L2Words)
+	for i := uint64(0); i < l2Blocks; i++ {
+		buf := make([]byte, blockSize)
+		if _, err := r.ReadAt(buf, int64((l2Start+i)*blockSize)); err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("read L2 block %d: %w", l2Start+i, err)
+		}
+		start := i * wordsPerBlock
+		for j := uint64(0); j < wordsPerBlock && start+j < hdr.L2Words; j++ {
+			l2[start+j] = binary.LittleEndian.Uint64(buf[j*8:])
+		}
+	}
+
+	return
 }

@@ -37,45 +37,24 @@ func (fs *fsckState) warnf(format string, args ...interface{}) {
 }
 
 func verifyAllocatorPool(file *os.File, poolBlock, blockSize uint64, label string) error {
-	buf := make([]byte, blockSize)
-	if _, err := file.ReadAt(buf, int64(poolBlock*blockSize)); err != nil {
-		return fmt.Errorf("%s: read header block at %d: %w", label, poolBlock, err)
+	hdr, err := types.ReadAllocatorHeader(file, poolBlock, blockSize)
+	if err != nil {
+		return err
 	}
 
-	magic := binary.LittleEndian.Uint32(buf[0:])
-	if magic != types.AllocMagic {
-		return fmt.Errorf("%s: bad magic at block %d: expected 0x%08X, got 0x%08X", label, poolBlock, types.AllocMagic, magic)
-	}
-
-	ver := binary.LittleEndian.Uint32(buf[4:])
-	if ver != 1 {
-		return fmt.Errorf("%s: unsupported version %d at block %d", label, ver, poolBlock)
-	}
-
-	l0w := binary.LittleEndian.Uint64(buf[8:])
-	l1w := binary.LittleEndian.Uint64(buf[16:])
-	l2w := binary.LittleEndian.Uint64(buf[24:])
-	blockCount := binary.LittleEndian.Uint64(buf[32:])
-	freeCount := binary.LittleEndian.Uint64(buf[40:])
-
-	fmt.Fprintf(os.Stderr, "  %s: pool at block %d, %d entries, %d free\n", label, poolBlock, blockCount, freeCount)
-	fmt.Fprintf(os.Stderr, "    levels: L0=%d words, L1=%d words, L2=%d words\n", l0w, l1w, l2w)
+	fmt.Fprintf(os.Stderr, "  %s: pool at block %d, %d entries, %d free\n", label, poolBlock, hdr.BlockCount, hdr.FreeCount)
+	fmt.Fprintf(os.Stderr, "    levels: L0=%d words, L1=%d words, L2=%d words\n", hdr.L0Words, hdr.L1Words, hdr.L2Words)
 
 	return nil
 }
 
 // readAllocatorHeader reads the allocator pool header and returns all fields.
 func readAllocatorHeader(file *os.File, poolBlock, blockSize uint64) (l0w, l1w, l2w, blockCount, freeCount uint64, err error) {
-	buf := make([]byte, blockSize)
-	if _, err := file.ReadAt(buf, int64(poolBlock*blockSize)); err != nil {
-		return 0, 0, 0, 0, 0, fmt.Errorf("read allocator header at %d: %w", poolBlock, err)
+	hdr, err := types.ReadAllocatorHeader(file, poolBlock, blockSize)
+	if err != nil {
+		return 0, 0, 0, 0, 0, err
 	}
-	l0w = binary.LittleEndian.Uint64(buf[8:])
-	l1w = binary.LittleEndian.Uint64(buf[16:])
-	l2w = binary.LittleEndian.Uint64(buf[24:])
-	blockCount = binary.LittleEndian.Uint64(buf[32:])
-	freeCount = binary.LittleEndian.Uint64(buf[40:])
-	return
+	return hdr.L0Words, hdr.L1Words, hdr.L2Words, hdr.BlockCount, hdr.FreeCount, nil
 }
 
 // verifyAllocatorBitmap reads and validates the full 3-level allocator bitmap.
@@ -257,55 +236,10 @@ func popcount64(x uint64) int {
 }
 
 func verifySuperblock(file *os.File, blockSize uint64) (*types.SuperblockLayout, error) {
-	buf := make([]byte, blockSize)
-	if _, err := file.ReadAt(buf, 0); err != nil {
-		return nil, fmt.Errorf("read superblock: %w", err)
+	sb, err := types.ReadSuperblock(file, blockSize)
+	if err != nil {
+		return nil, err
 	}
-
-	sb := &types.SuperblockLayout{}
-	magic := binary.LittleEndian.Uint64(buf[0:])
-	if magic != types.MagicSuperblock {
-		return nil, fmt.Errorf("bad superblock magic: 0x%016X (expected 0x%016X)", magic, types.MagicSuperblock)
-	}
-
-	sb.Magic = magic
-	sb.MajorVer = binary.LittleEndian.Uint64(buf[8:])
-	sb.MinorVer = binary.LittleEndian.Uint64(buf[16:])
-	sb.PatchVer = binary.LittleEndian.Uint64(buf[24:])
-	sb.TotalBlocks = binary.LittleEndian.Uint64(buf[32:])
-	sb.DataBlocks = binary.LittleEndian.Uint64(buf[40:])
-	sb.BlockSize = binary.LittleEndian.Uint64(buf[48:])
-	sb.InodeSize = binary.LittleEndian.Uint64(buf[56:])
-	sb.BlocksGrp = binary.LittleEndian.Uint64(buf[64:])
-	sb.InodesGrp = binary.LittleEndian.Uint64(buf[72:])
-	sb.FSCreated = binary.LittleEndian.Uint64(buf[80:])
-	sb.FSLastMount = binary.LittleEndian.Uint64(buf[88:])
-	sb.FSLastChkpt = binary.LittleEndian.Uint64(buf[96:])
-	sb.FreeDataBlks = binary.LittleEndian.Uint64(buf[104:])
-	sb.FreeInodes = binary.LittleEndian.Uint64(buf[112:])
-	sb.RootIno = binary.LittleEndian.Uint64(buf[120:])
-	sb.FeatCompat = binary.LittleEndian.Uint64(buf[128:])
-	sb.FeatROCompat = binary.LittleEndian.Uint64(buf[136:])
-	sb.FeatIncompat = binary.LittleEndian.Uint64(buf[144:])
-	copy(sb.UUID[:], buf[152:168])
-	sb.EATOffset = binary.LittleEndian.Uint64(buf[168:])
-	sb.EATBlocks = binary.LittleEndian.Uint64(buf[176:])
-	sb.TrieRootBlock = binary.LittleEndian.Uint64(buf[184:])
-	sb.TrieBlocksUsed = binary.LittleEndian.Uint64(buf[192:])
-	sb.TrieNodePoolStart = binary.LittleEndian.Uint64(buf[200:])
-	sb.TrieNodePoolSize = binary.LittleEndian.Uint64(buf[208:])
-	sb.InodeBMOffset = binary.LittleEndian.Uint64(buf[216:])
-	sb.InodeBMBlocks = binary.LittleEndian.Uint64(buf[224:])
-	sb.InodeTableOffset = binary.LittleEndian.Uint64(buf[232:])
-	sb.JournalOffset = binary.LittleEndian.Uint64(buf[240:])
-	sb.JournalBlocks = binary.LittleEndian.Uint64(buf[248:])
-	sb.CheckpointSeq = binary.LittleEndian.Uint64(buf[256:])
-	sb.JournalLogStart = binary.LittleEndian.Uint64(buf[264:])
-	sb.JournalLogEnd = binary.LittleEndian.Uint64(buf[272:])
-	for i := 0; i < 4; i++ {
-		sb.ReservedJournal[i] = binary.LittleEndian.Uint64(buf[280+i*8:])
-	}
-	copy(sb.Label[:], buf[312:312+64])
 
 	return sb, nil
 }
@@ -1166,32 +1100,11 @@ func verifyDuplicateNames(fs *fsckState, entries []trieEntry) {
 
 // readAllocatorL2 reads the L2 bitmap words from an allocator pool.
 func readAllocatorL2(file *os.File, poolBlock, blockSize uint64) (l2 []uint64, l2w uint64, blockCount uint64, err error) {
-	buf := make([]byte, blockSize)
-	if _, err := file.ReadAt(buf, int64(poolBlock*blockSize)); err != nil {
-		return nil, 0, 0, fmt.Errorf("read allocator header at %d: %w", poolBlock, err)
+	_, _, l2, hdr, err := types.ReadAllocatorBitmap(file, poolBlock, blockSize)
+	if err != nil {
+		return nil, 0, 0, err
 	}
-	l0w := binary.LittleEndian.Uint64(buf[8:])
-	l1w := binary.LittleEndian.Uint64(buf[16:])
-	l2w = binary.LittleEndian.Uint64(buf[24:])
-	blockCount = binary.LittleEndian.Uint64(buf[32:])
-
-	l0Blocks := (l0w + 511) / 512
-	l1Blocks := (l1w + 511) / 512
-	l2Start := poolBlock + 1 + l0Blocks + l1Blocks
-	l2Blocks := (l2w + 511) / 512
-
-	l2 = make([]uint64, l2w)
-	for bi := uint64(0); bi < l2Blocks; bi++ {
-		b := make([]byte, blockSize)
-		if _, err := file.ReadAt(b, int64((l2Start+bi)*blockSize)); err != nil {
-			return nil, 0, 0, fmt.Errorf("read L2 block %d: %w", l2Start+bi, err)
-		}
-		start := bi * 512
-		for j := uint64(0); j < 512 && start+j < l2w; j++ {
-			l2[start+j] = binary.LittleEndian.Uint64(b[j*8:])
-		}
-	}
-	return
+	return l2, hdr.L2Words, hdr.BlockCount, nil
 }
 
 // verifyInodeBitmapCrossReference checks that every allocated inode bitmap slot

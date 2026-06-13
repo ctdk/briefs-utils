@@ -81,6 +81,12 @@ func (bd *BlockDevice) BlockSize() uint64 {
 	return bd.blockSize
 }
 
+// ReadAt implements io.ReaderAt, allowing types.ReadSuperblock and
+// types.ReadAllocatorHeader to work with a BlockDevice.
+func (bd *BlockDevice) ReadAt(p []byte, off int64) (int, error) {
+	return bd.file.ReadAt(p, off)
+}
+
 // Close closes the underlying file.
 func (bd *BlockDevice) Close() error {
 	return bd.file.Close()

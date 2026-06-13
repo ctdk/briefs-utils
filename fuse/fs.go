@@ -15,9 +15,9 @@ import (
 type Allocator struct {
 	mu sync.Mutex
 
-	dev              *BlockDevice
-	blockSize        uint64
-	poolStart        uint64 // first block of allocator pool on disk
+	dev     *BlockDevice
+	poolStart uint64
+	blockSize  uint64
 	l0Words, l1Words, l2Words uint64
 	blockCount       uint64
 	freeCount        uint64
@@ -25,119 +25,33 @@ type Allocator struct {
 	dirty            bool
 }
 
-// AllocHeader is the on-disk header for the allocator pool.
-type AllocHeader struct {
-	Magic      uint32
-	Version    uint32
-	L0Words    uint64
-	L1Words    uint64
-	L2Words    uint64
-	BlockCount uint64
-	FreeCount  uint64
-	_          [6]uint64 // reserved, 48 bytes
-}
-
-const allocMagic = 0x4249544D // "BITM"
-const allocVersion = 1
 const wordsPerBlock = 4096 / 8 // 512
 
 // OpenAllocator reads the allocator pool from disk and initializes the in-memory bitmap.
 func OpenAllocator(dev *BlockDevice, poolStart uint64) (*Allocator, error) {
-	buf, err := dev.ReadBlock(poolStart)
+	l0, l1, l2, hdr, err := types.ReadAllocatorBitmap(dev, poolStart, dev.BlockSize())
 	if err != nil {
-		return nil, fmt.Errorf("read allocator header at block %d: %w", poolStart, err)
+		return nil, err
 	}
 
-	magic := binary.LittleEndian.Uint32(buf[0:])
-	if magic != allocMagic {
-		return nil, fmt.Errorf("bad allocator magic at block %d: 0x%08x (expected 0x%08x)",
-			poolStart, magic, allocMagic)
+	if hdr.L0Words < 1 || hdr.L1Words < 1 || hdr.L2Words < 1 {
+		return nil, fmt.Errorf("invalid allocator level sizes: l0=%d l1=%d l2=%d",
+			hdr.L0Words, hdr.L1Words, hdr.L2Words)
 	}
 
-	ver := binary.LittleEndian.Uint32(buf[4:])
-	if ver != allocVersion {
-		return nil, fmt.Errorf("unsupported allocator version %d at block %d", ver, poolStart)
-	}
-
-	l0w := binary.LittleEndian.Uint64(buf[8:])
-	l1w := binary.LittleEndian.Uint64(buf[16:])
-	l2w := binary.LittleEndian.Uint64(buf[24:])
-	blockCount := binary.LittleEndian.Uint64(buf[32:])
-	freeCount := binary.LittleEndian.Uint64(buf[40:])
-
-	if l0w < 1 || l1w < 1 || l2w < 1 {
-		return nil, fmt.Errorf("invalid allocator level sizes: l0=%d l1=%d l2=%d", l0w, l1w, l2w)
-	}
-
-	a := &Allocator{
-		dev:       dev,
-		blockSize: dev.BlockSize(),
-		poolStart: poolStart,
-		l0Words:   l0w,
-		l1Words:   l1w,
-		l2Words:   l2w,
-		blockCount: blockCount,
-		freeCount:  freeCount,
-		l0:        make([]uint64, l0w),
-		l1:        make([]uint64, l1w),
-		l2:        make([]uint64, l2w),
-	}
-
-	// Read level 0
-	pos := poolStart + 1
-	l0Blocks := (l0w + wordsPerBlock - 1) / wordsPerBlock
-	for i := uint64(0); i < l0Blocks; i++ {
-		b, err := dev.ReadBlock(pos + i)
-		if err != nil {
-			return nil, fmt.Errorf("read allocator L0 block %d: %w", pos+i, err)
-		}
-		start := i * wordsPerBlock
-		n := l0w - start
-		if n > wordsPerBlock {
-			n = wordsPerBlock
-		}
-		for j := uint64(0); j < n; j++ {
-			a.l0[start+j] = binary.LittleEndian.Uint64(b[j*8:])
-		}
-	}
-	pos += l0Blocks
-
-	// Read level 1
-	l1Blocks := (l1w + wordsPerBlock - 1) / wordsPerBlock
-	for i := uint64(0); i < l1Blocks; i++ {
-		b, err := dev.ReadBlock(pos + i)
-		if err != nil {
-			return nil, fmt.Errorf("read allocator L1 block %d: %w", pos+i, err)
-		}
-		start := i * wordsPerBlock
-		n := l1w - start
-		if n > wordsPerBlock {
-			n = wordsPerBlock
-		}
-		for j := uint64(0); j < n; j++ {
-			a.l1[start+j] = binary.LittleEndian.Uint64(b[j*8:])
-		}
-	}
-	pos += l1Blocks
-
-	// Read level 2
-	l2Blocks := (l2w + wordsPerBlock - 1) / wordsPerBlock
-	for i := uint64(0); i < l2Blocks; i++ {
-		b, err := dev.ReadBlock(pos + i)
-		if err != nil {
-			return nil, fmt.Errorf("read allocator L2 block %d: %w", pos+i, err)
-		}
-		start := i * wordsPerBlock
-		n := l2w - start
-		if n > wordsPerBlock {
-			n = wordsPerBlock
-		}
-		for j := uint64(0); j < n; j++ {
-			a.l2[start+j] = binary.LittleEndian.Uint64(b[j*8:])
-		}
-	}
-
-	return a, nil
+	return &Allocator{
+		dev:        dev,
+		blockSize:  dev.BlockSize(),
+		poolStart:  poolStart,
+		l0Words:    hdr.L0Words,
+		l1Words:    hdr.L1Words,
+		l2Words:    hdr.L2Words,
+		blockCount: hdr.BlockCount,
+		freeCount:  hdr.FreeCount,
+		l0:         l0,
+		l1:         l1,
+		l2:         l2,
+	}, nil
 }
 
 // AllocBlock finds and allocates a single free block.
@@ -340,8 +254,8 @@ func (a *Allocator) Sync() error {
 
 	// Update header with free_count
 	hdr := make([]byte, blockSize)
-	binary.LittleEndian.PutUint32(hdr[0:], allocMagic)
-	binary.LittleEndian.PutUint32(hdr[4:], allocVersion)
+	binary.LittleEndian.PutUint32(hdr[0:], types.AllocMagic)
+	binary.LittleEndian.PutUint32(hdr[4:], 1) // version
 	binary.LittleEndian.PutUint64(hdr[8:], a.l0Words)
 	binary.LittleEndian.PutUint64(hdr[16:], a.l1Words)
 	binary.LittleEndian.PutUint64(hdr[24:], a.l2Words)

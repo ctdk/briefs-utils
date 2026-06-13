@@ -3,7 +3,6 @@ package fuse
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"syscall"
 
@@ -92,58 +91,9 @@ func Mount(imagePath string, opts MountOptions) error {
 }
 
 // readSuperblock reads and parses the superblock from block 0.
+// readSuperblock reads and parses the superblock from block 0.
 func readSuperblock(dev *BlockDevice) (*types.SuperblockLayout, error) {
-	buf, err := dev.ReadBlock(0)
-	if err != nil {
-		return nil, err
-	}
-
-	magic := binary.LittleEndian.Uint64(buf[0:])
-	if magic != types.MagicSuperblock {
-		return nil, fmt.Errorf("bad superblock magic: 0x%016x (expected 0x%016x)", magic, types.MagicSuperblock)
-	}
-
-	sb := &types.SuperblockLayout{}
-	sb.Magic = magic
-	sb.MajorVer = binary.LittleEndian.Uint64(buf[8:])
-	sb.MinorVer = binary.LittleEndian.Uint64(buf[16:])
-	sb.PatchVer = binary.LittleEndian.Uint64(buf[24:])
-	sb.TotalBlocks = binary.LittleEndian.Uint64(buf[32:])
-	sb.DataBlocks = binary.LittleEndian.Uint64(buf[40:])
-	sb.BlockSize = binary.LittleEndian.Uint64(buf[48:])
-	sb.InodeSize = binary.LittleEndian.Uint64(buf[56:])
-	sb.BlocksGrp = binary.LittleEndian.Uint64(buf[64:])
-	sb.InodesGrp = binary.LittleEndian.Uint64(buf[72:])
-	sb.FSCreated = binary.LittleEndian.Uint64(buf[80:])
-	sb.FSLastMount = binary.LittleEndian.Uint64(buf[88:])
-	sb.FSLastChkpt = binary.LittleEndian.Uint64(buf[96:])
-	sb.FreeDataBlks = binary.LittleEndian.Uint64(buf[104:])
-	sb.FreeInodes = binary.LittleEndian.Uint64(buf[112:])
-	sb.RootIno = binary.LittleEndian.Uint64(buf[120:])
-	sb.FeatCompat = binary.LittleEndian.Uint64(buf[128:])
-	sb.FeatROCompat = binary.LittleEndian.Uint64(buf[136:])
-	sb.FeatIncompat = binary.LittleEndian.Uint64(buf[144:])
-	copy(sb.UUID[:], buf[152:168])
-	sb.EATOffset = binary.LittleEndian.Uint64(buf[168:])
-	sb.EATBlocks = binary.LittleEndian.Uint64(buf[176:])
-	sb.TrieRootBlock = binary.LittleEndian.Uint64(buf[184:])
-	sb.TrieBlocksUsed = binary.LittleEndian.Uint64(buf[192:])
-	sb.TrieNodePoolStart = binary.LittleEndian.Uint64(buf[200:])
-	sb.TrieNodePoolSize = binary.LittleEndian.Uint64(buf[208:])
-	sb.InodeBMOffset = binary.LittleEndian.Uint64(buf[216:])
-	sb.InodeBMBlocks = binary.LittleEndian.Uint64(buf[224:])
-	sb.InodeTableOffset = binary.LittleEndian.Uint64(buf[232:])
-	sb.JournalOffset = binary.LittleEndian.Uint64(buf[240:])
-	sb.JournalBlocks = binary.LittleEndian.Uint64(buf[248:])
-	sb.CheckpointSeq = binary.LittleEndian.Uint64(buf[256:])
-	sb.JournalLogStart = binary.LittleEndian.Uint64(buf[264:])
-	sb.JournalLogEnd = binary.LittleEndian.Uint64(buf[272:])
-	for i := 0; i < 4; i++ {
-		sb.ReservedJournal[i] = binary.LittleEndian.Uint64(buf[280+i*8:])
-	}
-	copy(sb.Label[:], buf[312:312+64])
-
-	return sb, nil
+	return types.ReadSuperblock(dev, dev.BlockSize())
 }
 
 // brieFSNode implements the FUSE inode operations for BrieFS.
