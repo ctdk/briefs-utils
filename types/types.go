@@ -78,7 +78,7 @@ const (
 
 	// BrieFS version numbers for this version of briefs-utils
 	BrieFSMajorVersion = 0
-	BrieFSMinorVersion = 5
+	BrieFSMinorVersion = 6
 	BrieFSPatchVersion = 0
 )
 
