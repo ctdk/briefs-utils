@@ -13,6 +13,22 @@ import (
 
 var versionStr = fmt.Sprintf("v%d.%d.%d", types.BrieFSMajorVersion, types.BrieFSMinorVersion, types.BrieFSPatchVersion)
 
+// fsckError tracks the total error count across all checks.
+type fsckState struct {
+	errors int
+	file   *os.File
+	sb     *types.SuperblockLayout
+}
+
+func (fs *fsckState) errorf(format string, args ...interface{}) {
+	fs.errors++
+	fmt.Fprintf(os.Stderr, "  ERROR: "+format+"\n", args...)
+}
+
+func (fs *fsckState) warnf(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, "  WARNING: "+format+"\n", args...)
+}
+
 func verifyAllocatorPool(file *os.File, poolBlock, blockSize uint64, label string) error {
 	buf := make([]byte, blockSize)
 	if _, err := file.ReadAt(buf, int64(poolBlock*blockSize)); err != nil {
@@ -39,6 +55,198 @@ func verifyAllocatorPool(file *os.File, poolBlock, blockSize uint64, label strin
 	fmt.Fprintf(os.Stderr, "    levels: L0=%d words, L1=%d words, L2=%d words\n", l0w, l1w, l2w)
 
 	return nil
+}
+
+// readAllocatorHeader reads the allocator pool header and returns all fields.
+func readAllocatorHeader(file *os.File, poolBlock, blockSize uint64) (l0w, l1w, l2w, blockCount, freeCount uint64, err error) {
+	buf := make([]byte, blockSize)
+	if _, err := file.ReadAt(buf, int64(poolBlock*blockSize)); err != nil {
+		return 0, 0, 0, 0, 0, fmt.Errorf("read allocator header at %d: %w", poolBlock, err)
+	}
+	l0w = binary.LittleEndian.Uint64(buf[8:])
+	l1w = binary.LittleEndian.Uint64(buf[16:])
+	l2w = binary.LittleEndian.Uint64(buf[24:])
+	blockCount = binary.LittleEndian.Uint64(buf[32:])
+	freeCount = binary.LittleEndian.Uint64(buf[40:])
+	return
+}
+
+// verifyAllocatorBitmap reads and validates the full 3-level allocator bitmap.
+// It checks:
+//   - L0 bits correctly summarize L1 (a set L0 bit means at least one L1 word under it is non-zero)
+//   - L1 bits correctly summarize L2 (a set L1 bit means at least one L2 word under it is non-zero)
+//   - Trailing bits in the last L0/L1/L2 word are properly masked
+//   - Computed free count from L2 matches the header's free count
+func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize uint64, l0w, l1w, l2w, blockCount, headerFree uint64, label string) {
+	wordsPerBlock := blockSize / 8 // 512 u64 words per 4096-byte block
+
+	// Compute expected level sizes
+	expectedL2 := (blockCount + 63) / 64
+	expectedL1 := (expectedL2 + 63) / 64
+	expectedL0 := (expectedL1 + 63) / 64
+	if expectedL0 < 1 {
+		expectedL0 = 1
+	}
+	if expectedL1 < 1 {
+		expectedL1 = 1
+	}
+	if expectedL2 < 1 {
+		expectedL2 = 1
+	}
+
+	if l0w != expectedL0 {
+		fs.errorf("%s: L0 word count mismatch: header says %d, expected %d", label, l0w, expectedL0)
+	}
+	if l1w != expectedL1 {
+		fs.errorf("%s: L1 word count mismatch: header says %d, expected %d", label, l1w, expectedL1)
+	}
+	if l2w != expectedL2 {
+		fs.errorf("%s: L2 word count mismatch: header says %d, expected %d", label, l2w, expectedL2)
+	}
+
+	// Read all L0 words
+	l0Blocks := (l0w + wordsPerBlock - 1) / wordsPerBlock
+	l0 := make([]uint64, l0w)
+	for bi := uint64(0); bi < l0Blocks; bi++ {
+		buf := make([]byte, blockSize)
+		block := poolBlock + 1 + bi
+		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
+			fs.errorf("%s: read L0 block %d: %v", label, block, err)
+			return
+		}
+		start := bi * wordsPerBlock
+		for j := uint64(0); j < wordsPerBlock && start+j < l0w; j++ {
+			l0[start+j] = binary.LittleEndian.Uint64(buf[j*8:])
+		}
+	}
+
+	// Read all L1 words
+	l1Start := poolBlock + 1 + l0Blocks
+	l1Blocks := (l1w + wordsPerBlock - 1) / wordsPerBlock
+	l1 := make([]uint64, l1w)
+	for bi := uint64(0); bi < l1Blocks; bi++ {
+		buf := make([]byte, blockSize)
+		block := l1Start + bi
+		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
+			fs.errorf("%s: read L1 block %d: %v", label, block, err)
+			return
+		}
+		start := bi * wordsPerBlock
+		for j := uint64(0); j < wordsPerBlock && start+j < l1w; j++ {
+			l1[start+j] = binary.LittleEndian.Uint64(buf[j*8:])
+		}
+	}
+
+	// Read all L2 words
+	l2Start := l1Start + l1Blocks
+	l2Blocks := (l2w + wordsPerBlock - 1) / wordsPerBlock
+	l2 := make([]uint64, l2w)
+	for bi := uint64(0); bi < l2Blocks; bi++ {
+		buf := make([]byte, blockSize)
+		block := l2Start + bi
+		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
+			fs.errorf("%s: read L2 block %d: %v", label, block, err)
+			return
+		}
+		start := bi * wordsPerBlock
+		for j := uint64(0); j < wordsPerBlock && start+j < l2w; j++ {
+			l2[start+j] = binary.LittleEndian.Uint64(buf[j*8:])
+		}
+	}
+
+	// Verify trailing bits in last L2 word are properly masked
+	if tail := blockCount % 64; tail != 0 {
+		lastWord := l2[len(l2)-1]
+		mask := (uint64(1) << tail) - 1
+		if lastWord&^mask != 0 {
+			fs.errorf("%s: trailing bits set in last L2 word (0x%016X, mask 0x%016X)", label, lastWord, mask)
+		}
+	}
+
+	// Verify trailing bits in last L1 word
+	if tail := l2w % 64; tail != 0 {
+		lastWord := l1[len(l1)-1]
+		mask := (uint64(1) << tail) - 1
+		if lastWord&^mask != 0 {
+			fs.errorf("%s: trailing bits set in last L1 word (0x%016X, mask 0x%016X)", label, lastWord, mask)
+		}
+	}
+
+	// Verify trailing bits in last L0 word
+	if tail := l1w % 64; tail != 0 {
+		lastWord := l0[len(l0)-1]
+		mask := (uint64(1) << tail) - 1
+		if lastWord&^mask != 0 {
+			fs.errorf("%s: trailing bits set in last L0 word (0x%016X, mask 0x%016X)", label, lastWord, mask)
+		}
+	}
+
+	// Verify L1 -> L2 pyramid: for each L1 word, check its bits correctly
+	// summarize the corresponding L2 words.
+	l1Errors := 0
+	for i := uint64(0); i < l1w; i++ {
+		expected := uint64(0)
+		start := i * 64
+		for j := uint64(0); j < 64 && start+j < l2w; j++ {
+			if l2[start+j] != 0 {
+				expected |= 1 << j
+			}
+		}
+		if l1[i] != expected {
+			if l1Errors < 10 {
+				fs.errorf("%s: L1 word %d mismatch: on-disk 0x%016X, computed 0x%016X", label, i, l1[i], expected)
+			} else if l1Errors == 10 {
+				fs.errorf("%s: (more L1 errors suppressed)", label)
+			}
+			l1Errors++
+		}
+	}
+
+	// Verify L0 -> L1 pyramid
+	l0Errors := 0
+	for i := uint64(0); i < l0w; i++ {
+		expected := uint64(0)
+		start := i * 64
+		for j := uint64(0); j < 64 && start+j < l1w; j++ {
+			if l1[start+j] != 0 {
+				expected |= 1 << j
+			}
+		}
+		if l0[i] != expected {
+			if l0Errors < 10 {
+				fs.errorf("%s: L0 word %d mismatch: on-disk 0x%016X, computed 0x%016X", label, i, l0[i], expected)
+			} else if l0Errors == 10 {
+				fs.errorf("%s: (more L0 errors suppressed)", label)
+			}
+			l0Errors++
+		}
+	}
+
+	// Compute actual free count from L2 bitmap
+	computedFree := uint64(0)
+	for i := uint64(0); i < l2w; i++ {
+		computedFree += uint64(popcount64(l2[i]))
+	}
+
+	if computedFree != headerFree {
+		fs.errorf("%s: free count mismatch: header says %d, bitmap scan says %d", label, headerFree, computedFree)
+	}
+
+	if l1Errors > 0 || l0Errors > 0 {
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "  %s bitmap pyramid: consistent (%d L0, %d L1, %d L2 words, %d free)\n",
+		label, l0w, l1w, l2w, computedFree)
+}
+
+// popcount64 returns the number of set bits in a 64-bit word.
+func popcount64(x uint64) int {
+	// simple parallel popcount
+	x = x - ((x >> 1) & 0x5555555555555555)
+	x = (x & 0x3333333333333333) + ((x >> 2) & 0x3333333333333333)
+	x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0F
+	return int((x * 0x0101010101010101) >> 56)
 }
 
 func verifySuperblock(file *os.File, blockSize uint64) (*types.SuperblockLayout, error) {
@@ -95,37 +303,50 @@ func verifySuperblock(file *os.File, blockSize uint64) (*types.SuperblockLayout,
 	return sb, nil
 }
 
-func verifyInode(file *os.File, ino, blockOffset, byteOffset, blockSize, inodeSize uint64) error {
-	buf := make([]byte, blockSize)
-	if _, err := file.ReadAt(buf, int64(blockOffset*blockSize)); err != nil {
-		return fmt.Errorf("read inode block %d: %w", blockOffset, err)
-	}
-
+// verifyInode checks a single inode from an already-read buffer.
+// Returns the parsed inode if valid, or an error.
+func verifyInode(buf []byte, ino, byteOffset, inodeSize uint64) (*types.Inode, error) {
 	inodeBuf := buf[byteOffset : byteOffset+inodeSize]
 	magic := binary.LittleEndian.Uint64(inodeBuf[8:])
 	if magic == 0 {
-		return nil // unallocated inode
+		return nil, nil // unallocated inode
 	}
 	if magic != types.MagicInode {
-		return fmt.Errorf("ino %d: bad magic 0x%016X", ino, magic)
+		return nil, fmt.Errorf("ino %d: bad magic 0x%016X", ino, magic)
 	}
 
-	nlinks := binary.LittleEndian.Uint32(inodeBuf[144:])
-	extentsInline := binary.LittleEndian.Uint32(inodeBuf[148:])
-	extentsTotal := binary.LittleEndian.Uint64(inodeBuf[160:])
-
-	if extentsInline > 8 {
-		return fmt.Errorf("ino %d: too many inline extents %d", ino, extentsInline)
-	}
-	if extentsTotal < uint64(extentsInline) {
-		return fmt.Errorf("ino %d: total extents %d < inline extents %d", ino, extentsTotal, extentsInline)
+	// Use the existing UnmarshalInode for full parsing
+	in, err := types.UnmarshalInode(inodeBuf)
+	if err != nil {
+		return nil, fmt.Errorf("ino %d: unmarshal failed: %w", ino, err)
 	}
 
-	_ = nlinks
-	return nil
+	// Validate inode number matches
+	if in.InodeNumber != ino {
+		return nil, fmt.Errorf("ino %d: stored inode number mismatch (%d)", ino, in.InodeNumber)
+	}
+
+	// Validate extent counts
+	if in.NumExtentsInline > 8 {
+		return nil, fmt.Errorf("ino %d: too many inline extents %d", ino, in.NumExtentsInline)
+	}
+	if in.NumExtentsTotal < uint64(in.NumExtentsInline) {
+		return nil, fmt.Errorf("ino %d: total extents %d < inline extents %d", ino, in.NumExtentsTotal, in.NumExtentsInline)
+	}
+
+	// Validate file mode
+	mode := in.Filemode
+	if mode == 0 {
+		return nil, fmt.Errorf("ino %d: zero file mode", ino)
+	}
+	if mode&types.ModeDir == 0 && mode&types.ModeFile == 0 && mode&types.ModeSymlink == 0 {
+		// Not a dir, file, or symlink — could be a special device, which is fine
+	}
+
+	return in, nil
 }
 
-func verifyInodeTable(file *os.File, inodeTableBlock, inodeTableBlocks, blockSize, inodeSize uint64) (totalInodes int, errors int) {
+func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSize, inodeSize uint64) (totalInodes int) {
 	inodesPerBlock := blockSize / inodeSize
 	ino := uint64(1)
 
@@ -133,9 +354,9 @@ func verifyInodeTable(file *os.File, inodeTableBlock, inodeTableBlocks, blockSiz
 
 	for bi := uint64(0); bi < inodeTableBlocks; bi++ {
 		buf := make([]byte, blockSize)
-		if _, err := file.ReadAt(buf, int64((inodeTableBlock+bi)*blockSize)); err != nil {
-			fmt.Fprintf(os.Stderr, "    ERROR: read inode table block %d: %v\n", inodeTableBlock+bi, err)
-			errors++
+		if _, err := fs.file.ReadAt(buf, int64((inodeTableBlock+bi)*blockSize)); err != nil {
+			fs.errorf("read inode table block %d: %v", inodeTableBlock+bi, err)
+			ino += inodesPerBlock
 			continue
 		}
 
@@ -148,9 +369,18 @@ func verifyInodeTable(file *os.File, inodeTableBlock, inodeTableBlocks, blockSiz
 			}
 
 			totalInodes++
-			if err := verifyInode(file, ino, inodeTableBlock+bi, offset, blockSize, inodeSize); err != nil {
-				fmt.Fprintf(os.Stderr, "    ERROR: %v\n", err)
-				errors++
+			in, err := verifyInode(buf, ino, offset, inodeSize)
+			if err != nil {
+				fs.errorf("%v", err)
+			} else if in != nil {
+				// Basic sanity: directory must have a trie root
+				if in.IsDir() && in.DirTrieRoot == 0 {
+					fs.errorf("ino %d: directory with no trie root", ino)
+				}
+				// File with zero size but extents
+				if in.IsFile() && in.FileSize == 0 && in.NumExtentsTotal > 0 {
+					fs.warnf("ino %d: file with zero size but %d extents", ino, in.NumExtentsTotal)
+				}
 			}
 			ino++
 		}
@@ -159,7 +389,237 @@ func verifyInodeTable(file *os.File, inodeTableBlock, inodeTableBlocks, blockSiz
 	return
 }
 
-func verifyJournal(file *os.File, journalOffset, journalBlocks, blockSize uint64) error {
+// trieNode is the on-disk format of a BrieFS directory trie node (32 bytes header).
+// Each node occupies one 4096-byte block. Names are stored in the trailing bytes.
+type trieNode struct {
+	Magic       uint32 // "TRN " - 0x54524E20
+	ChildCount  uint32
+	FirstChild  uint64 // block number of first child
+	NextSibling uint64 // block number of next sibling at same depth
+	Depth       uint8
+	NodeType    uint8 // NODE_TYPE_* | NODE_STATUS_LEAF
+	ByteVal     uint8
+	FType       uint8 // file type (S_IFMT >> 12)
+	Reserved    [4]byte
+	Flags       uint64 // NODE_FLAG_*
+
+	// Leaf entry data (valid when TRIE_IS_LEAF is true)
+	Inode       uint64
+	NameLen     uint16 // full name length (including 2-byte prefix)
+	NameOffset  uint16 // offset from block end to name bytes
+}
+
+const trieNodeHeaderSize = 32
+
+// trieIsLeaf returns true if the node has leaf data (pure leaf or INTERM+NODE_STATUS_LEAF).
+func trieIsLeaf(nt uint8) bool {
+	return (nt&types.NodeTypeInterm) == 0 || (nt&types.NodeStatusLeaf) != 0
+}
+
+// trieEntry represents a single directory entry found in the trie.
+type trieEntry struct {
+	Inode  uint64
+	FType  uint8
+	Name   string
+	Parent uint64 // parent directory inode
+}
+
+// verifyDirectoryTrie walks a directory's trie, validating structure and collecting entries.
+// Returns the list of entries found, or nil if the trie is empty.
+func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootBlock uint64, blockSize uint64) []trieEntry {
+	if rootBlock == 0 {
+		return nil
+	}
+
+	// Track visited blocks to detect cycles
+	visited := make(map[uint64]bool)
+	var entries []trieEntry
+
+	// Iterative depth-first walk using a stack of block numbers
+	stack := []uint64{rootBlock}
+	// Parallel stack: whether we've already emitted this node's leaf
+	leafEmitted := []bool{false}
+
+	for len(stack) > 0 {
+		block := stack[len(stack)-1]
+		emitted := leafEmitted[len(leafEmitted)-1]
+		stack = stack[:len(stack)-1]
+		leafEmitted = leafEmitted[:len(leafEmitted)-1]
+
+		if visited[block] {
+			fs.errorf("ino %d dir trie: cycle detected at block %d", parentIno, block)
+			continue
+		}
+		visited[block] = true
+
+		buf := make([]byte, blockSize)
+		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
+			fs.errorf("ino %d dir trie: read block %d: %v", parentIno, block, err)
+			continue
+		}
+
+		node := parseTrieNode(buf)
+
+		// Validate magic
+		if node.Magic != types.MagicTrieNode {
+			fs.errorf("ino %d dir trie: block %d: bad magic 0x%08X (expected 0x%08X)",
+				parentIno, block, node.Magic, types.MagicTrieNode)
+			continue
+		}
+
+		// Validate node type
+		if node.NodeType == 0 {
+			fs.errorf("ino %d dir trie: block %d: zero node type", parentIno, block)
+			continue
+		}
+		if node.NodeType&types.NodeTypeInterm != 0 && node.NodeType != types.NodeTypeInterm &&
+			node.NodeType != (types.NodeTypeInterm|types.NodeStatusLeaf) {
+			fs.errorf("ino %d dir trie: block %d: invalid node type 0x%02X", parentIno, block, node.NodeType)
+		}
+
+		// Validate depth
+		if block == rootBlock && node.Depth != 0 {
+			fs.errorf("ino %d dir trie: root block %d: depth is %d, expected 0", parentIno, block, node.Depth)
+		}
+
+		// Validate root block byte_val
+		if block == rootBlock && node.ByteVal != 0 {
+			fs.errorf("ino %d dir trie: root block %d: byte_val is %d, expected 0", parentIno, block, node.ByteVal)
+		}
+
+		// Validate child_count vs first_child
+		if node.ChildCount == 0 && node.FirstChild != 0 {
+			fs.errorf("ino %d dir trie: block %d: child_count=0 but first_child=%d", parentIno, block, node.FirstChild)
+		}
+		if node.ChildCount > 0 && node.FirstChild == 0 {
+			fs.errorf("ino %d dir trie: block %d: child_count=%d but first_child=0", parentIno, block, node.ChildCount)
+		}
+
+		// Validate block number ranges
+		if node.FirstChild > 0 && node.FirstChild >= fs.sb.TotalBlocks {
+			fs.errorf("ino %d dir trie: block %d: first_child %d exceeds total blocks %d",
+				parentIno, block, node.FirstChild, fs.sb.TotalBlocks)
+		}
+		if node.NextSibling > 0 && node.NextSibling >= fs.sb.TotalBlocks {
+			fs.errorf("ino %d dir trie: block %d: next_sibling %d exceeds total blocks %d",
+				parentIno, block, node.NextSibling, fs.sb.TotalBlocks)
+		}
+
+		// If we've already emitted this node's leaf (re-visit for children), skip leaf
+		if emitted {
+			goto pushChildren
+		}
+
+		// Extract leaf entry if this node has one
+		if trieIsLeaf(node.NodeType) {
+			name := extractTrieNodeName(buf, node)
+			if name == "" {
+				fs.errorf("ino %d dir trie: block %d: empty or invalid name (name_len=%d, name_offset=%d)",
+					parentIno, block, node.NameLen, node.NameOffset)
+			} else {
+				entries = append(entries, trieEntry{
+					Inode:  node.Inode,
+					FType:  node.FType,
+					Name:   name,
+					Parent: parentIno,
+				})
+			}
+
+			// If this node also has children, push it back with emitted=true
+			if node.FirstChild != 0 {
+				stack = append(stack, block)
+				leafEmitted = append(leafEmitted, true)
+			}
+		}
+
+	pushChildren:
+		// Push children (siblings in reverse order so they're processed in order)
+		if node.FirstChild != 0 {
+			// Collect all siblings first
+			var siblings []uint64
+			child := node.FirstChild
+			for child != 0 {
+				siblings = append(siblings, child)
+				cbuf := make([]byte, blockSize)
+				if _, err := fs.file.ReadAt(cbuf, int64(child*blockSize)); err != nil {
+					fs.errorf("ino %d dir trie: read sibling block %d: %v", parentIno, child, err)
+					break
+				}
+				cn := parseTrieNode(cbuf)
+				child = cn.NextSibling
+			}
+			// Push in reverse order so first sibling is processed first
+			for i := len(siblings) - 1; i >= 0; i-- {
+				stack = append(stack, siblings[i])
+				leafEmitted = append(leafEmitted, false)
+			}
+		}
+	}
+
+	return entries
+}
+
+// parseTrieNode reads a trie node from a block buffer.
+func parseTrieNode(buf []byte) trieNode {
+	return trieNode{
+		Magic:       binary.LittleEndian.Uint32(buf[0:]),
+		ChildCount:  binary.LittleEndian.Uint32(buf[4:]),
+		FirstChild:  binary.LittleEndian.Uint64(buf[8:]),
+		NextSibling: binary.LittleEndian.Uint64(buf[16:]),
+		Depth:       buf[24],
+		NodeType:    buf[25],
+		ByteVal:     buf[26],
+		FType:       buf[27],
+		// reserved[4] at buf[28:32]
+		Flags:      binary.LittleEndian.Uint64(buf[32:]),
+		Inode:      binary.LittleEndian.Uint64(buf[40:]),
+		NameLen:    binary.LittleEndian.Uint16(buf[48:]),
+		NameOffset: binary.LittleEndian.Uint16(buf[50:]),
+	}
+}
+
+// extractTrieNodeName reads the name from the trailing bytes of a trie node block.
+// Names are stored with a 2-byte length prefix, starting at block_size - name_offset.
+func extractTrieNodeName(buf []byte, node trieNode) string {
+	if node.NameLen < 2 || node.NameOffset == 0 {
+		return ""
+	}
+	if int(node.NameOffset) > len(buf) {
+		return ""
+	}
+	nameStart := len(buf) - int(node.NameOffset)
+	if nameStart < 0 || nameStart+2 > len(buf) {
+		return ""
+	}
+	// First 2 bytes at nameStart are the length prefix
+	storedLen := int(binary.LittleEndian.Uint16(buf[nameStart:]))
+	if storedLen < 1 || storedLen > types.BrieFSMaxNameLen {
+		return ""
+	}
+	if nameStart+2+storedLen > len(buf) {
+		return ""
+	}
+	return string(buf[nameStart+2 : nameStart+2+storedLen])
+}
+
+// verifyAllDirTries walks the trie of every directory inode found during the inode table scan.
+// It collects all entries and returns them for cross-referencing.
+func verifyAllDirTries(fs *fsckState, blockSize uint64, dirs []dirInfo) []trieEntry {
+	var allEntries []trieEntry
+
+	for _, d := range dirs {
+		entries := verifyDirectoryTrie(fs, d.ino, d.trieRoot, blockSize)
+		allEntries = append(allEntries, entries...)
+	}
+
+	return allEntries
+}
+
+// dirInfo stores info about a directory inode for later trie walking.
+type dirInfo struct {
+	ino      uint64
+	trieRoot uint64
+}
 	buf := make([]byte, blockSize)
 	if _, err := file.ReadAt(buf, int64(journalOffset*blockSize)); err != nil {
 		return fmt.Errorf("read journal block %d: %w", journalOffset, err)
@@ -179,8 +639,6 @@ func main() {
 		Before: func(c *cli.Context) error {
 			path := c.String("device")
 			if err := device.CheckMounted(path); err != nil {
-				// Running fsck on a mounted filesystem risks
-				// double-blind corruption. Refuse to continue.
 				return fmt.Errorf("refusing to check filesystem: %w\n", err)
 			}
 			return nil
@@ -217,6 +675,10 @@ func main() {
 			}
 			deviceSize := fi.Size()
 
+			fs := &fsckState{
+				file: file,
+			}
+
 			fmt.Fprintf(os.Stderr, "BrieFS filesystem check, version %s\n", versionStr)
 			fmt.Fprintf(os.Stderr, "Device: %s (%d bytes)\n", path, deviceSize)
 
@@ -225,6 +687,7 @@ func main() {
 			if err != nil {
 				return fmt.Errorf("superblock check FAILED: %w", err)
 			}
+			fs.sb = sb
 			blockSize := sb.BlockSize
 			fmt.Fprintf(os.Stderr, "\nSuperblock:\n")
 			fmt.Fprintf(os.Stderr, "  magic:       0x%016X\n", sb.Magic)
@@ -241,39 +704,88 @@ func main() {
 				return fmt.Errorf("device too small: %d bytes needed, got %d", sb.TotalBlocks*blockSize, deviceSize)
 			}
 
+			// Validate superblock field sanity
+			if sb.BlockSize < 512 || sb.BlockSize > 65536 || (sb.BlockSize&(sb.BlockSize-1)) != 0 {
+				fs.errorf("superblock: invalid block size %d (must be power of 2, 512-65536)", sb.BlockSize)
+			}
+			if sb.InodeSize < 128 || sb.InodeSize > 4096 || (sb.InodeSize&(sb.InodeSize-1)) != 0 {
+				fs.errorf("superblock: invalid inode size %d (must be power of 2, 128-4096)", sb.InodeSize)
+			}
+			if sb.TotalBlocks == 0 {
+				fs.errorf("superblock: zero total blocks")
+			}
+			if sb.DataBlocks > sb.TotalBlocks {
+				fs.errorf("superblock: data blocks (%d) > total blocks (%d)", sb.DataBlocks, sb.TotalBlocks)
+			}
+			if sb.FreeDataBlks > sb.DataBlocks {
+				fs.errorf("superblock: free data blocks (%d) > data blocks (%d)", sb.FreeDataBlks, sb.DataBlocks)
+			}
+			if sb.RootIno != 1 {
+				fs.errorf("superblock: root inode is %d, expected 1", sb.RootIno)
+			}
+			if sb.InodeTableOffset == 0 {
+				fs.errorf("superblock: inode table offset is 0")
+			}
+			if sb.JournalOffset == 0 || sb.JournalBlocks == 0 {
+				fs.errorf("superblock: invalid journal offset %d / blocks %d", sb.JournalOffset, sb.JournalBlocks)
+			}
+			if sb.JournalOffset+sb.JournalBlocks > sb.TotalBlocks {
+				fs.errorf("superblock: journal extends past end of device (offset %d + blocks %d > total %d)",
+					sb.JournalOffset, sb.JournalBlocks, sb.TotalBlocks)
+			}
+
 			// 2. Allocator pools
 			fmt.Fprintf(os.Stderr, "\nInode bitmap:\n")
 			if err := verifyAllocatorPool(file, sb.InodeBMOffset, blockSize, "inode bitmap"); err != nil {
-				fmt.Fprintf(os.Stderr, "  ERROR: %v\n", err)
+				fs.errorf("%v", err)
 			}
 
 			fmt.Fprintf(os.Stderr, "\nData block allocator:\n")
-			// Data allocator is at TrieNodePoolStart (formerly the trie node pool)
 			if err := verifyAllocatorPool(file, sb.TrieNodePoolStart, blockSize, "data allocator"); err != nil {
-				fmt.Fprintf(os.Stderr, "  ERROR: %v\n", err)
+				fs.errorf("%v", err)
+			}
+
+			// Cross-check allocator free counts against superblock and scan bitmap pyramid
+			inodeL0w, inodeL1w, inodeL2w, inodeBlockCount, inodeAllocFree, err := readAllocatorHeader(file, sb.InodeBMOffset, blockSize)
+			if err != nil {
+				fs.errorf("read inode allocator header: %v", err)
+			} else {
+				if inodeAllocFree != sb.FreeInodes {
+					fs.errorf("inode free count mismatch: superblock says %d, allocator says %d",
+						sb.FreeInodes, inodeAllocFree)
+				}
+				verifyAllocatorBitmap(fs, sb.InodeBMOffset, blockSize, inodeL0w, inodeL1w, inodeL2w, inodeBlockCount, inodeAllocFree, "inode")
+			}
+
+			dataL0w, dataL1w, dataL2w, dataBlockCount, dataAllocFree, err := readAllocatorHeader(file, sb.TrieNodePoolStart, blockSize)
+			if err != nil {
+				fs.errorf("read data allocator header: %v", err)
+			} else {
+				if dataAllocFree != sb.FreeDataBlks {
+					fs.errorf("data block free count mismatch: superblock says %d, allocator says %d",
+						sb.FreeDataBlks, dataAllocFree)
+				}
+				verifyAllocatorBitmap(fs, sb.TrieNodePoolStart, blockSize, dataL0w, dataL1w, dataL2w, dataBlockCount, dataAllocFree, "data")
 			}
 
 			// 3. Inode table
 			inodeTableStart := sb.InodeTableOffset
-				var inodeTableBlocks uint64
-	{
-		// Read inode allocator header to get actual inode count
-		inodeHeader := make([]byte, blockSize)
-		if _, err := file.ReadAt(inodeHeader, int64(sb.InodeBMOffset*blockSize)); err != nil {
-			return fmt.Errorf("read inode allocator header: %w", err)
-		}
-		numInodes := binary.LittleEndian.Uint64(inodeHeader[32:])
-		inodeTableBlocks = (numInodes * sb.InodeSize + blockSize - 1) / blockSize
-	}
+			var inodeTableBlocks uint64
+			{
+				// Read inode allocator header to get actual inode count
+				inodeHeader := make([]byte, blockSize)
+				if _, err := file.ReadAt(inodeHeader, int64(sb.InodeBMOffset*blockSize)); err != nil {
+					return fmt.Errorf("read inode allocator header: %w", err)
+				}
+				numInodes := binary.LittleEndian.Uint64(inodeHeader[32:])
+				inodeTableBlocks = (numInodes*sb.InodeSize + blockSize - 1) / blockSize
+			}
 			fmt.Fprintf(os.Stderr, "\nInode table:\n")
 			fmt.Fprintf(os.Stderr, "  start block: %d\n", inodeTableStart)
 			fmt.Fprintf(os.Stderr, "  blocks:      %d\n", inodeTableBlocks)
 
-			totalInodes, inodeErrors := verifyInodeTable(file, inodeTableStart, inodeTableBlocks, blockSize, sb.InodeSize)
+			totalInodes := verifyInodeTable(fs, inodeTableStart, inodeTableBlocks, blockSize, sb.InodeSize)
 			fmt.Fprintf(os.Stderr, "  inodes found: %d\n", totalInodes)
-			if inodeErrors > 0 {
-				fmt.Fprintf(os.Stderr, "  ERRORS:      %d\n", inodeErrors)
-			}
 
 			// 4. Journal
 			fmt.Fprintf(os.Stderr, "\nJournal:\n")
@@ -281,16 +793,15 @@ func main() {
 			fmt.Fprintf(os.Stderr, "  blocks:      %d\n", sb.JournalBlocks)
 			fmt.Fprintf(os.Stderr, "  checkpoint:  %d\n", sb.CheckpointSeq)
 			if err := verifyJournal(file, sb.JournalOffset, sb.JournalBlocks, blockSize); err != nil {
-				fmt.Fprintf(os.Stderr, "  WARNING: journal check: %v\n", err)
+				fs.warnf("journal check: %v", err)
 			} else {
 				fmt.Fprintf(os.Stderr, "  journal magic OK\n")
 			}
 
 			// 5. Summary
-			errors := 0
 			fmt.Fprintf(os.Stderr, "\n")
-			if errors > 0 {
-				fmt.Fprintf(os.Stderr, "FSCK COMPLETE: %d errors found\n", errors)
+			if fs.errors > 0 {
+				fmt.Fprintf(os.Stderr, "FSCK COMPLETE: %d error(s) found\n", fs.errors)
 				if c.Bool("repair") {
 					fmt.Fprintf(os.Stderr, "Repair not yet implemented\n")
 				}
