@@ -111,6 +111,30 @@ var _ = (fs.NodeOpener)((*brieFSNode)(nil))
 var _ = (fs.NodeReader)((*brieFSNode)(nil))
 var _ = (fs.NodeStatfser)((*brieFSNode)(nil))
 
+// readExtent reads the i-th extent from an inode, walking chain blocks
+// if the extent is beyond the 8 inline slots.
+func (n *brieFSNode) readExtent(diskInode *types.Inode, idx int) (types.Extent, error) {
+	if idx < 8 {
+		return diskInode.InlineExtents[idx], nil
+	}
+
+	chainIdx := idx - 8
+	chainBlock := diskInode.ExtentInlineBase
+	for chainBlock != 0 {
+		buf, err := n.bfs.dev.ReadBlock(chainBlock)
+		if err != nil {
+			return types.Extent{}, fmt.Errorf("read chain block %d: %w", chainBlock, err)
+		}
+		hdr := types.UnmarshalExtentChainHeader(buf)
+		if chainIdx < int(hdr.NumExtentsInBlock) {
+			return types.ReadChainExtent(buf, chainIdx), nil
+		}
+		chainIdx -= int(hdr.NumExtentsInBlock)
+		chainBlock = hdr.NextOverflowBlock
+	}
+	return types.Extent{}, fmt.Errorf("extent index %d out of range (total=%d)", idx, diskInode.NumExtentsTotal)
+}
+
 func (n *brieFSNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	diskInode, err := n.bfs.inodes.ReadInode(n.ino)
 	if err != nil {
@@ -131,9 +155,11 @@ func (n *brieFSNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.Att
 
 	totalBlocks := uint64(0)
 	for i := 0; i < int(diskInode.NumExtentsTotal); i++ {
-		if i < 8 {
-			totalBlocks += diskInode.InlineExtents[i].Len
+		ext, err := n.readExtent(diskInode, i)
+		if err != nil {
+			break
 		}
+		totalBlocks += ext.Len
 	}
 	out.Blocks = totalBlocks * (n.bfs.blockSize / 512)
 	out.Blksize = uint32(n.bfs.blockSize)
@@ -171,9 +197,11 @@ func (n *brieFSNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 
 	totalBlocks := uint64(0)
 	for i := 0; i < int(childInode.NumExtentsTotal); i++ {
-		if i < 8 {
-			totalBlocks += childInode.InlineExtents[i].Len
+		ext, err := n.readExtent(childInode, i)
+		if err != nil {
+			break
 		}
+		totalBlocks += ext.Len
 	}
 	out.Blocks = totalBlocks * (n.bfs.blockSize / 512)
 	out.Blksize = uint32(n.bfs.blockSize)
@@ -265,14 +293,11 @@ func (n *brieFSNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off
 	readBuf := make([]byte, toRead)
 	readPos := int64(0)
 
-	// Walk inline extents
+	// Walk all extents (inline + chain)
 	for i := 0; i < int(diskInode.NumExtentsTotal); i++ {
-		var ext types.Extent
-		if i < 8 {
-			ext = diskInode.InlineExtents[i]
-		} else {
-			// Chain extents: not yet supported in read-only MVP
-			break
+		ext, err := n.readExtent(diskInode, i)
+		if err != nil {
+			return nil, syscall.EIO
 		}
 
 		extStart := int64(ext.Offset) * blkSize
