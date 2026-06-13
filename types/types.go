@@ -2,6 +2,7 @@
 package types
 
 import (
+	"encoding/binary"
 	"fmt"
 	"unsafe"
 )
@@ -113,4 +114,51 @@ type Extent struct {
 	Len    uint64
 	Flags  uint32
 	Pad    uint32
+}
+
+// ExtentChainHeaderSize is the size of the header in an extent chain block
+// (next_overflow_block + num_extents_in_block + pad).
+const ExtentChainHeaderSize = 16
+
+// ExtentChainChecksumSize is the trailing checksum.
+const ExtentChainChecksumSize = 8
+
+// ExtentsPerChainBlock returns how many extents fit in one chain block.
+func ExtentsPerChainBlock(blockSize uint64) int {
+	return int((blockSize - ExtentChainHeaderSize - ExtentChainChecksumSize) / 32)
+}
+
+// ExtentChainHeader is the on-disk header of an extent chain block.
+// Matches struct briefs_extent_chain in the kernel module.
+type ExtentChainHeader struct {
+	NextOverflowBlock uint64 // block number of next chain block, 0 if last
+	NumExtentsInBlock uint32 // number of extents stored in this block
+	Pad               uint32
+	// Followed by extents, then a u64 checksum at block_size - 8
+}
+
+// UnmarshalExtentChainHeader reads the chain header from a block buffer.
+func UnmarshalExtentChainHeader(buf []byte) *ExtentChainHeader {
+	return &ExtentChainHeader{
+		NextOverflowBlock: binary.LittleEndian.Uint64(buf[0:]),
+		NumExtentsInBlock: binary.LittleEndian.Uint32(buf[8:]),
+		Pad:               binary.LittleEndian.Uint32(buf[12:]),
+	}
+}
+
+// ReadChainExtent reads the i-th extent from a chain block buffer.
+func ReadChainExtent(buf []byte, i int) Extent {
+	offset := ExtentChainHeaderSize + i*32
+	return Extent{
+		Offset: binary.LittleEndian.Uint64(buf[offset:]),
+		Phys:   binary.LittleEndian.Uint64(buf[offset+8:]),
+		Len:    binary.LittleEndian.Uint64(buf[offset+16:]),
+		Flags:  binary.LittleEndian.Uint32(buf[offset+24:]),
+		Pad:    binary.LittleEndian.Uint32(buf[offset+28:]),
+	}
+}
+
+// ReadChainChecksum reads the trailing checksum from a chain block buffer.
+func ReadChainChecksum(buf []byte, blockSize uint64) uint64 {
+	return binary.LittleEndian.Uint64(buf[blockSize-8:])
 }

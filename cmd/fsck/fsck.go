@@ -350,6 +350,15 @@ func verifyInode(buf []byte, ino, byteOffset, inodeSize uint64) (*types.Inode, e
 		// Not a dir, file, or symlink — could be a special device, which is fine
 	}
 
+	// Validate xattr fields (no BrieFS code writes xattrs yet, so these
+	// should always be zero on a healthy filesystem).
+	if in.XattrOffset != 0 || in.XattrSize != 0 {
+		// Record the xattr offset for later bitmap cross-referencing
+		// (the caller will track used blocks, but we just flag it here)
+		return in, fmt.Errorf("ino %d: unexpected xattr_offset=%d, xattr_size=%d (xattr not yet implemented)",
+			ino, in.XattrOffset, in.XattrSize)
+	}
+
 	return in, nil
 }
 
@@ -386,19 +395,14 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 			in, err := verifyInode(buf, ino, offset, inodeSize)
 			if err != nil {
 				fs.errorf("%v", err)
-			} else if in != nil {
-				// Store for cross-referencing
+			}
+			if in != nil {
+				// Even if verifyInode returned warnings (xattr, etc.),
+				// we still record the inode data for cross-referencing.
 				fs.inodes[ino] = in
 
 				// Collect extents for block cross-reference
-				for ei := uint32(0); ei < in.NumExtentsInline; ei++ {
-					ext := in.InlineExtents[ei]
-					if ext.Len > 0 && ext.Phys > 0 {
-						for bk := uint64(0); bk < ext.Len; bk++ {
-							fs.usedBlocks[ext.Phys+bk] = true
-						}
-					}
-				}
+				collectInodeExtents(fs, ino, in, blockSize)
 
 				// Collect trie root for directory trie walking
 				if in.IsDir() {
@@ -422,7 +426,69 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 	return
 }
 
-// trieNode is the on-disk format of a BrieFS directory trie node (32 bytes header).
+// collectInodeExtents collects all blocks referenced by an inode's extents,
+// including both inline extents and overflow chain blocks.
+func collectInodeExtents(fs *fsckState, ino uint64, in *types.Inode, blockSize uint64) {
+	// Helper to record the blocks from a single extent.
+	addExtentBlocks := func(ext types.Extent) {
+		if ext.Len > 0 && ext.Phys > 0 {
+			for bk := uint64(0); bk < ext.Len; bk++ {
+				fs.usedBlocks[ext.Phys+bk] = true
+			}
+		}
+	}
+
+	// Collect inline extents
+	for ei := uint32(0); ei < in.NumExtentsInline; ei++ {
+		ext := in.InlineExtents[ei]
+		addExtentBlocks(ext)
+	}
+
+	// Collect overflow extents from chain blocks
+	if in.NumExtentsTotal > uint64(in.NumExtentsInline) && in.ExtentInlineBase != 0 {
+		extentsPerBlock := types.ExtentsPerChainBlock(blockSize)
+		remaining := int(in.NumExtentsTotal) - int(in.NumExtentsInline)
+		chainBlock := in.ExtentInlineBase
+
+		for chainBlock != 0 && remaining > 0 {
+			buf := make([]byte, blockSize)
+			if _, err := fs.file.ReadAt(buf, int64(chainBlock*blockSize)); err != nil {
+				fs.errorf("ino %d: read extent chain block %d: %v", ino, chainBlock, err)
+				break
+			}
+
+			hdr := types.UnmarshalExtentChainHeader(buf)
+
+			// Validate extent count vs capacity
+			if hdr.NumExtentsInBlock > uint32(extentsPerBlock) {
+				fs.errorf("ino %d: extent chain block %d: %d extents exceeds block capacity %d",
+					ino, chainBlock, hdr.NumExtentsInBlock, extentsPerBlock)
+				break
+			}
+
+			// Record chain block itself as used (it's metadata)
+			fs.usedBlocks[chainBlock] = true
+
+			// Process extents in this chain block
+			n := int(hdr.NumExtentsInBlock)
+			if n > remaining {
+				n = remaining
+			}
+			for i := 0; i < n; i++ {
+				ext := types.ReadChainExtent(buf, i)
+				addExtentBlocks(ext)
+			}
+
+			remaining -= n
+			chainBlock = hdr.NextOverflowBlock
+		}
+
+		if remaining > 0 {
+			fs.errorf("ino %d: extent chain ended early: %d extents left unreachable (total=%d, inline=%d)",
+				ino, remaining, in.NumExtentsTotal, in.NumExtentsInline)
+		}
+	}
+}
 // Each node occupies one 4096-byte block. Names are stored in the trailing bytes.
 type trieNode struct {
 	Magic       uint32 // "TRN " - 0x54524E20
@@ -882,10 +948,31 @@ func verifyExtentOverlaps(fs *fsckState) {
 	var allExtents []extentRef
 
 	for ino, in := range fs.inodes {
+		// Walk inline extents
 		for ei := uint32(0); ei < in.NumExtentsInline; ei++ {
 			ext := in.InlineExtents[ei]
 			if ext.Len > 0 && ext.Phys > 0 {
 				allExtents = append(allExtents, extentRef{ino: ino, phys: ext.Phys, len: ext.Len})
+			}
+		}
+
+		// Walk overflow chain extents
+		if in.NumExtentsTotal > uint64(in.NumExtentsInline) && in.ExtentInlineBase != 0 {
+			extentsPerBlock := types.ExtentsPerChainBlock(fs.sb.BlockSize)
+			chainBlock := in.ExtentInlineBase
+			for chainBlock != 0 {
+				buf := make([]byte, fs.sb.BlockSize)
+				if _, err := fs.file.ReadAt(buf, int64(chainBlock*fs.sb.BlockSize)); err != nil {
+					break
+				}
+				hdr := types.UnmarshalExtentChainHeader(buf)
+				for i := uint32(0); i < hdr.NumExtentsInBlock && i < uint32(extentsPerBlock); i++ {
+					ext := types.ReadChainExtent(buf, int(i))
+					if ext.Len > 0 && ext.Phys > 0 {
+						allExtents = append(allExtents, extentRef{ino: ino, phys: ext.Phys, len: ext.Len})
+					}
+				}
+				chainBlock = hdr.NextOverflowBlock
 			}
 		}
 	}
