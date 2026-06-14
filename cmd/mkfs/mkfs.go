@@ -263,11 +263,24 @@ func main() {
 				(stat.Mode()&os.ModeDevice != 0 && stat.Mode()&os.ModeCharDevice == 0)) {
 				return fmt.Errorf("not an appropriate file or device type")
 			}
+
+			totalSize := sb.Lay.TotalBlocks * sb.Lay.BlockSize
 			if stat.Mode().IsRegular() {
-				totalSize := sb.Lay.TotalBlocks * sb.Lay.BlockSize
 				if err := file.Truncate(int64(totalSize)); err != nil {
 					return fmt.Errorf("truncate: %w", err)
 				}
+			}
+
+			// --- Clear metadata regions that mkfs doesn't otherwise write ---
+			// Stale data from a previous filesystem can survive in the rest
+			// of the inode table and in journal blocks before the checkpoint.
+			// Zero those regions explicitly so fsck doesn't see old inodes
+			// or stale journal records.
+			if err := zeroBlocks(file, inodeTableOffset, inodeTableBlocks, blockSize); err != nil {
+				return fmt.Errorf("zero inode table: %w", err)
+			}
+			if err := zeroBlocks(file, journalOffset, journalBlocks-1, blockSize); err != nil {
+				return fmt.Errorf("zero journal: %w", err)
 			}
 
 			// --- Write metadata blocks ---
@@ -421,4 +434,21 @@ func main() {
 
 func isPowerOfTwo(n uint64) bool {
 	return ((n == 0) || ((n & (n - 1)) == 0))
+}
+
+// zeroBlocks overwrites a range of blocks with zeros.  start is the first
+// block offset and count is the number of blocks.  The caller must ensure
+// start and count are within the device bounds.
+func zeroBlocks(file *os.File, start, count, blockSize uint64) error {
+	if count == 0 {
+		return nil
+	}
+	zeroBlock := make([]byte, blockSize)
+	for i := uint64(0); i < count; i++ {
+		off := int64((start + i) * blockSize)
+		if _, err := file.WriteAt(zeroBlock, off); err != nil {
+			return fmt.Errorf("write zero block at %d: %w", start+i, err)
+		}
+	}
+	return nil
 }
