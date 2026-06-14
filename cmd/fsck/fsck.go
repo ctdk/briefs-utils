@@ -856,6 +856,7 @@ func verifyJournalRecords(fs *fsckState, journalOffset, journalBlocks, logStart,
 			}
 
 			recordsChecked++
+			recData := buf[recOff+16 : recOff+16+uint64(dataLen)]
 			if storedChecksum == 0 {
 				if !legacyWarned {
 					fs.warnf("journal: legacy record with no checksum at block %d record %d; skipping CRC verification",
@@ -863,12 +864,54 @@ func verifyJournalRecords(fs *fsckState, journalOffset, journalBlocks, logStart,
 					legacyWarned = true
 				}
 			} else {
-				recData := buf[recOff+16 : recOff+16+uint64(dataLen)]
 				computed := types.ComputeJournalRecordChecksum(recType, recFlags, recData)
 				if computed != storedChecksum {
 					fs.errorf("journal block %d record %d: checksum mismatch (stored=0x%08X computed=0x%08X)",
 						cur, i, storedChecksum, computed)
 					badRecords++
+				}
+			}
+
+			// Parse and validate checkpoint payloads when the checksum is good.
+			if recType == uint32(types.JRN_CHECKPOINT) {
+				if dataLen != types.CheckpointSize {
+					fs.warnf("journal block %d record %d: checkpoint payload has unexpected length %d (want %d)",
+						cur, i, dataLen, types.CheckpointSize)
+				} else {
+					var cp types.Checkpoint
+					if err := cp.UnmarshalBinary(recData); err != nil {
+						fs.warnf("journal block %d record %d: checkpoint parse error: %v", cur, i, err)
+					} else {
+						fmt.Fprintf(os.Stderr, "  checkpoint:    seq=%d records=%d log_end=%d free_data=%d free_inodes=%d\n",
+							cp.Seq, cp.RecordCount, cp.LogSequenceEnd, cp.FreeDataCount, cp.FreeInodeCount)
+
+						if fs.sb != nil {
+							if cp.Seq != fs.sb.CheckpointSeq {
+								fs.warnf("checkpoint seq mismatch: payload=%d, superblock=%d",
+									cp.Seq, fs.sb.CheckpointSeq)
+							}
+							if cp.LogSequenceEnd != fs.sb.JournalLogEnd {
+								fs.warnf("checkpoint log_sequence_end mismatch: payload=%d, superblock=%d",
+									cp.LogSequenceEnd, fs.sb.JournalLogEnd)
+							}
+							if cp.FreeDataCount > fs.sb.TotalBlocks {
+								fs.warnf("checkpoint free_data_count out of range: %d > total_blocks %d",
+									cp.FreeDataCount, fs.sb.TotalBlocks)
+							}
+							if cp.FreeInodeCount > fs.sb.TotalBlocks {
+								fs.warnf("checkpoint free_inode_count out of range: %d > total_blocks %d",
+									cp.FreeInodeCount, fs.sb.TotalBlocks)
+							}
+							if cp.FreeDataCount != fs.sb.FreeDataBlks {
+								fs.warnf("checkpoint free_data_count differs from superblock: %d vs %d",
+									cp.FreeDataCount, fs.sb.FreeDataBlks)
+							}
+							if cp.FreeInodeCount != fs.sb.FreeInodes {
+								fs.warnf("checkpoint free_inode_count differs from superblock: %d vs %d",
+									cp.FreeInodeCount, fs.sb.FreeInodes)
+							}
+						}
+					}
 				}
 			}
 

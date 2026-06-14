@@ -32,6 +32,18 @@ const (
 	DefaultInodeSize   = 512
 	DefaultJournalSize = 64 // blocks
 
+	// Journal record types — mirrors briefs.h enum journal_record_type.
+	// These are used by fsck and mkfs to avoid magic numbers.
+	JRN_NONE = iota
+	JRN_EXTENT_ALLOC
+	JRN_EXTENT_FREE
+	JRN_INODE_UPDATE
+	JRN_INODE_ALLOC
+	JRN_INODE_FREE
+	JRN_TRIE_ALLOC
+	JRN_DIR_UPDATE
+	JRN_CHECKPOINT
+
 	// Trie node types — mirrors briefs.h NODE_TYPE_* / NODE_STATUS_*
 	NodeTypeFile     = 0x01
 	NodeTypeDir      = 0x02
