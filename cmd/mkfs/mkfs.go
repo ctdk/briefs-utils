@@ -108,17 +108,16 @@ func main() {
 			// --- Block Layout (matches kernel expectations) ---
 			//
 			// Block 0:       Superblock          (1 block)
-			// Next:           Inode bitmap        (1 bit per inode)
-			// Next:           Data bitmap         (1 bit per data block)
+			// Next:           Inode bitmap        (3-level pyramid, 1 bit per inode)
 			// Next:           Inode table         (8 inodes per block)
 			// Next:           EAT                 (reserved, 1 block)
-			// Next:           Trie pool           (header + node blocks)
+			// Next:           Trie pool           (data allocator header + level blocks)
 			// Next:           Data region         (free blocks)
 			// Last:           Journal             (at the end of the volume)
 			//
-			// Kernel computes inode table start as:
-			//   data_bitmap_offset + data_bitmap_blocks
-			// which matches this layout.
+			// The kernel reads inode_table_offset directly from the superblock.
+			// The legacy flat data bitmap is no longer used; the 3-level allocator
+			// pyramid in the trie pool tracks all data blocks.
 
 			estInodes := uint64(totalBlocks) / 16
 			if estInodes < 100 {
@@ -134,29 +133,13 @@ func main() {
 			inodeBitmapBlocks := inodeAllocBuilder.NbBlocks()
 			inodeAllocBlocks := inodeBitmapBlocks
 
-			// Allocator pool size is deterministic — no iteration needed.
-			// Start with a rough estimate of data blocks to size the data bitmap,
-			// then compute the exact allocator size.
-			estAllocBlocks := uint64(1) + uint64(totalBlocks/100000)
-			if estAllocBlocks < 2 {
-				estAllocBlocks = 2
-			}
-
-			estData1 := uint64(totalBlocks) - inodeBitmapBlocks - inodeTableBlocks - 1 - estAllocBlocks - journalBlocks
-			if estData1 < 1 {
-				return fmt.Errorf("filesystem too small")
-			}
-			dataBitmapBytes := (estData1 + 7) / 8
-			dataBitmapBlocks := roundUp(dataBitmapBytes, blockSize) / blockSize
-			if dataBitmapBlocks < 1 {
-				dataBitmapBlocks = 1
-			}
-
-			// Compute final data blocks and exact allocator size (one pass)
-			finalDataBlocks := uint64(totalBlocks) - 1 - inodeAllocBlocks - dataBitmapBlocks - inodeTableBlocks - 1 - journalBlocks
+			// Compute final data blocks and exact allocator size (one pass).
+			// No flat data bitmap is written; the allocator pyramid lives in
+			// the trie pool region.
+			finalDataBlocks := uint64(totalBlocks) - 1 - inodeAllocBlocks - inodeTableBlocks - 1 - journalBlocks
 			builder := types.NewAllocBuilder(finalDataBlocks)
 			allocBlocks := builder.NbBlocks()
-			finalDataBlocks = uint64(totalBlocks) - 1 - inodeAllocBlocks - dataBitmapBlocks - inodeTableBlocks - 1 - allocBlocks - journalBlocks
+			finalDataBlocks = uint64(totalBlocks) - 1 - inodeAllocBlocks - inodeTableBlocks - 1 - allocBlocks - journalBlocks
 			if finalDataBlocks < 1 {
 				return fmt.Errorf("filesystem too small")
 			}
@@ -177,18 +160,9 @@ func main() {
 			inodeBMBlocks := inodeBitmapBlocks
 			nextBlock += inodeBMBlocks
 
-			// Data bitmap (kernel reads inode table start as this + blocks)
-			dataBMOffset := nextBlock
-			dataBMBlocks := dataBitmapBlocks
-			nextBlock += dataBMBlocks
-
 			// Inode table (at inode_table_offset)
 			inodeTableOffset := nextBlock
 			nextBlock += inodeTableBlocks
-			// Sanity: kernel-derived inode table start must match
-			if inodeTableOffset != dataBMOffset+dataBMBlocks {
-				panic("inode table offset mismatch")
-			}
 
 			// EAT (placeholder)
 			eatOffset := nextBlock
@@ -225,7 +199,7 @@ func main() {
 			sb.Lay.InodeBMOffset = inodeBMOffset
 			sb.Lay.InodeBMBlocks = inodeBMBlocks
 			sb.Lay.InodeTableOffset = inodeTableOffset
-	
+
 			sb.Lay.EATOffset = eatOffset
 			sb.Lay.EATBlocks = eatBlocks
 
@@ -293,13 +267,7 @@ func main() {
 				}
 			}
 
-			// 3. Data bitmap (all zeros — all data blocks free)
-			dataBitmap := make([]byte, int(dataBMBlocks)*int(blockSize))
-			if _, err := file.WriteAt(dataBitmap, int64(dataBMOffset*blockSize)); err != nil {
-				return fmt.Errorf("write data bitmap: %w", err)
-			}
-
-			// 4. Root directory trie root
+			// 3. Root directory trie root
 			// Allocate a block for a packed trie page; slot 0 is the root node.
 			rootTrieBlock := dataRegionStart
 			trieBlock := make([]byte, blockSize)
@@ -324,12 +292,7 @@ func main() {
 				return fmt.Errorf("write root trie page at %d: %w", rootTrieBlock, err)
 			}
 
-			// Mark the root trie block as allocated in the data bitmap
-			dataBitmapByte := rootTrieBlock / 8
-			dataBitmapBit := rootTrieBlock % 8
-			dataBitmap[dataBitmapByte] |= uint8(1 << dataBitmapBit)
-
-			// 5. Root inode (inode 1) at first slot of inode table
+			// 4. Root inode (inode 1) at first slot of inode table
 			rootInode := types.NewInode(1, types.ModeDir|0755)
 			rootInode.Nlinks = 2
 			rootInode.DirTrieRoot = types.TrieMakeRef(rootTrieBlock, 0)
@@ -338,11 +301,6 @@ func main() {
 			fileOffset := int64(inodeBlock*blockSize + inodeByteOffset)
 			if err := rootInode.WriteAt(file, fileOffset); err != nil {
 				return fmt.Errorf("write root inode: %w", err)
-			}
-
-			// Write updated data bitmap (root dir block allocated)
-			if _, err := file.WriteAt(dataBitmap, int64(dataBMOffset*blockSize)); err != nil {
-				return fmt.Errorf("write updated data bitmap: %w", err)
 			}
 
 			// Update superblock's free counts (1 data block used, 1 inode used)
@@ -408,7 +366,6 @@ func main() {
 			fmt.Fprintf(os.Stderr, "  data blocks:  %d (blocks %d..%d, %d free)\n",
 				finalDataBlocks, dataRegionStart, journalOffset-1, finalDataBlocks-1)
 			fmt.Fprintf(os.Stderr, "  inode bitmap: %d blocks at offset %d (3-level bitmap pyramid)\n", inodeBMBlocks, inodeBMOffset)
-			fmt.Fprintf(os.Stderr, "  data bitmap:  %d blocks at offset %d\n", dataBMBlocks, dataBMOffset)
 			fmt.Fprintf(os.Stderr, "  inode table:  %d blocks at offset %d\n", inodeTableBlocks, inodeTableOffset)
 			fmt.Fprintf(os.Stderr, "  EAT:          %d block(s) at offset %d\n", eatBlocks, eatOffset)
 			fmt.Fprintf(os.Stderr, "  alloc pool:   %d blocks at offset %d (3-level bitmap)\n",
