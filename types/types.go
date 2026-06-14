@@ -22,9 +22,10 @@ const (
 
 	// File mode constants. Not using the normal Go ones from io/fs because
 	// they aren't what we need for something this low level.
-	ModeDir   = 0040000
-	ModeFile  = 0100000
-	ModeSymlink = 0120000
+	ModeTypeMask = 0170000
+	ModeDir      = 0040000
+	ModeFile     = 0100000
+	ModeSymlink  = 0120000
 
 	// Default values.
 	DefaultBlockSize   = 4096

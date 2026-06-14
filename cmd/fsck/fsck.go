@@ -1023,13 +1023,17 @@ func verifyDirEntryCrossReference(fs *fsckState, entries []trieEntry) {
 			continue
 		}
 
-		// Check file type matches
-		// ftype is stored as (S_IFMT >> 12): 4 for directories, 8 for regular files.
+		// Check file type matches.
+		// ftype is stored as (S_IFMT >> 12): 4 for directories, 8 for regular
+		// files, 10 for symbolic links.
 		var expectedFType uint8
-		if in.IsDir() {
+		switch in.Filemode & types.ModeTypeMask {
+		case types.ModeDir:
 			expectedFType = 4 // S_IFDIR >> 12
-		} else if in.IsFile() {
+		case types.ModeFile:
 			expectedFType = 8 // S_IFREG >> 12
+		case types.ModeSymlink:
+			expectedFType = 10 // S_IFLNK >> 12
 		}
 		if expectedFType != 0 && e.FType != expectedFType {
 			if badTypes < 20 {

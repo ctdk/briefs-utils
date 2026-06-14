@@ -71,12 +71,17 @@ func NewInode(ino uint64, mode uint32) *Inode {
 
 // IsDir returns true if the inode is a directory.
 func (in *Inode) IsDir() bool {
-	return in.Filemode&ModeDir != 0
+	return in.Filemode&ModeTypeMask == ModeDir
 }
 
 // IsFile returns true if the inode is a regular file.
 func (in *Inode) IsFile() bool {
-	return in.Filemode&ModeFile != 0
+	return in.Filemode&ModeTypeMask == ModeFile
+}
+
+// IsSymlink returns true if the inode is a symbolic link.
+func (in *Inode) IsSymlink() bool {
+	return in.Filemode&ModeTypeMask == ModeSymlink
 }
 
 // WriteAt writes the inode to a file at the given byte offset.
