@@ -8,7 +8,7 @@ The filesystem utils for BrieFS (`mkfs.briefs`, `fsck.briefs`, `fuse.briefs`).
 mkfs.briefs
 -----------
 
-Creates new BrieFS volumes. It's not quite all the way there yet and the argument syntax is still a little weird, but it does what it's supposed to.
+Creates new BrieFS volumes. It formats new filesystems with the packed directory trie layout used by BrieFS 0.7.0+.
 
 ```
 NAME:
@@ -18,7 +18,7 @@ USAGE:
    mkfs.briefs [global options] command [command options]
 
 VERSION:
-   v0.5.0
+   v0.7.0
 
 COMMANDS:
    help, h  Shows a list of commands or help for one command
@@ -37,7 +37,7 @@ GLOBAL OPTIONS:
 fsck.briefs
 -----------
 
-The idea with `fsck.briefs` is that it will repair broken, mangled, and mutilated BrieFS volumes. It doesn't actually do that yet, but that's the dream. It does, however, perform a growing list of consistency checks, including CRC32C verification of journal records and extent chain blocks.
+The idea with `fsck.briefs` is that it will repair broken, mangled, and mutilated BrieFS volumes. It doesn't actually do that yet, but that's the dream. It does, however, perform a growing list of consistency checks, including CRC32C verification of journal records and extent chain blocks, and validates the packed directory trie pages used by BrieFS 0.7.0+.
 
 ```
 NAME:
@@ -47,7 +47,7 @@ USAGE:
    fsck.briefs [global options] command [command options]
 
 VERSION:
-   v0.5.0
+   v0.7.0
 
 COMMANDS:
    help, h  Shows a list of commands or help for one command
@@ -63,7 +63,7 @@ GLOBAL OPTIONS:
 fuse.briefs
 -----------
 
-A FUSE bridge for BrieFS so you can mount BrieFS volumes without the commitment of loading and/or battling with a kernel module. Currently read-only and basic.
+A FUSE bridge for BrieFS so you can mount BrieFS volumes without the commitment of loading and/or battling with a kernel module. Currently read-only and basic. Supports the packed directory trie format introduced in BrieFS 0.7.0.
 
 ```
 NAME:
@@ -73,7 +73,7 @@ USAGE:
    briefs-fuse [global options] command [command options]
 
 VERSION:
-   v0.5.0
+   v0.7.0
 
 COMMANDS:
    help, h  Shows a list of commands or help for one command

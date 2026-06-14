@@ -8,75 +8,102 @@ import (
 	"github.com/ctdk/briefs-utils/types"
 )
 
-func TestParseTrieNode(t *testing.T) {
+func makeTriePageRoot(buf []byte) {
+	binary.LittleEndian.PutUint32(buf[0:], types.MagicTriePage)
+	binary.LittleEndian.PutUint32(buf[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint16(buf[8:], 1)          // live_count
+	binary.LittleEndian.PutUint16(buf[10:], 0)         // free_name_off
+	binary.LittleEndian.PutUint64(buf[12:], ^uint64(1)) // free_slots: slot 0 allocated
+
+	// Slot 0 at offset 16: empty root INTERM node, all fields zero.
+	slotOff := uint64(16)
+	buf[slotOff+trieSlotDepth] = 0
+	buf[slotOff+trieSlotNodeType] = trieNodeTypeInterm
+}
+
+func writeTrieLeaf(buf []byte, slot uint, ino uint64, name string) {
+	slotOff := slotOffset(slot)
+	nameLen := len(name)
+	nameSize := nameLen + 2
+
+	// Place name at the top of the name heap, growing upward from block end.
+	nameStart := uint64(len(buf)) - uint64(nameSize)
+	binary.LittleEndian.PutUint16(buf[nameStart:], uint16(nameLen))
+	copy(buf[nameStart+2:], name)
+
+	binary.LittleEndian.PutUint64(buf[slotOff+trieSlotInode:], ino)
+	binary.LittleEndian.PutUint16(buf[slotOff+trieSlotNameLen:], uint16(nameSize))
+	binary.LittleEndian.PutUint16(buf[slotOff+trieSlotNameOffset:], uint16(nameSize))
+	buf[slotOff+trieSlotDepth] = uint8(len(name) - 1)
+	buf[slotOff+trieSlotNodeType] = 0 // pure leaf
+	buf[slotOff+trieSlotFType] = 8    // regular file
+}
+
+func TestReadTriePage(t *testing.T) {
 	buf := make([]byte, 4096)
+	makeTriePageRoot(buf)
 
-	// Construct a minimal trie node (pure leaf, file type)
-	binary.LittleEndian.PutUint32(buf[0:], types.MagicTrieNode) // magic
-	binary.LittleEndian.PutUint32(buf[4:], 0)                    // child_count
-	binary.LittleEndian.PutUint64(buf[8:], 0)                    // first_child
-	binary.LittleEndian.PutUint64(buf[16:], 0)                   // next_sibling
-	buf[24] = 0  // depth
-	buf[25] = 0  // node_type (0 = pure leaf)
-	buf[26] = 0  // byte_val
-	buf[27] = 8  // f_type (S_IFREG >> 12)
-	binary.LittleEndian.PutUint64(buf[32:], 0) // flags
-	binary.LittleEndian.PutUint64(buf[40:], 5)  // inode = 5
-	binary.LittleEndian.PutUint16(buf[48:], 10) // name_len = 10 (8 + 2-byte prefix)
-	binary.LittleEndian.PutUint16(buf[50:], 20) // name_offset = 20 from block end
-
-	// Write name at block_size - 20: [len:2][name:8]
-	nameStart := 4096 - 20
-	binary.LittleEndian.PutUint16(buf[nameStart:], 8) // name length (without prefix)
-	copy(buf[nameStart+2:], "test.txt")
-
-	// Use ParseTrieNode directly (TrieReadNode needs a real BlockDevice)
-	parsed, err := ParseTrieNode(buf)
+	page, err := ReadTriePage(buf)
 	if err != nil {
-		t.Fatalf("ParseTrieNode: %v", err)
+		t.Fatalf("ReadTriePage: %v", err)
 	}
-
-	if parsed.Magic != types.MagicTrieNode {
-		t.Errorf("Magic: want 0x%X, got 0x%X", types.MagicTrieNode, parsed.Magic)
+	if page.Magic != types.MagicTriePage {
+		t.Errorf("Magic: want 0x%X, got 0x%X", types.MagicTriePage, page.Magic)
 	}
-	if parsed.NodeType != 0 {
-		t.Errorf("NodeType: want 0, got %d", parsed.NodeType)
+	if page.Version != types.TriePageVersion {
+		t.Errorf("Version: want %d, got %d", types.TriePageVersion, page.Version)
 	}
-	if parsed.FType != 8 {
-		t.Errorf("FType: want 8, got %d", parsed.FType)
-	}
-	if parsed.Inode != 5 {
-		t.Errorf("Inode: want 5, got %d", parsed.Inode)
-	}
-	if parsed.NameLen != 10 {
-		t.Errorf("NameLen: want 10, got %d", parsed.NameLen)
-	}
-	if parsed.NameOffset != 20 {
-		t.Errorf("NameOffset: want 20, got %d", parsed.NameOffset)
-	}
-
-	// Read leaf name
-	name, err := TrieReadLeafNameStr(buf, 4096)
-	if err != nil {
-		t.Fatalf("TrieReadLeafNameStr: %v", err)
-	}
-	if name != "test.txt" {
-		t.Errorf("name: want 'test.txt', got '%s'", name)
+	if page.LiveCount != 1 {
+		t.Errorf("LiveCount: want 1, got %d", page.LiveCount)
 	}
 }
 
-func TestParseTrieNodeBadMagic(t *testing.T) {
+func TestReadTriePageBadMagic(t *testing.T) {
 	buf := make([]byte, 4096)
-	_, err := ParseTrieNode(buf)
+	_, err := ReadTriePage(buf)
 	if err == nil {
 		t.Fatal("expected error for bad magic")
 	}
 }
 
-func TestParseTrieNodeTooShort(t *testing.T) {
-	_, err := ParseTrieNode([]byte{0, 0, 0, 0})
+func TestReadTriePageTooShort(t *testing.T) {
+	_, err := ReadTriePage([]byte{0, 0, 0, 0})
 	if err == nil {
 		t.Fatal("expected error for short buffer")
+	}
+}
+
+func TestReadTrieSlot(t *testing.T) {
+	buf := make([]byte, 4096)
+	makeTriePageRoot(buf)
+	writeTrieLeaf(buf, 1, 5, "test.txt")
+
+	node, err := ReadTrieSlot(buf, 1)
+	if err != nil {
+		t.Fatalf("ReadTrieSlot: %v", err)
+	}
+	if node.Inode != 5 {
+		t.Errorf("Inode: want 5, got %d", node.Inode)
+	}
+	if node.NameLen != 10 {
+		t.Errorf("NameLen: want 10, got %d", node.NameLen)
+	}
+	if node.NameOffset != 10 {
+		t.Errorf("NameOffset: want 10, got %d", node.NameOffset)
+	}
+	if node.NodeType != 0 {
+		t.Errorf("NodeType: want 0, got %d", node.NodeType)
+	}
+	if node.FType != 8 {
+		t.Errorf("FType: want 8, got %d", node.FType)
+	}
+
+	name, err := readTrieLeafNameStr(buf, 4096, node)
+	if err != nil {
+		t.Fatalf("readTrieLeafNameStr: %v", err)
+	}
+	if name != "test.txt" {
+		t.Errorf("name: want 'test.txt', got '%s'", name)
 	}
 }
 
@@ -95,19 +122,16 @@ func TestTrieIsLeaf(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := make([]byte, 4096)
-			buf[25] = tc.nodeType
-			got := TrieIsLeaf(buf)
+			node := &TrieNodeData{NodeType: tc.nodeType}
+			got := trieIsLeaf(node)
 			if got != tc.want {
-				t.Errorf("TrieIsLeaf(0x%02X): want %v, got %v", tc.nodeType, tc.want, got)
+				t.Errorf("trieIsLeaf(0x%02X): want %v, got %v", tc.nodeType, tc.want, got)
 			}
 		})
 	}
 }
 
 func TestTrieFindChild(t *testing.T) {
-	// This test needs a real BlockDevice with a trie structure.
-	// Just verify the function exists by checking it's exported.
 	_ = TrieFindChild
 }
 

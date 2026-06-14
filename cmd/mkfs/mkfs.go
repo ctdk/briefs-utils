@@ -297,19 +297,28 @@ func main() {
 			}
 
 			// 4. Root directory trie root
-			// Allocate a block for the directory trie root node
+			// Allocate a block for a packed trie page; slot 0 is the root node.
 			rootTrieBlock := dataRegionStart
-			// Initialize as a "TRN " intermediate node (empty root)
 			trieBlock := make([]byte, blockSize)
-			binary.LittleEndian.PutUint32(trieBlock[0:], types.MagicTrieNode) // "TRN " magic
-			// child_count (offset 4): 0
-			// first_child (offset 8): 0
-			// next_sibling (offset 16): 0
-			trieBlock[24] = 0  // depth = 0
-			trieBlock[25] = byte(types.NodeTypeInterm)  // node_type = NODE_TYPE_INTERM
+			// Page header (16 bytes)
+			binary.LittleEndian.PutUint32(trieBlock[0:], types.MagicTriePage) // "TRNP" magic
+			binary.LittleEndian.PutUint32(trieBlock[4:], types.TriePageVersion)
+			binary.LittleEndian.PutUint16(trieBlock[8:], 1)   // live_count = 1
+			binary.LittleEndian.PutUint16(trieBlock[10:], 0)  // free_name_off = 0
+			// free_slots: slot 0 allocated, rest free -> bitmap = ~1
+			binary.LittleEndian.PutUint64(trieBlock[12:], ^uint64(1))
+			// Slot 0 at offset 20.  Fields are little-endian:
+			//   first_child (8), next_sibling (8), inode (8),
+			//   name_len (2), name_offset (2), depth (1), node_type (1),
+			//   byte_val (1), f_type (1), flags (2), child_count (2)
+			slotOff := uint64(20)
+			trieBlock[slotOff+28] = 0                       // depth = 0
+			trieBlock[slotOff+29] = byte(types.NodeTypeInterm) // node_type
+			// first_child, next_sibling, inode, name_len, name_offset,
+			// byte_val, f_type, flags, child_count all default to 0.
 
 			if _, err := file.WriteAt(trieBlock, int64(rootTrieBlock*blockSize)); err != nil {
-				return fmt.Errorf("write root trie block at %d: %w", rootTrieBlock, err)
+				return fmt.Errorf("write root trie page at %d: %w", rootTrieBlock, err)
 			}
 
 			// Mark the root trie block as allocated in the data bitmap
@@ -320,7 +329,7 @@ func main() {
 			// 5. Root inode (inode 1) at first slot of inode table
 			rootInode := types.NewInode(1, types.ModeDir|0755)
 			rootInode.Nlinks = 2
-			rootInode.DirTrieRoot = rootTrieBlock
+			rootInode.DirTrieRoot = types.TrieMakeRef(rootTrieBlock, 0)
 
 			inodeBlock, inodeByteOffset := calculateInodeLocation(sb, 1)
 			fileOffset := int64(inodeBlock*blockSize + inodeByteOffset)
