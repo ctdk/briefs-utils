@@ -82,9 +82,9 @@ func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, labe
 	sb := &Superblock{}
 
 	sb.Lay.Magic = MagicSuperblock
-	sb.Lay.MajorVer = 0
-	sb.Lay.MinorVer = 1
-	sb.Lay.PatchVer = 0
+	sb.Lay.MajorVer = BrieFSMajorVersion
+	sb.Lay.MinorVer = BrieFSMinorVersion
+	sb.Lay.PatchVer = BrieFSPatchVersion
 	sb.Lay.TotalBlocks = totalBlocks
 	sb.Lay.BlockSize = blockSize
 	sb.Lay.InodeSize = inodeSize
