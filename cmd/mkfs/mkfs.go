@@ -355,10 +355,13 @@ func main() {
 				}
 			}
 
-			// 8. Journal — write a checkpoint in the first journal block
+			// 8. Journal — write the initial checkpoint in the last journal
+			// block. This matches the kernel's checkpoint_block location
+			// (journal_offset + journal_blocks - 1).
+			checkpointBlock := journalOffset + journalBlocks - 1
 			journalBuf := make([]byte, blockSize)
-			// Journal block header (16 bytes)
-			binary.LittleEndian.PutUint32(journalBuf[0:], 0x4A4E4C5A) // "JNLZ" magic
+			// Checkpoint block header (16 bytes)
+			binary.LittleEndian.PutUint32(journalBuf[0:], 0x43485053) // "CHPS" magic
 			binary.LittleEndian.PutUint32(journalBuf[4:], 0)          // block_seq
 			binary.LittleEndian.PutUint32(journalBuf[8:], 1)          // record_count
 			// Checkpoint record header at offset 16
@@ -366,7 +369,6 @@ func main() {
 			binary.LittleEndian.PutUint32(journalBuf[recOff:], 9)     // type = JRN_CHECKPOINT
 			binary.LittleEndian.PutUint32(journalBuf[recOff+4:], 0)   // flags
 			binary.LittleEndian.PutUint32(journalBuf[recOff+8:], 80)  // data_len
-			binary.LittleEndian.PutUint32(journalBuf[recOff+12:], 0)  // checksum
 			// Checkpoint record data at offset 32 (80 bytes)
 			cpOff := recOff + 16
 			binary.LittleEndian.PutUint64(journalBuf[cpOff:], 1)    // checkpoint_seq = 1
@@ -375,8 +377,13 @@ func main() {
 			binary.LittleEndian.PutUint64(journalBuf[cpOff+24:], 0) // trie_root_node
 			binary.LittleEndian.PutUint64(journalBuf[cpOff+32:], finalDataBlocks-1) // free_data_count
 			binary.LittleEndian.PutUint64(journalBuf[cpOff+40:], estInodes-1)     // free_inode_count
-			if _, err := file.WriteAt(journalBuf, int64(journalOffset*blockSize)); err != nil {
-				return fmt.Errorf("write journal checkpoint: %w", err)
+			// Compute and write the CRC32C checksum over type, flags,
+			// data_len, and the 80-byte checkpoint data.
+			cpData := journalBuf[cpOff : cpOff+80]
+			checksum := types.ComputeJournalRecordChecksum(9, 0, cpData)
+			binary.LittleEndian.PutUint32(journalBuf[recOff+12:], checksum)
+			if _, err := file.WriteAt(journalBuf, int64(checkpointBlock*blockSize)); err != nil {
+				return fmt.Errorf("write journal checkpoint at block %d: %w", checkpointBlock, err)
 			}
 
 			// --- Report ---

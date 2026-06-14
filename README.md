@@ -37,7 +37,7 @@ GLOBAL OPTIONS:
 fsck.briefs
 -----------
 
-The idea with `fsck.briefs` is that it will repair broken, mangled, and mutilated BrieFS volumes. It doesn't actually do that yet, but that's the dream.
+The idea with `fsck.briefs` is that it will repair broken, mangled, and mutilated BrieFS volumes. It doesn't actually do that yet, but that's the dream. It does, however, perform a growing list of consistency checks, including CRC32C verification of journal records and extent chain blocks.
 
 ```
 NAME:

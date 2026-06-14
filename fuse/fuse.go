@@ -125,6 +125,9 @@ func (n *brieFSNode) readExtent(diskInode *types.Inode, idx int) (types.Extent, 
 		if err != nil {
 			return types.Extent{}, fmt.Errorf("read chain block %d: %w", chainBlock, err)
 		}
+		if err := types.VerifyChainChecksum(buf, n.bfs.blockSize); err != nil {
+			return types.Extent{}, fmt.Errorf("chain block %d: checksum mismatch", chainBlock)
+		}
 		hdr := types.UnmarshalExtentChainHeader(buf)
 		if chainIdx < int(hdr.NumExtentsInBlock) {
 			return types.ReadChainExtent(buf, chainIdx), nil

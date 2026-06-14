@@ -3,19 +3,12 @@ package types
 
 import (
 	"encoding/binary"
-	"fmt"
-	"unsafe"
+	"errors"
 )
 
-func init() {
-	var s SuperblockLayout
-	fmt.Printf("DEBUG: SuperblockLayout size = %d\n", unsafe.Sizeof(s))
-	fmt.Printf("DEBUG: UUID offset = %d\n", unsafe.Offsetof(s.UUID))
-	fmt.Printf("DEBUG: EATOffset offset = %d\n", unsafe.Offsetof(s.EATOffset))
-	fmt.Printf("DEBUG: EATBlocks offset = %d\n", unsafe.Offsetof(s.EATBlocks))
-	fmt.Printf("DEBUG: InodeBMOffset offset = %d\n", unsafe.Offsetof(s.InodeBMOffset))
-	fmt.Printf("DEBUG: InodeTableOffset offset = %d\n", unsafe.Offsetof(s.InodeTableOffset))
-}
+// ErrChecksumMismatch is returned when a stored CRC32C checksum does not
+// match the computed value.
+var ErrChecksumMismatch = errors.New("CRC32C checksum mismatch")
 
 // Magic numbers for our filesystem structures.
 const (
@@ -124,8 +117,12 @@ type Extent struct {
 // (next_overflow_block + num_extents_in_block + pad).
 const ExtentChainHeaderSize = 16
 
-// ExtentChainChecksumSize is the trailing checksum.
+// ExtentChainChecksumSize is the checksum field size.
 const ExtentChainChecksumSize = 8
+
+// ExtentChainChecksumOffset is the byte offset of the checksum field within a
+// chain block. It follows the 16-byte header and 127 inline extents.
+const ExtentChainChecksumOffset = ExtentChainHeaderSize + 127*32 // 4080 for 4KiB blocks
 
 // ExtentsPerChainBlock returns how many extents fit in one chain block.
 func ExtentsPerChainBlock(blockSize uint64) int {
@@ -162,7 +159,7 @@ func ReadChainExtent(buf []byte, i int) Extent {
 	}
 }
 
-// ReadChainChecksum reads the trailing checksum from a chain block buffer.
+// ReadChainChecksum reads the checksum field from a chain block buffer.
 func ReadChainChecksum(buf []byte, blockSize uint64) uint64 {
-	return binary.LittleEndian.Uint64(buf[blockSize-8:])
+	return binary.LittleEndian.Uint64(buf[ExtentChainChecksumOffset:])
 }
