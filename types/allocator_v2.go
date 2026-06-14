@@ -157,6 +157,11 @@ func (b *AllocBuilder) MarkFree(relBlock uint64) {
 	w0 := w1 / 64
 	b0 := w1 % 64
 
+	// Already free?
+	if b.L2[w2]&(1<<b2) != 0 {
+		return
+	}
+
 	wasAllZero := b.L2[w2] == 0
 
 	b.L2[w2] |= 1 << b2

@@ -15,6 +15,7 @@ const (
 	MagicSuperblock = 0x504C434E        // "PLCN"
 	MagicInode      = 0x494E4F44        // "INOD"
 	MagicTrieNode   = 0x54524E20        // "TRN "
+	MagicTriePage   = 0x54524E50        // "TRNP"
 	MagicDirEntry   = 0x44495245        // "DIRE"
 	MagicJournal    = 0x4A4E4C5A        // "JNLZ"
 	MagicCheckpoint = 0x43485053        // "CHPS"
@@ -35,6 +36,12 @@ const (
 	NodeTypeDir      = 0x02
 	NodeTypeInterm   = 0x04
 	NodeStatusLeaf   = 0x08
+
+	// Trie page constants — packed node pages (BrieFS >= 0.7.0)
+	TrieSlotsPerBlock = 64
+	TrieSlotBits      = 6
+	TrieSlotMask      = (1 << TrieSlotBits) - 1
+	TriePageVersion   = 1
 
 	// Trie node flags — mirrors briefs.h NODE_FLAG_*
 	NodeFlagDeleted  = 0x00000004
@@ -71,8 +78,8 @@ const (
 
 	// BrieFS version numbers for this version of briefs-utils
 	BrieFSMajorVersion = 0
-	BrieFSMinorVersion = 6
-	BrieFSPatchVersion = 5
+	BrieFSMinorVersion = 7
+	BrieFSPatchVersion = 0
 )
 
 // Block layout constants - defines the order of metadata on disk
@@ -85,6 +92,26 @@ const (
 // Next:    Trie node data blocks
 // Next:    Data region
 // Last:    Journal
+
+// TrieMakeRef encodes a block number and slot index into a node reference.
+func TrieMakeRef(block uint64, slot uint) uint64 {
+	return (block << TrieSlotBits) | (uint64(slot) & TrieSlotMask)
+}
+
+// TrieRefBlock returns the block number encoded in a node reference.
+func TrieRefBlock(ref uint64) uint64 {
+	return ref >> TrieSlotBits
+}
+
+// TrieRefSlot returns the slot index encoded in a node reference.
+func TrieRefSlot(ref uint64) uint {
+	return uint(ref & TrieSlotMask)
+}
+
+// TrieRefIsNull reports whether a node reference is the null pointer.
+func TrieRefIsNull(ref uint64) bool {
+	return ref == 0
+}
 
 // nextPowerOf2 returns the smallest power of 2 >= n.
 func nextPowerOf2(n uint64) uint64 {
