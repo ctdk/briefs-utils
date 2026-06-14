@@ -43,19 +43,20 @@ func Crc32c(crc uint32, data []byte) uint32 {
 }
 
 // ComputeJournalRecordChecksum computes the CRC32C checksum for a journal
-// record header. It matches the kernel's compute_record_checksum():
-//   crc32c(0, type) ^ crc32c(0, flags) ^ crc32c(0, data_len) ^ crc32c(0, data)
+// record header. It matches the kernel's compute_record_checksum(), which
+// chains a single CRC over type + flags + data_len + data rather than XORing
+// four separate CRCs.
 func ComputeJournalRecordChecksum(recordType uint32, flags uint32, data []byte) uint32 {
 	var tmp [4]byte
 	var c uint32
 
 	binary.LittleEndian.PutUint32(tmp[:], recordType)
-	c ^= Crc32c(0, tmp[:])
+	c = Crc32c(0, tmp[:])
 	binary.LittleEndian.PutUint32(tmp[:], flags)
-	c ^= Crc32c(0, tmp[:])
+	c = Crc32c(c, tmp[:])
 	binary.LittleEndian.PutUint32(tmp[:], uint32(len(data)))
-	c ^= Crc32c(0, tmp[:])
-	c ^= Crc32c(0, data)
+	c = Crc32c(c, tmp[:])
+	c = Crc32c(c, data)
 
 	return c
 }

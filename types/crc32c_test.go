@@ -31,15 +31,15 @@ func TestCrc32cKnownVectors(t *testing.T) {
 }
 
 func TestComputeJournalRecordChecksum(t *testing.T) {
-	// The kernel computes:
-	//   crc32c(0, type) ^ crc32c(0, flags) ^ crc32c(0, data_len) ^ crc32c(0, data)
+	// The kernel now computes a single chained CRC:
+	//   crc32c(crc32c(crc32c(crc32c(0, type), flags), data_len), data)
 	// For type=1, flags=0, data_len=0, data=[] the result is:
-	//   crc32c(0, [1,0,0,0]) ^ crc32c(0, [0,0,0,0]) ^ crc32c(0, [0,0,0,0]) ^ crc32c(0, [])
+	//   crc32c(crc32c(crc32c(0, [1,0,0,0]), [0,0,0,0]), [0,0,0,0])
 	var buf [4]byte
 	buf[0] = 1
-	typeCRC := Crc32c(0, buf[:])
-	zeroCRC := Crc32c(0, []byte{0, 0, 0, 0})
-	want := typeCRC ^ zeroCRC ^ zeroCRC ^ 0
+	want := Crc32c(0, buf[:])
+	want = Crc32c(want, []byte{0, 0, 0, 0})
+	want = Crc32c(want, []byte{0, 0, 0, 0})
 
 	got := ComputeJournalRecordChecksum(1, 0, nil)
 	if got != want {
