@@ -380,18 +380,20 @@ func main() {
 			recOff := uint64(16)
 			binary.LittleEndian.PutUint32(journalBuf[recOff:], 9)     // type = JRN_CHECKPOINT
 			binary.LittleEndian.PutUint32(journalBuf[recOff+4:], 0)   // flags
-			binary.LittleEndian.PutUint32(journalBuf[recOff+8:], 80)  // data_len
-			// Checkpoint record data at offset 32 (80 bytes)
+			binary.LittleEndian.PutUint32(journalBuf[recOff+8:], 56)  // data_len
+			// Checkpoint record data at offset 32 (56 bytes), matching the
+			// kernel's struct jrn_checkpoint.
 			cpOff := recOff + 16
 			binary.LittleEndian.PutUint64(journalBuf[cpOff:], 1)    // checkpoint_seq = 1
 			binary.LittleEndian.PutUint32(journalBuf[cpOff+8:], 1)  // record_count
+			binary.LittleEndian.PutUint32(journalBuf[cpOff+12:], 0) // reserved
 			binary.LittleEndian.PutUint64(journalBuf[cpOff+16:], 0) // log_sequence_end
 			binary.LittleEndian.PutUint64(journalBuf[cpOff+24:], 0) // trie_root_node
 			binary.LittleEndian.PutUint64(journalBuf[cpOff+32:], finalDataBlocks-1) // free_data_count
 			binary.LittleEndian.PutUint64(journalBuf[cpOff+40:], estInodes-1)     // free_inode_count
 			// Compute and write the CRC32C checksum over type, flags,
-			// data_len, and the 80-byte checkpoint data.
-			cpData := journalBuf[cpOff : cpOff+80]
+			// data_len, and the 56-byte checkpoint data.
+			cpData := journalBuf[cpOff : cpOff+56]
 			checksum := types.ComputeJournalRecordChecksum(9, 0, cpData)
 			binary.LittleEndian.PutUint32(journalBuf[recOff+12:], checksum)
 			if _, err := file.WriteAt(journalBuf, int64(checkpointBlock*blockSize)); err != nil {
