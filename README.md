@@ -15,16 +15,12 @@ NAME:
    mkfs.briefs - Create a new BrieFS filesystem
 
 USAGE:
-   mkfs.briefs [global options] command [command options]
+   mkfs.briefs [global options] DEVICE
 
 VERSION:
    v0.7.0
 
-COMMANDS:
-   help, h  Shows a list of commands or help for one command
-
 GLOBAL OPTIONS:
-   --output value, -o value        output file path
    --size value, -s value          filesystem size in blocks (default: 0)
    --block-size value, -b value    block size in bytes (default: 4096)
    --inode-size value              inode size in bytes (default: 512)
@@ -44,16 +40,12 @@ NAME:
    fsck.briefs - Check and repair a BrieFS filesystem
 
 USAGE:
-   fsck.briefs [global options] command [command options]
+   fsck.briefs [global options] DEVICE
 
 VERSION:
    v0.7.0
 
-COMMANDS:
-   help, h  Shows a list of commands or help for one command
-
 GLOBAL OPTIONS:
-   --device value, -d value  filesystem device or image file
    --verbose, -V             verbose output (default: false)
    --repair                  attempt to repair found errors (not yet implemented) (default: false)
    --help, -h                show help

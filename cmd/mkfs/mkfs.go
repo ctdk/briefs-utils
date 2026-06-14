@@ -29,21 +29,17 @@ func calculateInodeLocation(sb *types.Superblock, inodeNum uint64) (blockOffset 
 	return blockOffset, byteOffset
 }
 
-// TODO: mkfs.briefs should use the same general argument and flag format that
-// other mkfs programs use, i.e. "mkfs.briefs <options> /dev/sda1" instead of
-// "mkfs.briefs <options> -o /dev/sda1". Will deal with later, since it looks
-// like that'll require a bit of wiring to get the help message showing the
-// right things.
-//
-// On the plus side, I learned that it's easy to make man pages with apps that
-// use github.com/urfave/cli for flag/arg processing. Huzzah!
 func main() {
 	app := &cli.App{
-		Name:  "mkfs.briefs",
-		Usage: "Create a new BrieFS filesystem",
-		Version: versionStr,
+		Name:     "mkfs.briefs",
+		Usage:    "Create a new BrieFS filesystem",
+		ArgsUsage: "DEVICE",
+		Version:  versionStr,
 		Before: func(c *cli.Context) error {
-			path := c.String("output")
+			if c.Args().Len() < 1 {
+				return fmt.Errorf("missing required argument: DEVICE")
+			}
+			path := c.Args().First()
 			if err := device.CheckMounted(path); err != nil {
 				// Reformatting a mounted filesystem is incredibly
 				// dangerous. Refuse to continue.
@@ -52,12 +48,6 @@ func main() {
 			return nil
 		},
 		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:     "output",
-				Aliases:  []string{"o"},
-				Required: true,
-				Usage:    "output file path",
-			},
 			&cli.Int64Flag{
 				Name:     "size",
 				Aliases:  []string{"s"},
@@ -88,7 +78,7 @@ func main() {
 			},
 		},
 		Action: func(c *cli.Context) error {
-			path := c.String("output")
+			path := c.Args().First()
 			totalBlocks := c.Int64("size")
 			blockSize := uint64(c.Int("block-size"))
 			inodeSize := uint64(c.Int("inode-size"))

@@ -1372,23 +1372,21 @@ func verifySuperblockFreeCounts(fs *fsckState, totalInodesFound int) {
 
 func main() {
 	app := &cli.App{
-		Name:    "fsck.briefs",
-		Usage:   "Check and repair a BrieFS filesystem",
-		Version: versionStr,
+		Name:     "fsck.briefs",
+		Usage:    "Check and repair a BrieFS filesystem",
+		ArgsUsage: "DEVICE",
+		Version:  versionStr,
 		Before: func(c *cli.Context) error {
-			path := c.String("device")
+			if c.Args().Len() < 1 {
+				return fmt.Errorf("missing required argument: DEVICE")
+			}
+			path := c.Args().First()
 			if err := device.CheckMounted(path); err != nil {
 				return fmt.Errorf("refusing to check filesystem: %w\n", err)
 			}
 			return nil
 		},
 		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:     "device",
-				Aliases:  []string{"d"},
-				Required: true,
-				Usage:    "filesystem device or image file",
-			},
 			&cli.BoolFlag{
 				Name:    "verbose",
 				Aliases: []string{"V"},
@@ -1400,7 +1398,7 @@ func main() {
 			},
 		},
 		Action: func(c *cli.Context) error {
-			path := c.String("device")
+			path := c.Args().First()
 
 			file, err := os.Open(path)
 			if err != nil {
