@@ -6,3 +6,4 @@ mkfs.briefs
 fsck.briefs
 fuse.briefs
 *.exe
+.claude
