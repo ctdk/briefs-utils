@@ -417,9 +417,9 @@ func collectInodeExtents(fs *fsckState, ino uint64, in *types.Inode, blockSize u
 	}
 
 	// Collect inline extents
+	inlineExtents := in.InlineExtents()
 	for ei := uint32(0); ei < in.NumExtentsInline; ei++ {
-		ext := in.InlineExtents[ei]
-		addExtentBlocks(ext)
+		addExtentBlocks(inlineExtents[ei])
 	}
 
 	// Collect overflow extents from chain blocks
@@ -1174,9 +1174,9 @@ func verifyExtentOverlaps(fs *fsckState) {
 			continue
 		}
 		// Walk inline extents
+		inlineExtents := in.InlineExtents()
 		for ei := uint32(0); ei < in.NumExtentsInline; ei++ {
-			ext := in.InlineExtents[ei]
-			addExtent(ino, ext)
+			addExtent(ino, inlineExtents[ei])
 		}
 
 		// Walk overflow chain extents

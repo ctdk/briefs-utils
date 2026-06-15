@@ -337,18 +337,9 @@ func (im *InodeManager) WriteInode(inode *types.Inode) error {
 		binary.LittleEndian.PutUint64(data[pos:], inode.ExtentInlineBase); pos += 8
 		binary.LittleEndian.PutUint64(data[pos:], inode.NumExtentsTotal); pos += 8
 
-		if inode.Flags&types.InodeFlagInlineData != 0 {
-			copy(data[pos:pos+256], inode.InlineData[:])
-			pos += 256
-		} else {
-			for i := 0; i < 8; i++ {
-				binary.LittleEndian.PutUint64(data[pos:], inode.InlineExtents[i].Offset); pos += 8
-				binary.LittleEndian.PutUint64(data[pos:], inode.InlineExtents[i].Phys); pos += 8
-				binary.LittleEndian.PutUint64(data[pos:], inode.InlineExtents[i].Len); pos += 8
-				binary.LittleEndian.PutUint32(data[pos:], inode.InlineExtents[i].Flags); pos += 4
-				binary.LittleEndian.PutUint32(data[pos:], inode.InlineExtents[i].Pad); pos += 4
-			}
-		}
+		inlineRegion := inode.InlineData()
+		copy(data[pos:pos+256], inlineRegion[:])
+		pos += 256
 
 		binary.LittleEndian.PutUint64(data[pos:], inode.XattrOffset); pos += 8
 		binary.LittleEndian.PutUint64(data[pos:], inode.XattrSize); pos += 8

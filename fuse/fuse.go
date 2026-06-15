@@ -115,7 +115,7 @@ var _ = (fs.NodeStatfser)((*brieFSNode)(nil))
 // if the extent is beyond the 8 inline slots.
 func (n *brieFSNode) readExtent(diskInode *types.Inode, idx int) (types.Extent, error) {
 	if idx < 8 {
-		return diskInode.InlineExtents[idx], nil
+		return diskInode.InlineExtents()[idx], nil
 	}
 
 	chainIdx := idx - 8
@@ -306,7 +306,8 @@ func (n *brieFSNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off
 		if end > int64(diskInode.FileSize) {
 			end = int64(diskInode.FileSize)
 		}
-		nc := copy(readBuf, diskInode.InlineData[start:end])
+		inlineData := diskInode.InlineData()
+		nc := copy(readBuf, inlineData[start:end])
 		return fuse.ReadResultData(readBuf[:nc]), 0
 	}
 

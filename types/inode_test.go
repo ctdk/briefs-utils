@@ -86,14 +86,15 @@ func TestInodeUnmarshal(t *testing.T) {
 	if in.NumExtentsTotal != 1 {
 		t.Errorf("NumExtentsTotal: want 1, got %d", in.NumExtentsTotal)
 	}
-	if in.InlineExtents[0].Offset != 0 {
-		t.Errorf("Extent[0].Offset: want 0, got %d", in.InlineExtents[0].Offset)
+	ext0 := in.InlineExtents()[0]
+	if ext0.Offset != 0 {
+		t.Errorf("Extent[0].Offset: want 0, got %d", ext0.Offset)
 	}
-	if in.InlineExtents[0].Phys != 100 {
-		t.Errorf("Extent[0].Phys: want 100, got %d", in.InlineExtents[0].Phys)
+	if ext0.Phys != 100 {
+		t.Errorf("Extent[0].Phys: want 100, got %d", ext0.Phys)
 	}
-	if in.InlineExtents[0].Len != 1 {
-		t.Errorf("Extent[0].Len: want 1, got %d", in.InlineExtents[0].Len)
+	if ext0.Len != 1 {
+		t.Errorf("Extent[0].Len: want 1, got %d", ext0.Len)
 	}
 	if in.DirTrieRoot != 91 {
 		t.Errorf("DirTrieRoot: want 91, got %d", in.DirTrieRoot)
@@ -167,14 +168,15 @@ func TestInodeSetInlineExtent(t *testing.T) {
 	if in.NumExtentsTotal != 1 {
 		t.Errorf("NumExtentsTotal: want 1, got %d", in.NumExtentsTotal)
 	}
-	if in.InlineExtents[0].Offset != 10 {
-		t.Errorf("Offset: want 10, got %d", in.InlineExtents[0].Offset)
+	ext0 := in.InlineExtents()[0]
+	if ext0.Offset != 10 {
+		t.Errorf("Offset: want 10, got %d", ext0.Offset)
 	}
-	if in.InlineExtents[0].Phys != 200 {
-		t.Errorf("Phys: want 200, got %d", in.InlineExtents[0].Phys)
+	if ext0.Phys != 200 {
+		t.Errorf("Phys: want 200, got %d", ext0.Phys)
 	}
-	if in.InlineExtents[0].Len != 5 {
-		t.Errorf("Len: want 5, got %d", in.InlineExtents[0].Len)
+	if ext0.Len != 5 {
+		t.Errorf("Len: want 5, got %d", ext0.Len)
 	}
 }
 
@@ -191,9 +193,11 @@ func TestInodeInlineDataRoundTrip(t *testing.T) {
 	in := NewInode(2, ModeFile|0644)
 	in.Flags = InodeFlagInlineData
 	in.FileSize = 50
+	var inlineData [256]byte
 	for i := 0; i < 50; i++ {
-		in.InlineData[i] = byte('a' + i%26)
+		inlineData[i] = byte('a' + i%26)
 	}
+	in.SetInlineData(inlineData)
 
 	// Extent fields should be ignored when the inline flag is set.
 	in.NumExtentsInline = 0
@@ -229,9 +233,10 @@ func TestInodeInlineDataRoundTrip(t *testing.T) {
 	if got.NumExtentsTotal != 0 {
 		t.Errorf("NumExtentsTotal: want 0, got %d", got.NumExtentsTotal)
 	}
+	gotData := got.InlineData()
 	for i := 0; i < 50; i++ {
-		if got.InlineData[i] != byte('a'+i%26) {
-			t.Errorf("InlineData[%d]: want %c, got %c", i, byte('a'+i%26), got.InlineData[i])
+		if gotData[i] != byte('a'+i%26) {
+			t.Errorf("InlineData[%d]: want %c, got %c", i, byte('a'+i%26), gotData[i])
 		}
 	}
 }

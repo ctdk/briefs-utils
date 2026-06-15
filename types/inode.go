@@ -33,8 +33,7 @@ type Inode struct {
 	NumExtentsInline  uint32
 	ExtentInlineBase  uint64
 	NumExtentsTotal   uint64
-	InlineExtents     [8]Extent
-	InlineData        [256]byte
+	inlineRegion      [256]byte
 	XattrOffset       uint64
 	XattrSize         uint64
 	ParentInode       uint64
@@ -43,6 +42,42 @@ type Inode struct {
 	DirTrieRoot       uint64
 	Rdev              uint64
 	Reserved          [80]byte
+}
+
+// InlineData returns the 256-byte raw inline data region of the inode.
+func (in *Inode) InlineData() [256]byte {
+	return in.inlineRegion
+}
+
+// SetInlineData copies the given 256-byte slice into the inode's inline data region.
+func (in *Inode) SetInlineData(data [256]byte) {
+	in.inlineRegion = data
+}
+
+// InlineExtents parses and returns the 8 inline extents stored in the raw region.
+func (in *Inode) InlineExtents() [8]Extent {
+	var ext [8]Extent
+	pos := 0
+	for i := 0; i < 8; i++ {
+		ext[i].Offset = binary.LittleEndian.Uint64(in.inlineRegion[pos:]); pos += 8
+		ext[i].Phys = binary.LittleEndian.Uint64(in.inlineRegion[pos:]); pos += 8
+		ext[i].Len = binary.LittleEndian.Uint64(in.inlineRegion[pos:]); pos += 8
+		ext[i].Flags = binary.LittleEndian.Uint32(in.inlineRegion[pos:]); pos += 4
+		ext[i].Pad = binary.LittleEndian.Uint32(in.inlineRegion[pos:]); pos += 4
+	}
+	return ext
+}
+
+// SetInlineExtents serializes the 8 inline extents into the raw region.
+func (in *Inode) SetInlineExtents(ext [8]Extent) {
+	pos := 0
+	for i := 0; i < 8; i++ {
+		binary.LittleEndian.PutUint64(in.inlineRegion[pos:], ext[i].Offset); pos += 8
+		binary.LittleEndian.PutUint64(in.inlineRegion[pos:], ext[i].Phys); pos += 8
+		binary.LittleEndian.PutUint64(in.inlineRegion[pos:], ext[i].Len); pos += 8
+		binary.LittleEndian.PutUint32(in.inlineRegion[pos:], ext[i].Flags); pos += 4
+		binary.LittleEndian.PutUint32(in.inlineRegion[pos:], ext[i].Pad); pos += 4
+	}
 }
 
 // NewInode creates a new inode with default values.
@@ -112,19 +147,10 @@ func (in *Inode) WriteAt(file *os.File, offset int64) error {
 	binary.LittleEndian.PutUint64(block[pos:], in.ExtentInlineBase); pos += 8
 	binary.LittleEndian.PutUint64(block[pos:], in.NumExtentsTotal); pos += 8
 
-	// Write the 256-byte inline region as either raw data or extents.
-	if in.Flags&InodeFlagInlineData != 0 {
-		copy(block[pos:pos+256], in.InlineData[:])
-		pos += 256
-	} else {
-		for i := 0; i < 8; i++ {
-			binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Offset); pos += 8
-			binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Phys); pos += 8
-			binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Len); pos += 8
-			binary.LittleEndian.PutUint32(block[pos:], in.InlineExtents[i].Flags); pos += 4
-			binary.LittleEndian.PutUint32(block[pos:], in.InlineExtents[i].Pad); pos += 4
-		}
-	}
+	// The 256-byte inline region is always written as raw bytes; callers
+	// interpret it as inline extents or inline data based on InodeFlagInlineData.
+	copy(block[pos:pos+256], in.inlineRegion[:])
+	pos += 256
 
 	binary.LittleEndian.PutUint64(block[pos:], in.XattrOffset); pos += 8
 	binary.LittleEndian.PutUint64(block[pos:], in.XattrSize); pos += 8
@@ -176,15 +202,10 @@ func UnmarshalInode(data []byte) (*Inode, error) {
 	in.ExtentInlineBase = binary.LittleEndian.Uint64(data[pos:]); pos += 8
 	in.NumExtentsTotal = binary.LittleEndian.Uint64(data[pos:]); pos += 8
 
-	// Read the 256-byte inline region as raw bytes (also parsed as extents).
-	copy(in.InlineData[:], data[pos:pos+256])
-	for i := 0; i < 8; i++ {
-		in.InlineExtents[i].Offset = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-		in.InlineExtents[i].Phys = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-		in.InlineExtents[i].Len = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-		in.InlineExtents[i].Flags = binary.LittleEndian.Uint32(data[pos:]); pos += 4
-		in.InlineExtents[i].Pad = binary.LittleEndian.Uint32(data[pos:]); pos += 4
-	}
+	// The 256-byte inline region is always stored as raw bytes; callers
+	// interpret it as inline extents or inline data based on InodeFlagInlineData.
+	copy(in.inlineRegion[:], data[pos:pos+256])
+	pos += 256
 
 	in.XattrOffset = binary.LittleEndian.Uint64(data[pos:]); pos += 8
 	in.XattrSize = binary.LittleEndian.Uint64(data[pos:]); pos += 8
@@ -217,13 +238,12 @@ func (in *Inode) SetInlineExtent(index int, offset, phys, length, flags uint64) 
 	if index < 0 || index >= 8 {
 		return InlineExtentRangeErr
 	}
-	in.InlineExtents[index] = Extent{
-		Offset: offset,
-		Phys:   phys,
-		Len:    length,
-		Flags:  uint32(flags),
-		Pad:    0,
-	}
+	pos := index * 32
+	binary.LittleEndian.PutUint64(in.inlineRegion[pos:], offset); pos += 8
+	binary.LittleEndian.PutUint64(in.inlineRegion[pos:], phys); pos += 8
+	binary.LittleEndian.PutUint64(in.inlineRegion[pos:], length); pos += 8
+	binary.LittleEndian.PutUint32(in.inlineRegion[pos:], uint32(flags)); pos += 4
+	binary.LittleEndian.PutUint32(in.inlineRegion[pos:], 0)
 	// Update inline extent count if this is the last one
 	if index+1 > int(in.NumExtentsInline) {
 		in.NumExtentsInline = uint32(index + 1)
