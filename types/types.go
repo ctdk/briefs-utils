@@ -44,6 +44,7 @@ const (
 	JRN_DIR_UPDATE
 	JRN_CHECKPOINT
 	JRN_INODE_FULL
+	JRN_SYMLINK_DATA
 
 	// Trie node types — mirrors briefs.h NODE_TYPE_* / NODE_STATUS_*
 	NodeTypeFile     = 0x01
