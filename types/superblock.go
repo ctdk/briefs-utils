@@ -3,7 +3,6 @@ package types
 // Superblock structs and methods
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 
@@ -12,6 +11,7 @@ import (
 	"time"
 )
 
+//go:briefs-disk size=1024
 // SuperblockLayout is the on-disk format (first 1KB block).
 type SuperblockLayout struct {
 	// Block 0: core fields
@@ -144,116 +144,11 @@ func (sb *Superblock) Write(path string) error {
 
 // MarshalBinary converts the superblock to binary format.
 func (sb *Superblock) MarshalBinary() []byte {
-	data := make([]byte, BrieFSSuperSize)
-	pos := 0
-
-	// There are definitely more elegant ways to do this. Is it worth doing
-	// this more elegantly?
-
-	// Write fields in order
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.Magic); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.MajorVer); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.MinorVer); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.PatchVer); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.TotalBlocks); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.DataBlocks); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.BlockSize); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.InodeSize); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.BlocksGrp); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.InodesGrp); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.FSCreated); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.FSLastMount); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.FSLastChkpt); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.FreeDataBlks); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.FreeInodes); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.RootIno); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.FeatCompat); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.FeatROCompat); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.FeatIncompat); pos += 8
-
-	copy(data[pos:pos+16], sb.Lay.UUID[:]); pos += 16
-
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.EATOffset); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.EATBlocks); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.TrieRootBlock); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.TrieBlocksUsed); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.TrieNodePoolStart); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.TrieNodePoolSize); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.InodeBMOffset); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.InodeBMBlocks); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.InodeTableOffset); pos += 8
-	// skipped: old data_bitmap_offset + data_bitmap_blocks area (now replaced by InodeTableOffset)
-	// pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.JournalOffset); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.JournalBlocks); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.CheckpointSeq); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.JournalLogStart); pos += 8
-	binary.LittleEndian.PutUint64(data[pos:], sb.Lay.JournalLogEnd); pos += 8
-
-	copy(data[pos:pos+32], []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}); pos += 32
-
-	copy(data[pos:pos+BrieFSVolLabelLen], sb.Lay.Label[:]); pos += BrieFSVolLabelLen
-
-	// Pad to 4096 bytes
-	for i := pos; i < BrieFSSuperSize; i++ {
-		data[i] = 0
+	data, err := sb.Lay.MarshalBinary()
+	if err != nil {
+		panic(err)
 	}
-
 	return data
-}
-
-// UnmarshalBinary deserializes a SuperblockLayout from a byte slice.
-// The data should be at least BrieFSSuperSize bytes.
-func (sb *SuperblockLayout) UnmarshalBinary(data []byte) error {
-	if len(data) < BrieFSSuperSize {
-		return fmt.Errorf("superblock data too short: %d < %d", len(data), BrieFSSuperSize)
-	}
-	pos := 0
-	sb.Magic = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.MajorVer = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.MinorVer = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.PatchVer = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.TotalBlocks = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.DataBlocks = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.BlockSize = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.InodeSize = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.BlocksGrp = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.InodesGrp = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.FSCreated = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.FSLastMount = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.FSLastChkpt = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.FreeDataBlks = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.FreeInodes = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.RootIno = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.FeatCompat = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.FeatROCompat = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.FeatIncompat = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-
-	copy(sb.UUID[:], data[pos:pos+16]); pos += 16
-
-	sb.EATOffset = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.EATBlocks = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.TrieRootBlock = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.TrieBlocksUsed = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.TrieNodePoolStart = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.TrieNodePoolSize = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.InodeBMOffset = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.InodeBMBlocks = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.InodeTableOffset = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.JournalOffset = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.JournalBlocks = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.CheckpointSeq = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.JournalLogStart = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	sb.JournalLogEnd = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-
-	for i := 0; i < 4; i++ {
-		sb.ReservedJournal[i] = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	}
-
-	copy(sb.Label[:], data[pos:pos+BrieFSVolLabelLen]); pos += BrieFSVolLabelLen
-
-	return nil
 }
 
 // ReadSuperblock reads and parses the superblock from an io.ReaderAt.

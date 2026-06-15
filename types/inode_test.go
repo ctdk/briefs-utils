@@ -4,7 +4,22 @@ import (
 	"encoding/binary"
 	"os"
 	"testing"
+	"unsafe"
 )
+
+func TestInodeSize(t *testing.T) {
+	if got := int(unsafe.Sizeof(Inode{})); got != DefaultInodeSize {
+		t.Fatalf("Inode size: want %d, got %d", DefaultInodeSize, got)
+	}
+	in := NewInode(1, 0o100644)
+	data, err := in.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+	if len(data) != DefaultInodeSize {
+		t.Fatalf("MarshalBinary length: want %d, got %d", DefaultInodeSize, len(data))
+	}
+}
 
 func TestInodeUnmarshal(t *testing.T) {
 	data := make([]byte, 512)

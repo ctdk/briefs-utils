@@ -1,17 +1,20 @@
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
 
-.PHONY: all mkfs fsck fuse install clean
+.PHONY: all generate mkfs fsck fuse install clean
 
 all: mkfs fsck fuse
 
-mkfs: cmd/mkfs/mkfs.go
+generate:
+	go generate ./types
+
+mkfs: generate cmd/mkfs/mkfs.go
 	go build -o mkfs.briefs ./cmd/mkfs
 
-fsck: cmd/fsck/fsck.go
+fsck: generate cmd/fsck/fsck.go
 	go build -o fsck.briefs ./cmd/fsck
 
-fuse: cmd/fuse/fuse.go
+fuse: generate cmd/fuse/fuse.go
 	go build -o fuse.briefs ./cmd/fuse
 
 install: all

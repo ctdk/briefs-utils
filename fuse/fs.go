@@ -315,42 +315,10 @@ func (im *InodeManager) WriteInode(inode *types.Inode) error {
 	}
 	// Marshal inode data into the buffer at the correct offset
 	{
-		data := make([]byte, im.sb.InodeSize)
-		pos := 0
-		binary.LittleEndian.PutUint64(data[pos:], inode.InodeNumber); pos += 8
-		binary.LittleEndian.PutUint64(data[pos:], inode.Magic); pos += 8
-		binary.LittleEndian.PutUint32(data[pos:], inode.Filemode); pos += 4
-		binary.LittleEndian.PutUint32(data[pos:], inode.Uid); pos += 4
-		binary.LittleEndian.PutUint32(data[pos:], inode.Gid); pos += 4
-		binary.LittleEndian.PutUint32(data[pos:], 0); pos += 4 // _Pad0
-		binary.LittleEndian.PutUint64(data[pos:], inode.FileSize); pos += 8
-		binary.LittleEndian.PutUint64(data[pos:], inode.CtimeSec); pos += 8
-		binary.LittleEndian.PutUint64(data[pos:], inode.CtimeNsec); pos += 8
-		binary.LittleEndian.PutUint64(data[pos:], inode.AtimeSec); pos += 8
-		binary.LittleEndian.PutUint64(data[pos:], inode.AtimeNsec); pos += 8
-		binary.LittleEndian.PutUint64(data[pos:], inode.MtimeSec); pos += 8
-		binary.LittleEndian.PutUint64(data[pos:], inode.MtimeNsec); pos += 8
-		binary.LittleEndian.PutUint64(data[pos:], inode.CreationTimeSec); pos += 8
-		binary.LittleEndian.PutUint64(data[pos:], inode.CreationTimeNsec); pos += 8
-		binary.LittleEndian.PutUint32(data[pos:], inode.Nlinks); pos += 4
-		binary.LittleEndian.PutUint32(data[pos:], inode.NumExtentsInline); pos += 4
-		binary.LittleEndian.PutUint64(data[pos:], inode.ExtentInlineBase); pos += 8
-		binary.LittleEndian.PutUint64(data[pos:], inode.NumExtentsTotal); pos += 8
-
-		inlineRegion := inode.InlineData()
-		copy(data[pos:pos+256], inlineRegion[:])
-		pos += 256
-
-		binary.LittleEndian.PutUint64(data[pos:], inode.XattrOffset); pos += 8
-		binary.LittleEndian.PutUint64(data[pos:], inode.XattrSize); pos += 8
-		binary.LittleEndian.PutUint64(data[pos:], inode.ParentInode); pos += 8
-		binary.LittleEndian.PutUint32(data[pos:], inode.Unused); pos += 4
-		binary.LittleEndian.PutUint32(data[pos:], inode.Flags); pos += 4
-		binary.LittleEndian.PutUint64(data[pos:], inode.DirTrieRoot); pos += 8
-		binary.LittleEndian.PutUint64(data[pos:], inode.Rdev); pos += 8
-
-		copy(data[pos:pos+80], inode.Reserved[:])
-
+		data, err := inode.MarshalBinary()
+		if err != nil {
+			return fmt.Errorf("marshal inode %d: %w", inode.InodeNumber, err)
+		}
 		copy(buf[off:], data)
 	}
 

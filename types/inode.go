@@ -12,6 +12,7 @@ import (
 
 var InlineExtentRangeErr = errors.New("index out of range for inode inline extents")
 
+//go:briefs-disk size=512
 // Inode represents a filesystem inode (512 bytes).
 type Inode struct {
 	InodeNumber       uint64
@@ -122,45 +123,10 @@ func (in *Inode) IsSymlink() bool {
 
 // WriteAt writes the inode to a file at the given byte offset.
 func (in *Inode) WriteAt(file *os.File, offset int64) error {
-	block := make([]byte, DefaultInodeSize)
-	pos := 0
-
-	// Same thing as with the superblock: There are definitely more elegant
-	// ways to do this. Is it worth pursuing that?
-	binary.LittleEndian.PutUint64(block[pos:], in.InodeNumber); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.Magic); pos += 8
-	binary.LittleEndian.PutUint32(block[pos:], in.Filemode); pos += 4
-	binary.LittleEndian.PutUint32(block[pos:], in.Uid); pos += 4
-	binary.LittleEndian.PutUint32(block[pos:], in.Gid); pos += 4
-	binary.LittleEndian.PutUint32(block[pos:], in._Pad0); pos += 4
-	binary.LittleEndian.PutUint64(block[pos:], in.FileSize); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.CtimeSec); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.CtimeNsec); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.AtimeSec); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.AtimeNsec); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.MtimeSec); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.MtimeNsec); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.CreationTimeSec); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.CreationTimeNsec); pos += 8
-	binary.LittleEndian.PutUint32(block[pos:], in.Nlinks); pos += 4
-	binary.LittleEndian.PutUint32(block[pos:], in.NumExtentsInline); pos += 4
-	binary.LittleEndian.PutUint64(block[pos:], in.ExtentInlineBase); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.NumExtentsTotal); pos += 8
-
-	// The 256-byte inline region is always written as raw bytes; callers
-	// interpret it as inline extents or inline data based on InodeFlagInlineData.
-	copy(block[pos:pos+256], in.inlineRegion[:])
-	pos += 256
-
-	binary.LittleEndian.PutUint64(block[pos:], in.XattrOffset); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.XattrSize); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.ParentInode); pos += 8
-	binary.LittleEndian.PutUint32(block[pos:], in.Unused); pos += 4
-	binary.LittleEndian.PutUint32(block[pos:], in.Flags); pos += 4
-	binary.LittleEndian.PutUint64(block[pos:], in.DirTrieRoot); pos += 8
-	binary.LittleEndian.PutUint64(block[pos:], in.Rdev); pos += 8
-
-	copy(block[pos:pos+80], in.Reserved[:])
+	block, err := in.MarshalBinary()
+	if err != nil {
+		return err
+	}
 
 	written, err := file.WriteAt(block, offset)
 	if err != nil {
@@ -173,50 +139,11 @@ func (in *Inode) WriteAt(file *os.File, offset int64) error {
 }
 
 // UnmarshalInode deserializes a 512-byte buffer into an Inode.
-// Fields are read in the same order as WriteAt writes them.
 func UnmarshalInode(data []byte) (*Inode, error) {
-	if len(data) < DefaultInodeSize {
-		return nil, fmt.Errorf("inode data too short: %d bytes (need %d)", len(data), DefaultInodeSize)
-	}
-
 	in := &Inode{}
-	pos := 0
-
-	in.InodeNumber = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.Magic = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.Filemode = binary.LittleEndian.Uint32(data[pos:]); pos += 4
-	in.Uid = binary.LittleEndian.Uint32(data[pos:]); pos += 4
-	in.Gid = binary.LittleEndian.Uint32(data[pos:]); pos += 4
-	in._Pad0 = binary.LittleEndian.Uint32(data[pos:]); pos += 4
-	in.FileSize = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.CtimeSec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.CtimeNsec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.AtimeSec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.AtimeNsec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.MtimeSec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.MtimeNsec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.CreationTimeSec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.CreationTimeNsec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.Nlinks = binary.LittleEndian.Uint32(data[pos:]); pos += 4
-	in.NumExtentsInline = binary.LittleEndian.Uint32(data[pos:]); pos += 4
-	in.ExtentInlineBase = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.NumExtentsTotal = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-
-	// The 256-byte inline region is always stored as raw bytes; callers
-	// interpret it as inline extents or inline data based on InodeFlagInlineData.
-	copy(in.inlineRegion[:], data[pos:pos+256])
-	pos += 256
-
-	in.XattrOffset = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.XattrSize = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.ParentInode = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.Unused = binary.LittleEndian.Uint32(data[pos:]); pos += 4
-	in.Flags = binary.LittleEndian.Uint32(data[pos:]); pos += 4
-	in.DirTrieRoot = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	in.Rdev = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-
-	copy(in.Reserved[:], data[pos:pos+80])
-
+	if err := in.UnmarshalBinary(data); err != nil {
+		return nil, err
+	}
 	return in, nil
 }
 

@@ -3,7 +3,19 @@ package types
 import (
 	"bytes"
 	"testing"
+	"unsafe"
 )
+
+func TestSuperblockLayoutSize(t *testing.T) {
+	if got := int(unsafe.Sizeof(SuperblockLayout{})); got != BrieFSSuperSize {
+		t.Fatalf("SuperblockLayout size: want %d, got %d", BrieFSSuperSize, got)
+	}
+	sb := NewSuperblock(100, 4096, 512, 4, "test")
+	data := sb.MarshalBinary()
+	if len(data) != BrieFSSuperSize {
+		t.Fatalf("MarshalBinary length: want %d, got %d", BrieFSSuperSize, len(data))
+	}
+}
 
 func TestSuperblockLayoutMarshalRoundTrip(t *testing.T) {
 	sb := NewSuperblock(10000, 4096, 512, 64, "test-label")
