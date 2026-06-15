@@ -295,6 +295,7 @@ func main() {
 			// 4. Root inode (inode 1) at first slot of inode table
 			rootInode := types.NewInode(1, types.ModeDir|0755)
 			rootInode.Nlinks = 2
+			rootInode.ParentInode = 1
 			rootInode.DirTrieRoot = types.TrieMakeRef(rootTrieBlock, 0)
 
 			inodeBlock, inodeByteOffset := calculateInodeLocation(sb, 1)

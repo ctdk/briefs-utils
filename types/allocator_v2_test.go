@@ -112,6 +112,44 @@ func TestAllocBuilderMarkFreeTwice(t *testing.T) {
 	}
 }
 
+func TestAllocBuilderMarkFreeSetsL0(t *testing.T) {
+	// 64*64*64 = 262144 blocks makes L0 a single word and L1 64 words.
+	// Allocate every block in one L1 word's L2 words (words 0..63), so L1[0] goes to zero.
+	// L0[0] still has bit 0 set for the remaining L1 words 1..63, and only goes to zero
+	// once all L1 words under it are zero. With 64 L1 words and only word 0 depleted,
+	// L0[0] stays non-zero, so test the actual bug: restoring L1[0] also restores L0[0]
+	// when it had been cleared.
+	b := NewAllocBuilder(262144)
+
+	// Deplete the first L1 word (L2 words 0..63) completely.
+	for i := uint64(0); i < 64*64; i++ {
+		b.MarkAllocated(i)
+	}
+	if b.L1[0]&(1<<0) != 0 {
+		t.Fatalf("L1[0] bit 0 want 0 after full L2 word allocation, got 0x%X", b.L1[0])
+	}
+
+	// Now deplete the other 63 L1 words too, so L0[0] actually clears.
+	for i := uint64(64 * 64); i < 64*64*64; i++ {
+		b.MarkAllocated(i)
+	}
+	if b.L0[0] != 0 {
+		t.Fatalf("L0[0] want 0 after full L1 word depletion, got 0x%X", b.L0[0])
+	}
+
+	// Freeing block 0 must restore L1[0] and L0[0].
+	b.MarkFree(0)
+	if b.L1[0]&(1<<0) == 0 {
+		t.Errorf("L1[0] bit 0 should be set after MarkFree")
+	}
+	if b.L0[0]&(1<<0) == 0 {
+		t.Errorf("L0[0] bit 0 should be set after MarkFree; got 0x%X", b.L0[0])
+	}
+	if b.L0[0] != 1 {
+		t.Errorf("L0[0] want 0x1 (only first L1 word restored), got 0x%X", b.L0[0])
+	}
+}
+
 func TestAllocBuilderWriteBlocks(t *testing.T) {
 	b := NewAllocBuilder(1000)
 	b.MarkAllocated(0)

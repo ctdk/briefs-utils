@@ -133,10 +133,12 @@ func (b *AllocBuilder) MarkAllocated(relBlock uint64) {
 		return
 	}
 
+	wasNonZero := b.L2[w2] != 0
+
 	b.L2[w2] &^= 1 << b2
 	b.FreeCount--
 
-	if b.L2[w2] == 0 {
+	if wasNonZero && b.L2[w2] == 0 {
 		b.L1[w1] &^= 1 << b1
 		if b.L1[w1] == 0 {
 			b.L0[w0] &^= 1 << b0
@@ -169,11 +171,9 @@ func (b *AllocBuilder) MarkFree(relBlock uint64) {
 
 	if wasAllZero {
 		b.L1[w1] |= 1 << b1
-		if b.L1[w1] != 0 && b.L0[w0] == 0 {
-			// This is the first non-zero L1 word under this L0 bit
+		if b.L0[w0]&(1<<b0) == 0 {
+			b.L0[w0] |= 1 << b0
 		}
-		_ = w0
-		_ = b0
 	}
 }
 
