@@ -34,6 +34,7 @@ type Inode struct {
 	ExtentInlineBase  uint64
 	NumExtentsTotal   uint64
 	InlineExtents     [8]Extent
+	InlineData        [256]byte
 	XattrOffset       uint64
 	XattrSize         uint64
 	ParentInode       uint64
@@ -111,13 +112,18 @@ func (in *Inode) WriteAt(file *os.File, offset int64) error {
 	binary.LittleEndian.PutUint64(block[pos:], in.ExtentInlineBase); pos += 8
 	binary.LittleEndian.PutUint64(block[pos:], in.NumExtentsTotal); pos += 8
 
-	// Write inline extents
-	for i := 0; i < 8; i++ {
-		binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Offset); pos += 8
-		binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Phys); pos += 8
-		binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Len); pos += 8
-		binary.LittleEndian.PutUint32(block[pos:], in.InlineExtents[i].Flags); pos += 4
-		binary.LittleEndian.PutUint32(block[pos:], in.InlineExtents[i].Pad); pos += 4
+	// Write the 256-byte inline region as either raw data or extents.
+	if in.Flags&InodeFlagInlineData != 0 {
+		copy(block[pos:pos+256], in.InlineData[:])
+		pos += 256
+	} else {
+		for i := 0; i < 8; i++ {
+			binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Offset); pos += 8
+			binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Phys); pos += 8
+			binary.LittleEndian.PutUint64(block[pos:], in.InlineExtents[i].Len); pos += 8
+			binary.LittleEndian.PutUint32(block[pos:], in.InlineExtents[i].Flags); pos += 4
+			binary.LittleEndian.PutUint32(block[pos:], in.InlineExtents[i].Pad); pos += 4
+		}
 	}
 
 	binary.LittleEndian.PutUint64(block[pos:], in.XattrOffset); pos += 8
@@ -170,6 +176,8 @@ func UnmarshalInode(data []byte) (*Inode, error) {
 	in.ExtentInlineBase = binary.LittleEndian.Uint64(data[pos:]); pos += 8
 	in.NumExtentsTotal = binary.LittleEndian.Uint64(data[pos:]); pos += 8
 
+	// Read the 256-byte inline region as raw bytes (also parsed as extents).
+	copy(in.InlineData[:], data[pos:pos+256])
 	for i := 0; i < 8; i++ {
 		in.InlineExtents[i].Offset = binary.LittleEndian.Uint64(data[pos:]); pos += 8
 		in.InlineExtents[i].Phys = binary.LittleEndian.Uint64(data[pos:]); pos += 8

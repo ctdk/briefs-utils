@@ -2,6 +2,7 @@ package types
 
 import (
 	"encoding/binary"
+	"os"
 	"testing"
 )
 
@@ -182,5 +183,55 @@ func TestInodeSetInlineExtentOutOfRange(t *testing.T) {
 	err := in.SetInlineExtent(8, 0, 0, 0, 0)
 	if err == nil {
 		t.Fatal("expected error for index 8")
+	}
+}
+
+
+func TestInodeInlineDataRoundTrip(t *testing.T) {
+	in := NewInode(2, ModeFile|0644)
+	in.Flags = InodeFlagInlineData
+	in.FileSize = 50
+	for i := 0; i < 50; i++ {
+		in.InlineData[i] = byte('a' + i%26)
+	}
+
+	// Extent fields should be ignored when the inline flag is set.
+	in.NumExtentsInline = 0
+	in.NumExtentsTotal = 0
+
+	f, err := os.CreateTemp("", "briefs-inline-inode-*.img")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	if err := in.WriteAt(f, 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+
+	data := make([]byte, DefaultInodeSize)
+	if _, err := f.ReadAt(data, 0); err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+
+	got, err := UnmarshalInode(data)
+	if err != nil {
+		t.Fatalf("UnmarshalInode: %v", err)
+	}
+
+	if got.Flags != InodeFlagInlineData {
+		t.Errorf("Flags: want 0x%X, got 0x%X", InodeFlagInlineData, got.Flags)
+	}
+	if got.FileSize != 50 {
+		t.Errorf("FileSize: want 50, got %d", got.FileSize)
+	}
+	if got.NumExtentsTotal != 0 {
+		t.Errorf("NumExtentsTotal: want 0, got %d", got.NumExtentsTotal)
+	}
+	for i := 0; i < 50; i++ {
+		if got.InlineData[i] != byte('a'+i%26) {
+			t.Errorf("InlineData[%d]: want %c, got %c", i, byte('a'+i%26), got.InlineData[i])
+		}
 	}
 }

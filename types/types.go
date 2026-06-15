@@ -66,6 +66,7 @@ const (
 	InodeFlagReserved    = 0x00000001
 	InodeFlagCompressed  = 0x00000002
 	InodeFlagIndexed     = 0x00000004
+	InodeFlagInlineData  = 0x00000008
 
 	// Extent flags
 	ExtentFlagHole = 0x00000001
@@ -93,8 +94,8 @@ const (
 
 	// BrieFS version numbers for this version of briefs-utils
 	BrieFSMajorVersion = 0
-	BrieFSMinorVersion = 7
-	BrieFSPatchVersion = 5
+	BrieFSMinorVersion = 8
+	BrieFSPatchVersion = 0
 )
 
 // Block layout constants - defines the order of metadata on disk

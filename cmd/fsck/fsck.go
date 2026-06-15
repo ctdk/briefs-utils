@@ -268,12 +268,31 @@ func verifyInode(buf []byte, ino, byteOffset, inodeSize uint64) (*types.Inode, e
 		return nil, fmt.Errorf("ino %d: stored inode number mismatch (%d)", ino, in.InodeNumber)
 	}
 
-	// Validate extent counts
-	if in.NumExtentsInline > 8 {
-		return nil, fmt.Errorf("ino %d: too many inline extents %d", ino, in.NumExtentsInline)
-	}
-	if in.NumExtentsTotal < uint64(in.NumExtentsInline) {
-		return nil, fmt.Errorf("ino %d: total extents %d < inline extents %d", ino, in.NumExtentsTotal, in.NumExtentsInline)
+	// Validate inline-data inodes
+	if in.Flags&types.InodeFlagInlineData != 0 {
+		if in.FileSize > 256 {
+			return nil, fmt.Errorf("ino %d: inline-data file size %d > 256", ino, in.FileSize)
+		}
+		if in.NumExtentsTotal != 0 {
+			return nil, fmt.Errorf("ino %d: inline-data inode has %d extents", ino, in.NumExtentsTotal)
+		}
+		if in.NumExtentsInline != 0 {
+			return nil, fmt.Errorf("ino %d: inline-data inode has %d inline extents", ino, in.NumExtentsInline)
+		}
+		if in.ExtentInlineBase != 0 {
+			return nil, fmt.Errorf("ino %d: inline-data inode has extent_inline_base %d", ino, in.ExtentInlineBase)
+		}
+		if in.IsDir() {
+			return nil, fmt.Errorf("ino %d: directory cannot use inline data", ino)
+		}
+	} else {
+		// Validate extent counts
+		if in.NumExtentsInline > 8 {
+			return nil, fmt.Errorf("ino %d: too many inline extents %d", ino, in.NumExtentsInline)
+		}
+		if in.NumExtentsTotal < uint64(in.NumExtentsInline) {
+			return nil, fmt.Errorf("ino %d: total extents %d < inline extents %d", ino, in.NumExtentsTotal, in.NumExtentsInline)
+		}
 	}
 
 	// Validate file mode
@@ -353,6 +372,10 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 				if in.IsFile() && in.FileSize == 0 && in.NumExtentsTotal > 0 {
 					fs.warnf("ino %d: file with zero size but %d extents", ino, in.NumExtentsTotal)
 				}
+				// Non-inline file with non-zero size but no extents
+				if in.IsFile() && in.FileSize > 0 && in.NumExtentsTotal == 0 && in.Flags&types.InodeFlagInlineData == 0 {
+					fs.warnf("ino %d: file with size %d but no extents (not inline)", ino, in.FileSize)
+				}
 			}
 			ino++
 		}
@@ -364,6 +387,11 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 // collectInodeExtents collects all blocks referenced by an inode's extents,
 // including both inline extents and overflow chain blocks.
 func collectInodeExtents(fs *fsckState, ino uint64, in *types.Inode, blockSize uint64) {
+	// Inline-data inodes reference no data blocks.
+	if in.Flags&types.InodeFlagInlineData != 0 {
+		return
+	}
+
 	// Helper to record the blocks from a single extent.
 	// Skips hole extents (ExtentFlagHole) which have no physical backing.
 	addExtentBlocks := func(ext types.Extent) {
@@ -1132,12 +1160,19 @@ func verifyExtentOverlaps(fs *fsckState) {
 		if ext.Flags&types.ExtentFlagHole != 0 {
 			return
 		}
+		if ext.Flags&^(uint32(types.ExtentFlagHole|types.ExtentFlagEof)) != 0 {
+			fs.warnf("ino %d: extent with unknown flags 0x%08X (phys=%d, len=%d)",
+				ino, ext.Flags, ext.Phys, ext.Len)
+		}
 		if ext.Len > 0 && ext.Phys > 0 {
 			allExtents = append(allExtents, extentRef{ino: ino, phys: ext.Phys, len: ext.Len})
 		}
 	}
 
 	for ino, in := range fs.inodes {
+		if in.Flags&types.InodeFlagInlineData != 0 {
+			continue
+		}
 		// Walk inline extents
 		for ei := uint32(0); ei < in.NumExtentsInline; ei++ {
 			ext := in.InlineExtents[ei]

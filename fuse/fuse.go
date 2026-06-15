@@ -296,6 +296,20 @@ func (n *brieFSNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off
 	readBuf := make([]byte, toRead)
 	readPos := int64(0)
 
+	// Inline data is stored directly inside the inode.
+	if diskInode.Flags&types.InodeFlagInlineData != 0 {
+		start := off
+		if start < 0 {
+			start = 0
+		}
+		end := endOff
+		if end > int64(diskInode.FileSize) {
+			end = int64(diskInode.FileSize)
+		}
+		nc := copy(readBuf, diskInode.InlineData[start:end])
+		return fuse.ReadResultData(readBuf[:nc]), 0
+	}
+
 	// Walk all extents (inline + chain)
 	for i := 0; i < int(diskInode.NumExtentsTotal); i++ {
 		ext, err := n.readExtent(diskInode, i)
