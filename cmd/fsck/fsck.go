@@ -2,11 +2,13 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"math/bits"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/ctdk/briefs-utils/device"
 	"github.com/ctdk/briefs-utils/types"
@@ -45,6 +47,48 @@ type repairPlan struct {
 	freeDataBlks  uint64
 	freeInodes    uint64
 	checkpointSeq uint64
+}
+
+// repairOptions selects which repair/optimization phases run.
+type repairOptions struct {
+	RebuildAllocator bool // rebuild allocator bitmaps from the scan (phase 2)
+	CompactExtents   bool // merge adjacent file extents (phase 4)
+	CompactTries     bool // rebuild directory tries (phase 3)
+	RepairLinks      bool // recompute inode nlink values (phase 5)
+}
+
+// parseRepairOptions converts a comma-separated phase list into a repairOptions
+// value. An empty list or "all" enables every phase.
+func parseRepairOptions(list string) (*repairOptions, error) {
+	list = strings.TrimSpace(list)
+	if list == "" || strings.ToLower(list) == "all" {
+		return &repairOptions{
+			RebuildAllocator: true,
+			CompactExtents:   true,
+			CompactTries:     true,
+			RepairLinks:      true,
+		}, nil
+	}
+
+	opts := &repairOptions{}
+	for _, tok := range strings.Split(list, ",") {
+		tok = strings.TrimSpace(strings.ToLower(tok))
+		switch tok {
+		case "allocator":
+			opts.RebuildAllocator = true
+		case "extents":
+			opts.CompactExtents = true
+		case "trie":
+			opts.CompactTries = true
+		case "links":
+			opts.RepairLinks = true
+		case "":
+			// ignore empty tokens
+		default:
+			return nil, fmt.Errorf("unknown repair phase %q (expected allocator, extents, trie, or links)", tok)
+		}
+	}
+	return opts, nil
 }
 
 func (fs *fsckState) errorf(format string, args ...interface{}) {
@@ -1491,16 +1535,40 @@ func main() {
 			},
 			&cli.BoolFlag{
 				Name:  "repair",
-				Usage: "attempt to repair found errors (not yet implemented)",
+				Usage: "attempt to repair found errors",
+			},
+			&cli.StringFlag{
+				Name:  "repair-only",
+				Usage: "run only selected repair phases (comma-separated: allocator,extents,trie,links; default all)",
+			},
+			&cli.BoolFlag{
+				Name:  "optimize",
+				Usage: "safe compaction only (alias for --repair --repair-only=trie,extents)",
+			},
+			&cli.BoolFlag{
+				Name:    "assume-yes",
+				Aliases: []string{"y"},
+				Usage:   "do not ask for confirmation before modifying the volume",
 			},
 		},
 		Action: func(c *cli.Context) error {
 			path := c.Args().First()
 			repair := c.Bool("repair")
+			repairOnly := c.String("repair-only")
+			optimize := c.Bool("optimize")
+			assumeYes := c.Bool("assume-yes")
+
+			if optimize && repairOnly != "" {
+				return fmt.Errorf("--optimize and --repair-only cannot be used together")
+			}
+			if optimize {
+				repairOnly = "trie,extents"
+			}
+			repairRequested := repair || repairOnly != ""
 
 			var file *os.File
 			var err error
-			if repair {
+			if repairRequested {
 				file, err = os.OpenFile(path, os.O_RDWR, 0)
 				if err != nil {
 					return fmt.Errorf("open device read-write for repair: %w", err)
@@ -1585,7 +1653,7 @@ func main() {
 			totalInodes := runVerificationPass(fs, blockSize, sb.InodeSize)
 
 			// 7. Repair / optimization phase
-			if repair {
+			if repairRequested {
 				if fs.errors > 0 && len(fs.failedTrieDirs) > 0 {
 					fmt.Fprintf(os.Stderr, "Refusing repair: %d director(ies) have unrecoverable trie errors\n", len(fs.failedTrieDirs))
 					fmt.Fprintf(os.Stderr, "FSCK COMPLETE: %d error(s) found, repair skipped\n", fs.errors)
@@ -1596,7 +1664,23 @@ func main() {
 					fmt.Fprintf(os.Stderr, "FSCK COMPLETE: %d error(s) found, repair skipped\n", fs.errors)
 					return nil
 				}
-				if err := runRepair(fs, blockSize, totalInodes); err != nil {
+
+				repairOpts, err := parseRepairOptions(repairOnly)
+				if err != nil {
+					return err
+				}
+
+				if !assumeYes {
+					fmt.Fprintf(os.Stderr, "This will modify %s. Proceed? (y/N) ", path)
+					reader := bufio.NewReader(os.Stdin)
+					line, err := reader.ReadString('\n')
+					if err != nil || (line != "y\n" && line != "Y\n") {
+						fmt.Fprintf(os.Stderr, "\nRepair cancelled.\n")
+						return nil
+					}
+				}
+
+				if err := runRepair(fs, blockSize, totalInodes, repairOpts); err != nil {
 					fmt.Fprintf(os.Stderr, "Repair failed: %v\n", err)
 					fmt.Fprintf(os.Stderr, "FSCK COMPLETE: %d error(s) found, repair failed\n", fs.errors)
 					return nil
@@ -1736,12 +1820,57 @@ func runVerificationPass(fs *fsckState, blockSize, inodeSize uint64) int {
 //   - rebuild data/inode allocator bitmaps from the structures fsck found;
 //   - fix superblock free count mismatches;
 //   - free blocks that are allocated but not referenced (no failed trie walks).
-func runRepair(fs *fsckState, blockSize uint64, totalInodes int) error {
+// recomputeAllocatorFreeCount recalculates FreeCount from the L2 bitmap, masking
+// off bits beyond BlockCount. In the BrieFS allocator a set bit means "free",
+// so FreeCount is the number of set bits in the valid range. This is used after
+// loading an allocator from disk so any written header count matches the bitmap.
+func recomputeAllocatorFreeCount(b *types.AllocBuilder) {
+	if b.BlockCount == 0 {
+		b.FreeCount = 0
+		return
+	}
+	fullWords := b.BlockCount / 64
+	rem := b.BlockCount % 64
+	free := uint64(0)
+	for i := uint64(0); i < fullWords && i < uint64(len(b.L2)); i++ {
+		free += uint64(bits.OnesCount64(b.L2[i]))
+	}
+	if rem > 0 && fullWords < uint64(len(b.L2)) {
+		mask := (uint64(1) << rem) - 1
+		free += uint64(bits.OnesCount64(b.L2[fullWords] & mask))
+	}
+	if free > b.BlockCount {
+		free = b.BlockCount
+	}
+	b.FreeCount = free
+}
+
+// loadAllocatorFromDisk reads an allocator pool from disk into an AllocBuilder.
+// This is used for selective repairs that must allocate/free blocks without
+// rebuilding the allocator bitmaps from scratch.
+func loadAllocatorFromDisk(file *os.File, poolBlock, blockSize, blockCount uint64) (*types.AllocBuilder, error) {
+	l0, l1, l2, hdr, err := types.ReadAllocatorBitmap(file, poolBlock, blockSize)
+	if err != nil {
+		return nil, err
+	}
+	_ = blockCount // kept for symmetry with NewAllocBuilder; hdr.BlockCount is authoritative
+	b := &types.AllocBuilder{
+		L0:         l0,
+		L1:         l1,
+		L2:         l2,
+		BlockCount: hdr.BlockCount,
+		FreeCount:  hdr.FreeCount,
+	}
+	recomputeAllocatorFreeCount(b)
+	return b, nil
+}
+
+func runRepair(fs *fsckState, blockSize uint64, totalInodes int, opts *repairOptions) error {
 	plan := &repairPlan{
 		inodes: make(map[uint64]*types.Inode),
 	}
 
-	// 1. Rebuild data allocator from the structures fsck found.
+	// 1. Set up data allocator.
 	dataRegionStart := fs.sb.TrieNodePoolStart + fs.sb.TrieNodePoolSize
 	if dataRegionStart > fs.sb.TotalBlocks {
 		return fmt.Errorf("data region start %d exceeds total blocks %d", dataRegionStart, fs.sb.TotalBlocks)
@@ -1750,53 +1879,78 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int) error {
 	if fs.sb.JournalOffset > dataRegionStart {
 		dataBlockCount = fs.sb.JournalOffset - dataRegionStart
 	}
-	plan.dataAlloc = types.NewAllocBuilder(dataBlockCount)
 
-	// Mark every block referenced by extents or trie pages as allocated.
-	for absBlk := range fs.usedBlocks {
-		if absBlk >= dataRegionStart && absBlk < dataRegionStart+dataBlockCount {
-			plan.dataAlloc.MarkAllocated(absBlk - dataRegionStart)
+	if opts.RebuildAllocator {
+		// Rebuild data allocator from the structures fsck found.
+		plan.dataAlloc = types.NewAllocBuilder(dataBlockCount)
+		for absBlk := range fs.usedBlocks {
+			if absBlk >= dataRegionStart && absBlk < dataRegionStart+dataBlockCount {
+				plan.dataAlloc.MarkAllocated(absBlk - dataRegionStart)
+			}
+		}
+	} else {
+		// Use the on-disk allocator so selective repairs only touch the requested
+		// phases.
+		var err error
+		plan.dataAlloc, err = loadAllocatorFromDisk(fs.file, fs.sb.TrieNodePoolStart, blockSize, dataBlockCount)
+		if err != nil {
+			return fmt.Errorf("load data allocator: %w", err)
 		}
 	}
 
-	// 2. Rebuild inode allocator from the inode table scan.
+	// 2. Set up inode allocator.
 	inodeHeader, err := types.ReadAllocatorHeader(fs.file, fs.sb.InodeBMOffset, blockSize)
 	if err != nil {
 		return fmt.Errorf("read inode allocator header: %w", err)
 	}
-	plan.inodeAlloc = types.NewAllocBuilder(inodeHeader.BlockCount)
-	for ino := range fs.inodes {
-		if ino > 0 && ino <= inodeHeader.BlockCount {
-			plan.inodeAlloc.MarkAllocated(ino - 1)
+	if opts.RebuildAllocator {
+		plan.inodeAlloc = types.NewAllocBuilder(inodeHeader.BlockCount)
+		for ino := range fs.inodes {
+			if ino > 0 && ino <= inodeHeader.BlockCount {
+				plan.inodeAlloc.MarkAllocated(ino - 1)
+			}
+		}
+	} else {
+		plan.inodeAlloc, err = loadAllocatorFromDisk(fs.file, fs.sb.InodeBMOffset, blockSize, inodeHeader.BlockCount)
+		if err != nil {
+			return fmt.Errorf("load inode allocator: %w", err)
 		}
 	}
 
 	// 3. Compact file extents.
-	if err := compactFileExtents(fs, plan, blockSize); err != nil {
-		return fmt.Errorf("compact file extents: %w", err)
+	if opts.CompactExtents {
+		if err := compactFileExtents(fs, plan, blockSize); err != nil {
+			return fmt.Errorf("compact file extents: %w", err)
+		}
 	}
 
 	// 4. Compact directory tries.
-	if err := compactDirectoryTries(fs, plan, blockSize); err != nil {
-		return fmt.Errorf("compact directory tries: %w", err)
+	if opts.CompactTries {
+		if err := compactDirectoryTries(fs, plan, blockSize); err != nil {
+			return fmt.Errorf("compact directory tries: %w", err)
+		}
 	}
 
 	// Directory inodes may have received a new trie root during compaction.
 	// Keep the in-memory state in sync so the remaining repair steps walk the
 	// current on-disk tries.
-	for i := range fs.dirs {
-		d := &fs.dirs[i]
-		if updated, ok := plan.inodes[d.ino]; ok {
-			d.trieRoot = updated.DirTrieRoot
-			if orig, ok := fs.inodes[d.ino]; ok {
-				orig.DirTrieRoot = updated.DirTrieRoot
+	if opts.CompactTries {
+		for i := range fs.dirs {
+			d := &fs.dirs[i]
+			if updated, ok := plan.inodes[d.ino]; ok {
+				d.trieRoot = updated.DirTrieRoot
+				if orig, ok := fs.inodes[d.ino]; ok {
+					orig.DirTrieRoot = updated.DirTrieRoot
+				}
 			}
 		}
 	}
 
 	// 5. Repair link counts.
-	if err := repairLinkCounts(fs, plan, blockSize); err != nil {
-		return fmt.Errorf("repair link counts: %w", err)
+	if opts.RepairLinks {
+		if err := repairLinkCounts(fs, plan, blockSize); err != nil {
+			return fmt.Errorf("repair link counts: %w", err)
+		}
 	}
 
 	// 6. Stage summary values for superblock and checkpoint.

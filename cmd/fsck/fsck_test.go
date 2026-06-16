@@ -275,7 +275,7 @@ func TestFsckRepairFragmentedFile(t *testing.T) {
 	}
 
 	// Run fsck in repair mode.
-	cmd = exec.Command(fsckPath, "--repair", imgPath)
+	cmd = exec.Command(fsckPath, "--repair", "-y", imgPath)
 	out, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fsck repair failed: %v\n%s", err, out)
@@ -432,7 +432,7 @@ func TestFsckRepairCompactDirectoryTrie(t *testing.T) {
 		t.Fatalf("close image: %v", err)
 	}
 
-	cmd = exec.Command(fsckPath, "--repair", imgPath)
+	cmd = exec.Command(fsckPath, "--repair", "-y", imgPath)
 	out, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fsck repair failed: %v\n%s", err, out)
@@ -608,7 +608,7 @@ func TestFsckRepairLinkCounts(t *testing.T) {
 		t.Fatalf("close image: %v", err)
 	}
 
-	cmd = exec.Command(fsckPath, "--repair", imgPath)
+	cmd = exec.Command(fsckPath, "--repair", "-y", imgPath)
 	out, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fsck repair failed: %v\n%s", err, out)
@@ -856,7 +856,7 @@ func TestFsckRepairCombinedFragmentation(t *testing.T) {
 	}
 
 	// Run fsck in repair mode.
-	cmd = exec.Command(fsckPath, "--repair", imgPath)
+	cmd = exec.Command(fsckPath, "--repair", "-y", imgPath)
 	out, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fsck repair failed: %v\n%s", err, out)
@@ -951,5 +951,460 @@ func TestFsckRepairCombinedFragmentation(t *testing.T) {
 	}
 	if dir.Nlinks != 2 {
 		t.Errorf("subdir nlinks: want 2, got %d", dir.Nlinks)
+	}
+}
+
+// writeCombinedFixture creates a 5000-block image with a fragmented file, a
+// hand-built two-entry root directory trie, and an empty subdirectory trie. If
+// corruptNlinks is true, the link counts on the file, subdirectory, and root
+// directory are set to incorrect values.
+func writeCombinedFixture(t *testing.T, mkfsPath, imgPath string, corruptNlinks bool) {
+	const (
+		rootTrieBlock   = uint64(90)
+		subdirTrieBlock = uint64(91)
+		fileIno         = uint64(2)
+		dirIno          = uint64(3)
+		dataStartAbs    = uint64(100)
+		chainBlockAbs   = uint64(110)
+	)
+
+	cmd := exec.Command(mkfsPath, "-s", "5000", imgPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("mkfs failed: %v\n%s", err, out)
+	}
+
+	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open image: %v", err)
+	}
+	defer f.Close()
+
+	fileInode := &types.Inode{
+		InodeNumber:      fileIno,
+		Magic:            types.MagicInode,
+		Filemode:         types.ModeFile | 0644,
+		FileSize:         9 * 4096,
+		Nlinks:           1,
+		NumExtentsInline: 8,
+		NumExtentsTotal:  9,
+		ExtentInlineBase: chainBlockAbs,
+	}
+	var inlineExtents [8]types.Extent
+	for i := 0; i < 8; i++ {
+		inlineExtents[i] = types.Extent{Offset: uint64(i), Phys: dataStartAbs + uint64(i), Len: 1, Flags: 0, Pad: 0}
+	}
+	fileInode.SetInlineExtents(inlineExtents)
+	if corruptNlinks {
+		fileInode.Nlinks = 0
+	}
+	if err := fileInode.WriteAt(f, 5*4096+512); err != nil {
+		t.Fatalf("write file inode: %v", err)
+	}
+
+	chainBuf := make([]byte, 4096)
+	binary.LittleEndian.PutUint64(chainBuf[0:], 0)
+	binary.LittleEndian.PutUint32(chainBuf[8:], 1)
+	binary.LittleEndian.PutUint32(chainBuf[12:], 0)
+	const extOff = types.ExtentChainHeaderSize
+	binary.LittleEndian.PutUint64(chainBuf[extOff:], 8)
+	binary.LittleEndian.PutUint64(chainBuf[extOff+8:], dataStartAbs+8)
+	binary.LittleEndian.PutUint64(chainBuf[extOff+16:], 1)
+	binary.LittleEndian.PutUint32(chainBuf[extOff+24:], 0)
+	binary.LittleEndian.PutUint32(chainBuf[extOff+28:], 0)
+	checksum := types.ComputeChainChecksum(chainBuf, 4096)
+	binary.LittleEndian.PutUint64(chainBuf[types.ExtentChainChecksumOffset:], checksum)
+	if _, err := f.WriteAt(chainBuf, int64(chainBlockAbs*4096)); err != nil {
+		t.Fatalf("write chain block: %v", err)
+	}
+
+	subdirInode := &types.Inode{
+		InodeNumber: dirIno,
+		Magic:       types.MagicInode,
+		Filemode:    types.ModeDir | 0755,
+		FileSize:    4096,
+		Nlinks:      2,
+		DirTrieRoot: types.TrieMakeRef(subdirTrieBlock, 0),
+		ParentInode: 1,
+	}
+	if corruptNlinks {
+		subdirInode.Nlinks = 1
+	}
+	if err := subdirInode.WriteAt(f, 5*4096+1024); err != nil {
+		t.Fatalf("write subdir inode: %v", err)
+	}
+
+	rootInodeBuf := make([]byte, 512)
+	if _, err := f.ReadAt(rootInodeBuf, 5*4096); err != nil {
+		t.Fatalf("read root inode: %v", err)
+	}
+	rootInode, err := types.UnmarshalInode(rootInodeBuf)
+	if err != nil {
+		t.Fatalf("unmarshal root inode: %v", err)
+	}
+	rootInode.Nlinks = 3
+	rootInode.DirTrieRoot = types.TrieMakeRef(rootTrieBlock, 0)
+	rootInode.ParentInode = 1
+	if corruptNlinks {
+		rootInode.Nlinks = 2
+	}
+	if err := rootInode.WriteAt(f, 5*4096); err != nil {
+		t.Fatalf("write root inode: %v", err)
+	}
+
+	const inodeL2Block = 4
+	inodeBM := make([]byte, 4096)
+	if _, err := f.ReadAt(inodeBM, int64(inodeL2Block*4096)); err != nil {
+		t.Fatalf("read inode bitmap: %v", err)
+	}
+	word := binary.LittleEndian.Uint64(inodeBM[0:])
+	word &^= 1 << 1
+	word &^= 1 << 2
+	binary.LittleEndian.PutUint64(inodeBM[0:], word)
+	if _, err := f.WriteAt(inodeBM, int64(inodeL2Block*4096)); err != nil {
+		t.Fatalf("write inode bitmap: %v", err)
+	}
+
+	rootPage := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(rootPage[0:], types.MagicTriePage)
+	binary.LittleEndian.PutUint32(rootPage[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint16(rootPage[8:], 3)
+	binary.LittleEndian.PutUint16(rootPage[10:], 0)
+	freeSlots := ^uint64(0)
+	freeSlots &^= 1 << 0
+	freeSlots &^= 1 << 1
+	freeSlots &^= 1 << 2
+	binary.LittleEndian.PutUint64(rootPage[12:], freeSlots)
+
+	const nameOffDir = uint16(5)
+	binary.LittleEndian.PutUint16(rootPage[4091:], uint16(len("dir")))
+	copy(rootPage[4093:], "dir")
+	const nameOffFile = uint16(11)
+	binary.LittleEndian.PutUint16(rootPage[4085:], uint16(len("file")))
+	copy(rootPage[4087:], "file")
+
+	leafFileRef := types.TrieMakeRef(rootTrieBlock, 1)
+	leafDirRef := types.TrieMakeRef(rootTrieBlock, 2)
+	writeTrieNode(rootPage, 0, leafFileRef, 0, 0, 0, 0, 0, types.NodeTypeInterm, 0, 0, 0, 2)
+	writeTrieNode(rootPage, 1, 0, leafDirRef, fileIno, uint16(len("file")), nameOffFile,
+		1, types.NodeTypeInterm|types.NodeStatusLeaf, 'f', 8, 0, 0)
+	writeTrieNode(rootPage, 2, 0, 0, dirIno, uint16(len("dir")), nameOffDir,
+		1, types.NodeTypeInterm|types.NodeStatusLeaf, 'd', 4, 0, 0)
+	if _, err := f.WriteAt(rootPage, int64(rootTrieBlock*4096)); err != nil {
+		t.Fatalf("write root trie page: %v", err)
+	}
+
+	subdirPage := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(subdirPage[0:], types.MagicTriePage)
+	binary.LittleEndian.PutUint32(subdirPage[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint16(subdirPage[8:], 1)
+	binary.LittleEndian.PutUint16(subdirPage[10:], 0)
+	binary.LittleEndian.PutUint64(subdirPage[12:], ^uint64(1))
+	writeTrieNode(subdirPage, 0, 0, 0, 0, 0, 0, 0, types.NodeTypeInterm, 0, 0, 0, 0)
+	if _, err := f.WriteAt(subdirPage, int64(subdirTrieBlock*4096)); err != nil {
+		t.Fatalf("write subdir trie page: %v", err)
+	}
+
+	dataL2 := make([]byte, 4096)
+	if _, err := f.ReadAt(dataL2, 89*4096); err != nil {
+		t.Fatalf("read data L2 bitmap: %v", err)
+	}
+	l2Word := binary.LittleEndian.Uint64(dataL2[0:])
+	l2Word &^= 1 << 0
+	l2Word &^= 1 << 1
+	for b := uint64(10); b <= 18; b++ {
+		l2Word &^= 1 << b
+	}
+	l2Word &^= 1 << 20
+	binary.LittleEndian.PutUint64(dataL2[0:], l2Word)
+	if _, err := f.WriteAt(dataL2, 89*4096); err != nil {
+		t.Fatalf("write data L2 bitmap: %v", err)
+	}
+
+	if err := f.Close(); err != nil {
+		t.Fatalf("close image: %v", err)
+	}
+}
+
+// TestFsckRepairOnlyAllocator verifies that --repair-only=allocator rebuilds
+// the allocator and fixes free counts without compacting file extents or
+// directory tries.
+func TestFsckRepairOnlyAllocator(t *testing.T) {
+	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
+	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
+
+	imgPath := filepath.Join(t.TempDir(), "only-alloc.briefs")
+	writeCombinedFixture(t, mkfsPath, imgPath, false)
+
+	cmd := exec.Command(fsckPath, "--repair", "--repair-only=allocator", "-y", imgPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fsck repair failed: %v\n%s", err, out)
+	}
+	output := string(out)
+	if !contains(output, "Repair complete") {
+		t.Fatalf("fsck did not report repair complete:\n%s", output)
+	}
+	lines := splitLines(output)
+	postRepair := false
+	for _, line := range lines {
+		if contains(line, "Re-running verification pass") {
+			postRepair = true
+		}
+		if postRepair && contains(line, "ERROR") {
+			t.Fatalf("fsck repair left errors:\n%s", output)
+		}
+	}
+	if !contains(output, "FSCK COMPLETE: no errors found") {
+		t.Fatalf("fsck repair did not finish clean:\n%s", output)
+	}
+
+	f, err := os.OpenFile(imgPath, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("reopen image: %v", err)
+	}
+	defer f.Close()
+
+	buf := make([]byte, 512)
+	if _, err := f.ReadAt(buf, 5*4096+512); err != nil {
+		t.Fatalf("read file inode: %v", err)
+	}
+	file, err := types.UnmarshalInode(buf)
+	if err != nil {
+		t.Fatalf("unmarshal file inode: %v", err)
+	}
+	if file.NumExtentsTotal != 9 {
+		t.Errorf("file NumExtentsTotal: want 9 (still fragmented), got %d", file.NumExtentsTotal)
+	}
+	if file.ExtentInlineBase == 0 {
+		t.Errorf("file ExtentInlineBase: expected chain block still in use")
+	}
+}
+
+// TestFsckRepairOnlyExtents verifies that --repair-only=extents merges file
+// extents without rebuilding the allocator or compacting directory tries.
+func TestFsckRepairOnlyExtents(t *testing.T) {
+	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
+	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
+
+	imgPath := filepath.Join(t.TempDir(), "only-extents.briefs")
+	writeCombinedFixture(t, mkfsPath, imgPath, false)
+
+	cmd := exec.Command(fsckPath, "--repair", "--repair-only=extents", "-y", imgPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fsck repair failed: %v\n%s", err, out)
+	}
+	output := string(out)
+	if !contains(output, "Repair complete") {
+		t.Fatalf("fsck did not report repair complete:\n%s", output)
+	}
+	lines := splitLines(output)
+	postRepair := false
+	for _, line := range lines {
+		if contains(line, "Re-running verification pass") {
+			postRepair = true
+		}
+		if postRepair && contains(line, "ERROR") {
+			t.Fatalf("fsck repair left errors:\n%s", output)
+		}
+	}
+	if !contains(output, "FSCK COMPLETE: no errors found") {
+		t.Fatalf("fsck repair did not finish clean:\n%s", output)
+	}
+
+	f, err := os.OpenFile(imgPath, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("reopen image: %v", err)
+	}
+	defer f.Close()
+
+	buf := make([]byte, 512)
+	if _, err := f.ReadAt(buf, 5*4096+512); err != nil {
+		t.Fatalf("read file inode: %v", err)
+	}
+	file, err := types.UnmarshalInode(buf)
+	if err != nil {
+		t.Fatalf("unmarshal file inode: %v", err)
+	}
+	if file.NumExtentsTotal != 1 {
+		t.Errorf("file NumExtentsTotal: want 1 (merged), got %d", file.NumExtentsTotal)
+	}
+	if file.ExtentInlineBase != 0 {
+		t.Errorf("file ExtentInlineBase: want 0 (no chain block), got %d", file.ExtentInlineBase)
+	}
+
+	if _, err := f.ReadAt(buf, 5*4096); err != nil {
+		t.Fatalf("read root inode: %v", err)
+	}
+	root, err := types.UnmarshalInode(buf)
+	if err != nil {
+		t.Fatalf("unmarshal root inode: %v", err)
+	}
+	if root.DirTrieRoot == 0 {
+		t.Errorf("root DirTrieRoot was cleared unexpectedly")
+	}
+}
+
+// TestFsckRepairOnlyLinks verifies that --repair-only=links fixes incorrect
+// inode nlink values without compacting file extents or directory tries.
+func TestFsckRepairOnlyLinks(t *testing.T) {
+	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
+	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
+
+	imgPath := filepath.Join(t.TempDir(), "only-links.briefs")
+	writeCombinedFixture(t, mkfsPath, imgPath, true)
+
+	cmd := exec.Command(fsckPath, "--repair", "--repair-only=links", "-y", imgPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fsck repair failed: %v\n%s", err, out)
+	}
+	output := string(out)
+	if !contains(output, "Repair complete") {
+		t.Fatalf("fsck did not report repair complete:\n%s", output)
+	}
+	lines := splitLines(output)
+	postRepair := false
+	for _, line := range lines {
+		if contains(line, "Re-running verification pass") {
+			postRepair = true
+		}
+		if postRepair && contains(line, "ERROR") {
+			t.Fatalf("fsck repair left errors:\n%s", output)
+		}
+	}
+	if !contains(output, "FSCK COMPLETE: no errors found") {
+		t.Fatalf("fsck repair did not finish clean:\n%s", output)
+	}
+
+	f, err := os.OpenFile(imgPath, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("reopen image: %v", err)
+	}
+	defer f.Close()
+
+	buf := make([]byte, 512)
+	if _, err := f.ReadAt(buf, 5*4096+512); err != nil {
+		t.Fatalf("read file inode: %v", err)
+	}
+	file, err := types.UnmarshalInode(buf)
+	if err != nil {
+		t.Fatalf("unmarshal file inode: %v", err)
+	}
+	if file.Nlinks != 1 {
+		t.Errorf("file Nlinks: want 1, got %d", file.Nlinks)
+	}
+	if file.NumExtentsTotal != 9 {
+		t.Errorf("file NumExtentsTotal: want 9 (still fragmented), got %d", file.NumExtentsTotal)
+	}
+	if file.ExtentInlineBase == 0 {
+		t.Errorf("file ExtentInlineBase: expected chain block still in use")
+	}
+
+	if _, err := f.ReadAt(buf, 5*4096+1024); err != nil {
+		t.Fatalf("read subdir inode: %v", err)
+	}
+	subdir, err := types.UnmarshalInode(buf)
+	if err != nil {
+		t.Fatalf("unmarshal subdir inode: %v", err)
+	}
+	if subdir.Nlinks != 2 {
+		t.Errorf("subdir Nlinks: want 2, got %d", subdir.Nlinks)
+	}
+
+	if _, err := f.ReadAt(buf, 5*4096); err != nil {
+		t.Fatalf("read root inode: %v", err)
+	}
+	root, err := types.UnmarshalInode(buf)
+	if err != nil {
+		t.Fatalf("unmarshal root inode: %v", err)
+	}
+	if root.Nlinks != 3 {
+		t.Errorf("root Nlinks: want 3, got %d", root.Nlinks)
+	}
+	if root.DirTrieRoot == 0 {
+		t.Errorf("root DirTrieRoot was cleared unexpectedly")
+	}
+}
+
+// TestFsckOptimize verifies that --optimize runs trie and extent compaction
+// without link-count repair.
+func TestFsckOptimize(t *testing.T) {
+	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
+	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
+
+	imgPath := filepath.Join(t.TempDir(), "optimize.briefs")
+	writeCombinedFixture(t, mkfsPath, imgPath, false)
+
+	cmd := exec.Command(fsckPath, "--optimize", "-y", imgPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fsck optimize failed: %v\n%s", err, out)
+	}
+	output := string(out)
+	if !contains(output, "Repair complete") {
+		t.Fatalf("fsck did not report repair complete:\n%s", output)
+	}
+	lines := splitLines(output)
+	postRepair := false
+	for _, line := range lines {
+		if contains(line, "Re-running verification pass") {
+			postRepair = true
+		}
+		if postRepair && contains(line, "ERROR") {
+			t.Fatalf("fsck optimize left errors:\n%s", output)
+		}
+	}
+	if !contains(output, "FSCK COMPLETE: no errors found") {
+		t.Fatalf("fsck optimize did not finish clean:\n%s", output)
+	}
+
+	f, err := os.OpenFile(imgPath, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("reopen image: %v", err)
+	}
+	defer f.Close()
+
+	buf := make([]byte, 512)
+	if _, err := f.ReadAt(buf, 5*4096+512); err != nil {
+		t.Fatalf("read file inode: %v", err)
+	}
+	file, err := types.UnmarshalInode(buf)
+	if err != nil {
+		t.Fatalf("unmarshal file inode: %v", err)
+	}
+	if file.NumExtentsTotal != 1 {
+		t.Errorf("file NumExtentsTotal: want 1, got %d", file.NumExtentsTotal)
+	}
+	if file.ExtentInlineBase != 0 {
+		t.Errorf("file ExtentInlineBase: want 0, got %d", file.ExtentInlineBase)
+	}
+	inline := file.InlineExtents()
+	if inline[0].Len != 9 {
+		t.Errorf("file inline extent length: want 9, got %d", inline[0].Len)
+	}
+}
+
+// TestFsckRepairOnlyInvalid verifies that an unknown --repair-only value is
+// rejected before any disk modifications.
+func TestFsckRepairOnlyInvalid(t *testing.T) {
+	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
+	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
+
+	imgPath := filepath.Join(t.TempDir(), "invalid.briefs")
+	cmd := exec.Command(mkfsPath, "-s", "5000", imgPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("mkfs failed: %v\n%s", err, out)
+	}
+
+	cmd = exec.Command(fsckPath, "--repair-only=foo", imgPath)
+	out, err = cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("fsck should have failed with invalid repair-only value")
+	}
+	if !contains(string(out), "unknown repair phase") {
+		t.Fatalf("fsck did not report unknown repair phase:\n%s", out)
 	}
 }
