@@ -138,6 +138,35 @@ func splitLines(s string) []string {
 	return lines
 }
 
+// writeTrieNode serializes a single trie node slot into a page buffer.
+// The caller is responsible for page-level fields (magic, live_count, free_slots).
+func writeTrieNode(buf []byte, slot uint, firstChild, nextSibling, inode uint64,
+	nameLen, nameOffset uint16, depth, nodeType, byteVal, fType uint8,
+	flags, childCount uint16) {
+	off := 20 + uint64(slot)*36
+	binary.LittleEndian.PutUint64(buf[off+0:], firstChild)
+	binary.LittleEndian.PutUint64(buf[off+8:], nextSibling)
+	binary.LittleEndian.PutUint64(buf[off+16:], inode)
+	binary.LittleEndian.PutUint16(buf[off+24:], nameLen)
+	binary.LittleEndian.PutUint16(buf[off+26:], nameOffset)
+	buf[off+28] = depth
+	buf[off+29] = nodeType
+	buf[off+30] = byteVal
+	buf[off+31] = fType
+	binary.LittleEndian.PutUint16(buf[off+32:], flags)
+	binary.LittleEndian.PutUint16(buf[off+34:], childCount)
+}
+
+// writeTrieName stores a name in the trailing region of a trie page and returns
+// the name_offset (distance from the end of the block to the length prefix).
+func writeTrieName(buf []byte, blockSize int, name string) uint16 {
+	needed := uint16(2 + len(name))
+	start := blockSize - int(needed)
+	binary.LittleEndian.PutUint16(buf[start:], uint16(len(name)))
+	copy(buf[start+2:], name)
+	return needed
+}
+
 // TestFsckRepairFragmentedFile creates a file with nine single-block extents
 // (so it must use chain blocks), then runs fsck --repair and verifies the
 // extents are merged into one inline extent and the file still passes fsck.
@@ -155,7 +184,7 @@ func TestFsckRepairFragmentedFile(t *testing.T) {
 	// Poke a fragmented file inode directly into the inode table.
 	// File inode 2 at inode table slot 1 (block 5, byte offset 512).
 	// Data region starts at TrieNodePoolStart + TrieNodePoolSize. For a 5000-block
-	// image that is block 93. We use a chain block at absolute block 110 and data
+	// image that is block 90. We use a chain block at absolute block 110 and data
 	// blocks 100..108 for the file content.
 	const (
 		chainBlockAbs = uint64(110)
@@ -301,5 +330,134 @@ func TestFsckRepairFragmentedFile(t *testing.T) {
 	if inline[0].Offset != 0 || inline[0].Phys != dataStartAbs || inline[0].Len != 9 {
 		t.Errorf("extent: want {0,%d,9}, got {%d,%d,%d}",
 			dataStartAbs, inline[0].Offset, inline[0].Phys, inline[0].Len)
+	}
+}
+
+// TestFsckRepairCompactDirectoryTrie builds a deliberately fragmented root
+// directory trie that spans two pages for a single entry, then runs
+// fsck --repair and verifies the entry is preserved and the filesystem ends
+// clean.
+func TestFsckRepairCompactDirectoryTrie(t *testing.T) {
+	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
+	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
+
+	imgPath := filepath.Join(t.TempDir(), "dir.briefs")
+	cmd := exec.Command(mkfsPath, "-s", "5000", imgPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("mkfs failed: %v\n%s", err, out)
+	}
+
+	const (
+		rootTrieBlock  = uint64(90)
+		extraTrieBlock = uint64(91)
+		targetIno      = uint64(2)
+	)
+
+	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open image: %v", err)
+	}
+	defer f.Close()
+
+	// Write inode 2 as a plain empty file so the directory entry is valid.
+	inode := &types.Inode{
+		InodeNumber: targetIno,
+		Magic:       types.MagicInode,
+		Filemode:    types.ModeFile | 0644,
+		FileSize:    0,
+		Nlinks:      1,
+	}
+	if err := inode.WriteAt(f, 5*4096+512); err != nil {
+		t.Fatalf("write target inode: %v", err)
+	}
+
+	// Mark inode 2 allocated in the inode bitmap. For a 640-inode bitmap the
+	// L2 words are at block 4 (inode bitmap offset 1 + header block + L0 + L1).
+	const inodeL2Block = 4
+	inodeBM := make([]byte, 4096)
+	if _, err := f.ReadAt(inodeBM, int64(inodeL2Block*4096)); err != nil {
+		t.Fatalf("read inode bitmap: %v", err)
+	}
+	word := binary.LittleEndian.Uint64(inodeBM[0:])
+	word &^= 1 << 1 // clear bit 1 = mark inode 2 allocated
+	binary.LittleEndian.PutUint64(inodeBM[0:], word)
+	if _, err := f.WriteAt(inodeBM, int64(inodeL2Block*4096)); err != nil {
+		t.Fatalf("write inode bitmap: %v", err)
+	}
+
+	// Build a two-page trie for the root directory. Page one holds only the
+	// root node; page two holds the leaf for "test". This is valid but
+	// fragmented, so repair should compact it into a single page.
+	rootPage := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(rootPage[0:], types.MagicTriePage)
+	binary.LittleEndian.PutUint32(rootPage[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint16(rootPage[8:], 1) // live_count
+	binary.LittleEndian.PutUint16(rootPage[10:], 0)
+	binary.LittleEndian.PutUint64(rootPage[12:], ^uint64(1)) // slot 0 used
+	leafRef := types.TrieMakeRef(extraTrieBlock, 0)
+	writeTrieNode(rootPage, 0, leafRef, 0, 0, 0, 0, 0, types.NodeTypeInterm, 0, 0, 0, 1)
+	if _, err := f.WriteAt(rootPage, int64(rootTrieBlock*4096)); err != nil {
+		t.Fatalf("write root trie page: %v", err)
+	}
+
+	leafPage := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(leafPage[0:], types.MagicTriePage)
+	binary.LittleEndian.PutUint32(leafPage[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint16(leafPage[8:], 1) // live_count
+	binary.LittleEndian.PutUint16(leafPage[10:], 0)
+	binary.LittleEndian.PutUint64(leafPage[12:], ^uint64(1)) // slot 0 used
+	nameOff := writeTrieName(leafPage, 4096, "test")
+	writeTrieNode(leafPage, 0, 0, 0, targetIno, uint16(len("test")), nameOff,
+		uint8(len("test")), types.NodeTypeInterm|types.NodeStatusLeaf, 't', 8, 0, 0)
+	if _, err := f.WriteAt(leafPage, int64(extraTrieBlock*4096)); err != nil {
+		t.Fatalf("write leaf trie page: %v", err)
+	}
+
+	// Mark the extra trie block allocated in the data allocator. The data
+	// region starts at block 93; block 94 is data-relative 1. The L2 bitmap is
+	// at block 89.
+	dataL2 := make([]byte, 4096)
+	if _, err := f.ReadAt(dataL2, 89*4096); err != nil {
+		t.Fatalf("read data L2 bitmap: %v", err)
+	}
+	l2Word := binary.LittleEndian.Uint64(dataL2[0:])
+	l2Word &^= 1 << 1 // mark data-relative block 1 (absolute 94) allocated
+	binary.LittleEndian.PutUint64(dataL2[0:], l2Word)
+	if _, err := f.WriteAt(dataL2, 89*4096); err != nil {
+		t.Fatalf("write data L2 bitmap: %v", err)
+	}
+
+	if err := f.Close(); err != nil {
+		t.Fatalf("close image: %v", err)
+	}
+
+	cmd = exec.Command(fsckPath, "--repair", imgPath)
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fsck repair failed: %v\n%s", err, out)
+	}
+	output := string(out)
+	if !contains(output, "Repair complete") {
+		t.Fatalf("fsck did not report repair complete:\n%s", output)
+	}
+	if !contains(output, "total entries found: 1") {
+		t.Fatalf("directory entry was not preserved (expected 1 entry):\n%s", output)
+	}
+	// The fixture intentionally does not update allocator header/summary levels,
+	// so the initial verification pass reports bitmap/header mismatches. Those
+	// are repaired. Only the post-repair verification pass must be error-free.
+	lines := splitLines(output)
+	postRepair := false
+	for _, line := range lines {
+		if contains(line, "Re-running verification pass") {
+			postRepair = true
+		}
+		if postRepair && contains(line, "ERROR") {
+			t.Fatalf("fsck repair left errors:\n%s", output)
+		}
+	}
+	if !contains(output, "FSCK COMPLETE: no errors found") {
+		t.Fatalf("fsck repair did not finish clean:\n%s", output)
 	}
 }
