@@ -76,6 +76,11 @@ func main() {
 				Value:    "BRIEFS",
 				Usage:    "filesystem label",
 			},
+			&cli.IntFlag{
+				Name:     "inode-ratio",
+				Value:    8,
+				Usage:    "blocks per inode (one inode per N blocks)",
+			},
 		},
 		Action: func(c *cli.Context) error {
 			path := c.Args().First()
@@ -84,6 +89,7 @@ func main() {
 			inodeSize := uint64(c.Int("inode-size"))
 			journalBlocks := uint64(c.Int("journal-size"))
 			label := c.String("label")
+			inodeRatio := c.Int("inode-ratio")
 
 			// Validate that blockSize and inodeSize are powers of
 			// two.
@@ -92,6 +98,9 @@ func main() {
 			}
 			if !isPowerOfTwo(inodeSize) {
 				return fmt.Errorf("inode-size must be a power of two, which %d isn't", inodeSize)
+			}
+			if inodeRatio < 1 {
+				return fmt.Errorf("inode-ratio must be at least 1, which %d isn't", inodeRatio)
 			}
 
 			// Probe device if no explicit size given
@@ -119,7 +128,7 @@ func main() {
 			// The legacy flat data bitmap is no longer used; the 3-level allocator
 			// pyramid in the trie pool tracks all data blocks.
 
-			estInodes := uint64(totalBlocks) / 16
+			estInodes := uint64(totalBlocks) / uint64(inodeRatio)
 			if estInodes < 100 {
 				estInodes = 100
 			}
@@ -370,7 +379,7 @@ func main() {
 			// --- Report ---
 			fmt.Fprintf(os.Stderr, "Created filesystem: %s (%d blocks × %d bytes)\n",
 				path, totalBlocks, blockSize)
-			fmt.Fprintf(os.Stderr, "  inodes:       %d\n", estInodes)
+			fmt.Fprintf(os.Stderr, "  inodes:       %d (ratio 1 inode per %d blocks)\n", estInodes, inodeRatio)
 			fmt.Fprintf(os.Stderr, "  journal:      %d blocks at %d\n", journalBlocks, journalOffset)
 			fmt.Fprintf(os.Stderr, "  data blocks:  %d (blocks %d..%d, %d free)\n",
 				finalDataBlocks, dataRegionStart, journalOffset-1, finalDataBlocks-1)
