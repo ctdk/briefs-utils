@@ -1781,17 +1781,35 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int) error {
 		return fmt.Errorf("compact directory tries: %w", err)
 	}
 
-	// 5. Stage summary values for superblock and checkpoint.
+	// Directory inodes may have received a new trie root during compaction.
+	// Keep the in-memory state in sync so the remaining repair steps walk the
+	// current on-disk tries.
+	for i := range fs.dirs {
+		d := &fs.dirs[i]
+		if updated, ok := plan.inodes[d.ino]; ok {
+			d.trieRoot = updated.DirTrieRoot
+			if orig, ok := fs.inodes[d.ino]; ok {
+				orig.DirTrieRoot = updated.DirTrieRoot
+			}
+		}
+	}
+
+	// 5. Repair link counts.
+	if err := repairLinkCounts(fs, plan, blockSize); err != nil {
+		return fmt.Errorf("repair link counts: %w", err)
+	}
+
+	// 6. Stage summary values for superblock and checkpoint.
 	plan.freeDataBlks = plan.dataAlloc.FreeCount
 	plan.freeInodes = plan.inodeAlloc.FreeCount
 	plan.checkpointSeq = fs.sb.CheckpointSeq + 1
 
-	// 6. Write modified inodes back to the inode table.
+	// 7. Write modified inodes back to the inode table.
 	if err := writeModifiedInodes(fs.file, fs.sb, plan, blockSize); err != nil {
 		return fmt.Errorf("write modified inodes: %w", err)
 	}
 
-	// 7. Write allocators.
+	// 8. Write allocators.
 	if err := writeAllocator(fs.file, fs.sb.InodeBMOffset, blockSize, plan.inodeAlloc); err != nil {
 		return fmt.Errorf("write inode allocator: %w", err)
 	}
@@ -1799,7 +1817,7 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int) error {
 		return fmt.Errorf("write data allocator: %w", err)
 	}
 
-	// 8. Write superblock with corrected free counts.
+	// 9. Write superblock with corrected free counts.
 	fs.sb.FreeDataBlks = plan.freeDataBlks
 	fs.sb.FreeInodes = plan.freeInodes
 	fs.sb.CheckpointSeq = plan.checkpointSeq
@@ -1809,7 +1827,7 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int) error {
 		return fmt.Errorf("write superblock: %w", err)
 	}
 
-	// 9. Write fresh checkpoint block.
+	// 10. Write fresh checkpoint block.
 	if err := writeCheckpoint(fs.file, fs.sb, blockSize, plan); err != nil {
 		return fmt.Errorf("write checkpoint: %w", err)
 	}
@@ -2628,6 +2646,53 @@ func writeCompactTriePages(file *os.File, pages []*compactTriePage, blockSize ui
 
 		if _, err := file.WriteAt(buf, int64(p.Block*blockSize)); err != nil {
 			return fmt.Errorf("write trie page %d: %w", p.Block, err)
+		}
+	}
+	return nil
+}
+
+// repairLinkCounts recomputes and fixes inode nlink values. Files and symlinks
+// should have nlinks equal to the number of directory entries that reference them;
+// directories should have nlinks equal to 2 (for . and ..) plus the number of
+// subdirectories they contain.
+func repairLinkCounts(fs *fsckState, plan *repairPlan, blockSize uint64) error {
+	// Count how many subdirectory entries each directory contains.
+	subdirCount := make(map[uint64]int)
+	for _, d := range fs.dirs {
+		entries, err := collectDirectoryEntries(fs, d.ino, d.trieRoot, blockSize)
+		if err != nil {
+			return fmt.Errorf("ino %d: collect directory entries: %w", d.ino, err)
+		}
+		for _, e := range entries {
+			target, ok := fs.inodes[e.Inode]
+			if !ok {
+				continue
+			}
+			if target.IsDir() {
+				subdirCount[d.ino]++
+			}
+		}
+	}
+
+	for ino, in := range fs.inodes {
+		var expected uint32
+		switch {
+		case in.IsDir():
+			expected = uint32(2 + subdirCount[ino])
+		case in.IsFile() || in.IsSymlink():
+			expected = uint32(fs.entryCounts[ino])
+		default:
+			continue
+		}
+
+		if in.Nlinks != expected {
+			clone, ok := plan.inodes[ino]
+			if !ok {
+				c := *in
+				clone = &c
+			}
+			clone.Nlinks = expected
+			plan.inodes[ino] = clone
 		}
 	}
 	return nil
