@@ -296,3 +296,36 @@ func TestReadAllocatorHeaderBadMagic(t *testing.T) {
 		t.Fatal("expected error for bad magic")
 	}
 }
+
+func TestAllocBuilderAllocateBlock(t *testing.T) {
+	b := NewAllocBuilder(1000)
+	b.MarkAllocated(0)
+
+	rel, err := b.AllocateBlock()
+	if err != nil {
+		t.Fatalf("AllocateBlock: %v", err)
+	}
+	if rel == 0 {
+		t.Fatalf("AllocateBlock returned 0, but block 0 was already allocated")
+	}
+	if b.FreeCount != 998 {
+		t.Errorf("FreeCount after AllocateBlock: want 998, got %d", b.FreeCount)
+	}
+
+	// The allocated block should be marked allocated.
+	w2 := rel / 64
+	b2 := rel % 64
+	if b.L2[w2]&(1<<b2) != 0 {
+		t.Errorf("block %d should be marked allocated", rel)
+	}
+
+	// Exhaust the allocator.
+	for b.FreeCount > 0 {
+		if _, err := b.AllocateBlock(); err != nil {
+			t.Fatalf("AllocateBlock during exhaustion: %v", err)
+		}
+	}
+	if _, err := b.AllocateBlock(); err == nil {
+		t.Fatal("expected error when allocator is exhausted")
+	}
+}

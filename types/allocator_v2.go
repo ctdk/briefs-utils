@@ -17,6 +17,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/bits"
 )
 
 // AllocMagic is the magic number for the allocator pool header block.
@@ -175,6 +176,51 @@ func (b *AllocBuilder) MarkFree(relBlock uint64) {
 			b.L0[w0] |= 1 << b0
 		}
 	}
+}
+
+// AllocateBlock finds a single free data-relative block and marks it allocated.
+// It returns the relative block number, or an error if no blocks are free.
+func (b *AllocBuilder) AllocateBlock() (uint64, error) {
+	if b.FreeCount == 0 {
+		return 0, fmt.Errorf("allocator has no free blocks")
+	}
+
+	for w0 := uint64(0); w0 < uint64(len(b.L0)); w0++ {
+		if b.L0[w0] == 0 {
+			continue
+		}
+		b0 := bits.TrailingZeros64(b.L0[w0])
+
+		w1 := w0*64 + uint64(b0)
+		if w1 >= uint64(len(b.L1)) {
+			continue
+		}
+		l1Word := b.L1[w1]
+		if l1Word == 0 {
+			continue
+		}
+		b1 := bits.TrailingZeros64(l1Word)
+
+		w2 := w1*64 + uint64(b1)
+		if w2 >= uint64(len(b.L2)) {
+			continue
+		}
+		l2Word := b.L2[w2]
+		if l2Word == 0 {
+			continue
+		}
+		b2 := bits.TrailingZeros64(l2Word)
+
+		block := w2*64 + uint64(b2)
+		if block >= b.BlockCount {
+			continue
+		}
+
+		b.MarkAllocated(block)
+		return block, nil
+	}
+
+	return 0, fmt.Errorf("allocator search exhausted despite free_count=%d", b.FreeCount)
 }
 
 // WriteBlocks packs the allocator into blocks. Returns one []byte per block.
