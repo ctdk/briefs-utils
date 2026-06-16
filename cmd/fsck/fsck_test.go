@@ -678,3 +678,278 @@ func TestFsckRepairLinkCounts(t *testing.T) {
 		t.Errorf("subdir nlinks: want 2, got %d", dir.Nlinks)
 	}
 }
+
+// TestFsckRepairCombinedFragmentation builds an image with several repair-worthy
+// problems at once: a fragmented file inside a directory, a fragmented directory
+// trie, and corrupted link counts. It then runs fsck --repair and verifies the
+// post-repair pass is clean, the file extents were merged, and the link counts
+// were recomputed.
+func TestFsckRepairCombinedFragmentation(t *testing.T) {
+	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
+	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
+
+	imgPath := filepath.Join(t.TempDir(), "combined.briefs")
+	cmd := exec.Command(mkfsPath, "-s", "5000", imgPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("mkfs failed: %v\n%s", err, out)
+	}
+
+	const (
+		rootTrieBlock   = uint64(90)
+		subdirTrieBlock = uint64(91)
+		fileIno         = uint64(2)
+		dirIno          = uint64(3)
+		dataStartAbs    = uint64(100)
+		chainBlockAbs   = uint64(110)
+	)
+
+	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open image: %v", err)
+	}
+	defer f.Close()
+
+	// File inode 2: fragmented across nine single-block extents (eight inline,
+	// ninth in a chain block), with a corrupted link count.
+	fileInode := &types.Inode{
+		InodeNumber:      fileIno,
+		Magic:            types.MagicInode,
+		Filemode:         types.ModeFile | 0644,
+		FileSize:         9 * 4096,
+		Nlinks:           0, // will be repaired to 1
+		NumExtentsInline: 8,
+		NumExtentsTotal:  9,
+		ExtentInlineBase: chainBlockAbs,
+	}
+	var inlineExtents [8]types.Extent
+	for i := 0; i < 8; i++ {
+		inlineExtents[i] = types.Extent{Offset: uint64(i), Phys: dataStartAbs + uint64(i), Len: 1, Flags: 0, Pad: 0}
+	}
+	fileInode.SetInlineExtents(inlineExtents)
+	if err := fileInode.WriteAt(f, 5*4096+512); err != nil {
+		t.Fatalf("write file inode: %v", err)
+	}
+
+	// Chain block holding the ninth extent.
+	chainBuf := make([]byte, 4096)
+	binary.LittleEndian.PutUint64(chainBuf[0:], 0) // next_overflow_block
+	binary.LittleEndian.PutUint32(chainBuf[8:], 1) // num_extents_in_block
+	binary.LittleEndian.PutUint32(chainBuf[12:], 0)
+	const extOff = types.ExtentChainHeaderSize
+	binary.LittleEndian.PutUint64(chainBuf[extOff:], 8)
+	binary.LittleEndian.PutUint64(chainBuf[extOff+8:], dataStartAbs+8)
+	binary.LittleEndian.PutUint64(chainBuf[extOff+16:], 1)
+	binary.LittleEndian.PutUint32(chainBuf[extOff+24:], 0)
+	binary.LittleEndian.PutUint32(chainBuf[extOff+28:], 0)
+	checksum := types.ComputeChainChecksum(chainBuf, 4096)
+	binary.LittleEndian.PutUint64(chainBuf[types.ExtentChainChecksumOffset:], checksum)
+	if _, err := f.WriteAt(chainBuf, int64(chainBlockAbs*4096)); err != nil {
+		t.Fatalf("write chain block: %v", err)
+	}
+
+	// Directory inode 3: empty directory with a corrupted link count.
+	subdirInode := &types.Inode{
+		InodeNumber: dirIno,
+		Magic:       types.MagicInode,
+		Filemode:    types.ModeDir | 0755,
+		FileSize:    4096,
+		Nlinks:      1, // will be repaired to 2
+		DirTrieRoot: types.TrieMakeRef(subdirTrieBlock, 0),
+		ParentInode: 1,
+	}
+	if err := subdirInode.WriteAt(f, 5*4096+1024); err != nil {
+		t.Fatalf("write subdir inode: %v", err)
+	}
+
+	// Root inode 1: points at a two-entry trie and has a corrupted link count.
+	rootInodeBuf := make([]byte, 512)
+	if _, err := f.ReadAt(rootInodeBuf, 5*4096); err != nil {
+		t.Fatalf("read root inode: %v", err)
+	}
+	rootInode, err := types.UnmarshalInode(rootInodeBuf)
+	if err != nil {
+		t.Fatalf("unmarshal root inode: %v", err)
+	}
+	rootInode.Nlinks = 2 // will be repaired to 3
+	rootInode.DirTrieRoot = types.TrieMakeRef(rootTrieBlock, 0)
+	rootInode.ParentInode = 1
+	if err := rootInode.WriteAt(f, 5*4096); err != nil {
+		t.Fatalf("write root inode: %v", err)
+	}
+
+	// Mark inodes 2 and 3 allocated in the inode bitmap L2 (block 4).
+	const inodeL2Block = 4
+	inodeBM := make([]byte, 4096)
+	if _, err := f.ReadAt(inodeBM, int64(inodeL2Block*4096)); err != nil {
+		t.Fatalf("read inode bitmap: %v", err)
+	}
+	word := binary.LittleEndian.Uint64(inodeBM[0:])
+	word &^= 1 << 1 // inode 2
+	word &^= 1 << 2 // inode 3
+	binary.LittleEndian.PutUint64(inodeBM[0:], word)
+	if _, err := f.WriteAt(inodeBM, int64(inodeL2Block*4096)); err != nil {
+		t.Fatalf("write inode bitmap: %v", err)
+	}
+
+	// Root trie page with two leaf children: "file" and "dir".
+	rootPage := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(rootPage[0:], types.MagicTriePage)
+	binary.LittleEndian.PutUint32(rootPage[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint16(rootPage[8:], 3) // live_count
+	binary.LittleEndian.PutUint16(rootPage[10:], 0)
+	freeSlots := ^uint64(0)
+	freeSlots &^= 1 << 0
+	freeSlots &^= 1 << 1
+	freeSlots &^= 1 << 2
+	binary.LittleEndian.PutUint64(rootPage[12:], freeSlots)
+
+	const nameOffDir = uint16(5)
+	binary.LittleEndian.PutUint16(rootPage[4091:], uint16(len("dir")))
+	copy(rootPage[4093:], "dir")
+	const nameOffFile = uint16(11)
+	binary.LittleEndian.PutUint16(rootPage[4085:], uint16(len("file")))
+	copy(rootPage[4087:], "file")
+
+	leafFileRef := types.TrieMakeRef(rootTrieBlock, 1)
+	leafDirRef := types.TrieMakeRef(rootTrieBlock, 2)
+	writeTrieNode(rootPage, 0, leafFileRef, 0, 0, 0, 0, 0, types.NodeTypeInterm, 0, 0, 0, 2)
+	writeTrieNode(rootPage, 1, 0, leafDirRef, fileIno, uint16(len("file")), nameOffFile,
+		1, types.NodeTypeInterm|types.NodeStatusLeaf, 'f', 8, 0, 0)
+	writeTrieNode(rootPage, 2, 0, 0, dirIno, uint16(len("dir")), nameOffDir,
+		1, types.NodeTypeInterm|types.NodeStatusLeaf, 'd', 4, 0, 0)
+
+	if _, err := f.WriteAt(rootPage, int64(rootTrieBlock*4096)); err != nil {
+		t.Fatalf("write root trie page: %v", err)
+	}
+
+	// Empty subdirectory trie page.
+	subdirPage := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(subdirPage[0:], types.MagicTriePage)
+	binary.LittleEndian.PutUint32(subdirPage[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint16(subdirPage[8:], 1) // live_count
+	binary.LittleEndian.PutUint16(subdirPage[10:], 0)
+	binary.LittleEndian.PutUint64(subdirPage[12:], ^uint64(1)) // slot 0 used
+	writeTrieNode(subdirPage, 0, 0, 0, 0, 0, 0, 0, types.NodeTypeInterm, 0, 0, 0, 0)
+	if _, err := f.WriteAt(subdirPage, int64(subdirTrieBlock*4096)); err != nil {
+		t.Fatalf("write subdir trie page: %v", err)
+	}
+
+	// Mark data blocks 90, 91, and 100..110 allocated in the data allocator L2.
+	dataL2 := make([]byte, 4096)
+	if _, err := f.ReadAt(dataL2, 89*4096); err != nil {
+		t.Fatalf("read data L2 bitmap: %v", err)
+	}
+	l2Word := binary.LittleEndian.Uint64(dataL2[0:])
+	l2Word &^= 1 << 0  // block 90 (root trie)
+	l2Word &^= 1 << 1  // block 91 (subdir trie)
+	for b := uint64(10); b <= 20; b++ {
+		l2Word &^= 1 << b // blocks 100..110 (file data + chain)
+	}
+	binary.LittleEndian.PutUint64(dataL2[0:], l2Word)
+	if _, err := f.WriteAt(dataL2, 89*4096); err != nil {
+		t.Fatalf("write data L2 bitmap: %v", err)
+	}
+
+	if err := f.Close(); err != nil {
+		t.Fatalf("close image: %v", err)
+	}
+
+	// Run fsck in repair mode.
+	cmd = exec.Command(fsckPath, "--repair", imgPath)
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fsck repair failed: %v\n%s", err, out)
+	}
+	output := string(out)
+	if !contains(output, "Repair complete") {
+		t.Fatalf("fsck did not report repair complete:\n%s", output)
+	}
+	if !contains(output, "total entries found: 2") {
+		t.Fatalf("directory entries were not preserved (expected 2):\n%s", output)
+	}
+
+	// The post-repair verification pass must be completely clean.
+	lines := splitLines(output)
+	postRepair := false
+	for _, line := range lines {
+		if contains(line, "Re-running verification pass") {
+			postRepair = true
+		}
+		if postRepair && contains(line, "ERROR") {
+			t.Fatalf("fsck repair left errors:\n%s", output)
+		}
+	}
+	if !contains(output, "FSCK COMPLETE: no errors found") {
+		t.Fatalf("fsck repair did not finish clean:\n%s", output)
+	}
+
+	// Run a second, standalone fsck to verify the repaired image stays clean.
+	cmd = exec.Command(fsckPath, imgPath)
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("second fsck failed: %v\n%s", err, out)
+	}
+	second := string(out)
+	if contains(second, "ERROR") {
+		t.Fatalf("second fsck found errors:\n%s", second)
+	}
+	if !contains(second, "FSCK COMPLETE: no errors found") {
+		t.Fatalf("second fsck did not report clean:\n%s", second)
+	}
+
+	// Read repaired inodes back and verify the repairs.
+	f, err = os.OpenFile(imgPath, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("reopen image: %v", err)
+	}
+	defer f.Close()
+
+	buf := make([]byte, 512)
+	if _, err := f.ReadAt(buf, 5*4096); err != nil {
+		t.Fatalf("read repaired root inode: %v", err)
+	}
+	root, err := types.UnmarshalInode(buf)
+	if err != nil {
+		t.Fatalf("unmarshal root inode: %v", err)
+	}
+	if root.Nlinks != 3 {
+		t.Errorf("root nlinks: want 3, got %d", root.Nlinks)
+	}
+
+	if _, err := f.ReadAt(buf, 5*4096+512); err != nil {
+		t.Fatalf("read repaired file inode: %v", err)
+	}
+	file, err := types.UnmarshalInode(buf)
+	if err != nil {
+		t.Fatalf("unmarshal file inode: %v", err)
+	}
+	if file.Nlinks != 1 {
+		t.Errorf("file nlinks: want 1, got %d", file.Nlinks)
+	}
+	if file.NumExtentsTotal != 1 {
+		t.Errorf("file NumExtentsTotal: want 1, got %d", file.NumExtentsTotal)
+	}
+	if file.NumExtentsInline != 1 {
+		t.Errorf("file NumExtentsInline: want 1, got %d", file.NumExtentsInline)
+	}
+	if file.ExtentInlineBase != 0 {
+		t.Errorf("file ExtentInlineBase: want 0, got %d", file.ExtentInlineBase)
+	}
+	inline := file.InlineExtents()
+	if inline[0].Offset != 0 || inline[0].Phys != dataStartAbs || inline[0].Len != 9 {
+		t.Errorf("file extent: want {0,%d,9}, got {%d,%d,%d}",
+			dataStartAbs, inline[0].Offset, inline[0].Phys, inline[0].Len)
+	}
+
+	if _, err := f.ReadAt(buf, 5*4096+1024); err != nil {
+		t.Fatalf("read repaired subdir inode: %v", err)
+	}
+	dir, err := types.UnmarshalInode(buf)
+	if err != nil {
+		t.Fatalf("unmarshal subdir inode: %v", err)
+	}
+	if dir.Nlinks != 2 {
+		t.Errorf("subdir nlinks: want 2, got %d", dir.Nlinks)
+	}
+}
