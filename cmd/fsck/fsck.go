@@ -26,6 +26,24 @@ type fsckState struct {
 	entryCounts map[uint64]int          // ino -> number of directory entries referencing it
 	// Tracks directories where trie walk had structural errors (bad magic, etc.)
 	failedTrieDirs map[uint64]bool // ino -> true if trie walk had unrecoverable errors
+	// Set when the caller requested repair/optimization.
+	repair bool
+}
+
+// repairPlan holds the intended state after repair/optimization. All changes
+// are staged here before being written back to disk.
+type repairPlan struct {
+	// Allocator state rebuilt from the post-repair metadata.
+	dataAlloc  *types.AllocBuilder
+	inodeAlloc *types.AllocBuilder
+
+	// Inodes that have been modified and need to be written back.
+	inodes map[uint64]*types.Inode
+
+	// Allocator and superblock free counts derived from the plan.
+	freeDataBlks  uint64
+	freeInodes    uint64
+	checkpointSeq uint64
 }
 
 func (fs *fsckState) errorf(format string, args ...interface{}) {
@@ -1504,7 +1522,8 @@ func main() {
 			deviceSize := bd.Bytes()
 
 			fs := &fsckState{
-				file: file,
+				file:   file,
+				repair: repair,
 			}
 
 			fmt.Fprintf(os.Stderr, "BrieFS filesystem check, version %s\n", versionStr)
@@ -1562,102 +1581,39 @@ func main() {
 					sb.JournalOffset, sb.JournalBlocks, sb.TotalBlocks)
 			}
 
-			// 2. Allocator pools
-			fmt.Fprintf(os.Stderr, "\nInode bitmap:\n")
-			if err := verifyAllocatorPool(file, sb.InodeBMOffset, blockSize, "inode bitmap"); err != nil {
-				fs.errorf("%v", err)
-			}
+			totalInodes := runVerificationPass(fs, blockSize, sb.InodeSize)
 
-			fmt.Fprintf(os.Stderr, "\nData block allocator:\n")
-			if err := verifyAllocatorPool(file, sb.TrieNodePoolStart, blockSize, "data allocator"); err != nil {
-				fs.errorf("%v", err)
-			}
-
-			// Cross-check allocator free counts against superblock and scan bitmap pyramid
-			inodeL0w, inodeL1w, inodeL2w, inodeBlockCount, inodeAllocFree, err := readAllocatorHeader(file, sb.InodeBMOffset, blockSize)
-			if err != nil {
-				fs.errorf("read inode allocator header: %v", err)
-			} else {
-				if inodeAllocFree != sb.FreeInodes {
-					fs.errorf("inode free count mismatch: superblock says %d, allocator says %d",
-						sb.FreeInodes, inodeAllocFree)
+			// 7. Repair / optimization phase
+			if repair {
+				if fs.errors > 0 && len(fs.failedTrieDirs) > 0 {
+					fmt.Fprintf(os.Stderr, "Refusing repair: %d director(ies) have unrecoverable trie errors\n", len(fs.failedTrieDirs))
+					fmt.Fprintf(os.Stderr, "FSCK COMPLETE: %d error(s) found, repair skipped\n", fs.errors)
+					return nil
 				}
-				verifyAllocatorBitmap(fs, sb.InodeBMOffset, blockSize, inodeL0w, inodeL1w, inodeL2w, inodeBlockCount, inodeAllocFree, "inode")
-			}
-
-			dataL0w, dataL1w, dataL2w, dataBlockCount, dataAllocFree, err := readAllocatorHeader(file, sb.TrieNodePoolStart, blockSize)
-			if err != nil {
-				fs.errorf("read data allocator header: %v", err)
-			} else {
-				if dataAllocFree != sb.FreeDataBlks {
-					fs.errorf("data block free count mismatch: superblock says %d, allocator says %d",
-						sb.FreeDataBlks, dataAllocFree)
+				if sb.JournalLogStart != sb.JournalLogEnd {
+					fmt.Fprintf(os.Stderr, "Refusing repair: journal has un-replayed records\n")
+					fmt.Fprintf(os.Stderr, "FSCK COMPLETE: %d error(s) found, repair skipped\n", fs.errors)
+					return nil
 				}
-				verifyAllocatorBitmap(fs, sb.TrieNodePoolStart, blockSize, dataL0w, dataL1w, dataL2w, dataBlockCount, dataAllocFree, "data")
-			}
-
-			// 3. Inode table
-			inodeTableStart := sb.InodeTableOffset
-			var inodeTableBlocks uint64
-			{
-				// Read inode allocator header to get actual inode count
-				inodeHeader := make([]byte, blockSize)
-				if _, err := file.ReadAt(inodeHeader, int64(sb.InodeBMOffset*blockSize)); err != nil {
-					return fmt.Errorf("read inode allocator header: %w", err)
+				if err := runRepair(fs, blockSize, totalInodes); err != nil {
+					fmt.Fprintf(os.Stderr, "Repair failed: %v\n", err)
+					fmt.Fprintf(os.Stderr, "FSCK COMPLETE: %d error(s) found, repair failed\n", fs.errors)
+					return nil
 				}
-				numInodes := binary.LittleEndian.Uint64(inodeHeader[32:])
-				inodeTableBlocks = (numInodes*sb.InodeSize + blockSize - 1) / blockSize
-			}
-			fmt.Fprintf(os.Stderr, "\nInode table:\n")
-			fmt.Fprintf(os.Stderr, "  start block: %d\n", inodeTableStart)
-			fmt.Fprintf(os.Stderr, "  blocks:      %d\n", inodeTableBlocks)
-
-			totalInodes := verifyInodeTable(fs, inodeTableStart, inodeTableBlocks, blockSize, sb.InodeSize)
-			fmt.Fprintf(os.Stderr, "  inodes found: %d\n", totalInodes)
-
-			// 4. Journal
-			fmt.Fprintf(os.Stderr, "\nJournal:\n")
-			fmt.Fprintf(os.Stderr, "  start block: %d\n", sb.JournalOffset)
-			fmt.Fprintf(os.Stderr, "  blocks:      %d\n", sb.JournalBlocks)
-			fmt.Fprintf(os.Stderr, "  checkpoint:  %d\n", sb.CheckpointSeq)
-			if err := verifyJournal(file, sb.JournalOffset, sb.JournalBlocks, sb.CheckpointSeq, sb.JournalLogStart, sb.JournalLogEnd, blockSize); err != nil {
-				fs.warnf("journal check: %v", err)
-			} else {
-				fmt.Fprintf(os.Stderr, "  journal magic OK\n")
-			}
-			verifyJournalRecords(fs, sb.JournalOffset, sb.JournalBlocks, sb.JournalLogStart, sb.JournalLogEnd, blockSize)
-
-			// 5. Directory trie walk
-			fmt.Fprintf(os.Stderr, "\nDirectory tries:\n")
-			allEntries := verifyAllDirTries(fs, blockSize, fs.dirs)
-			fmt.Fprintf(os.Stderr, "  directories scanned: %d\n", len(fs.dirs))
-			fmt.Fprintf(os.Stderr, "  total entries found: %d\n", len(allEntries))
-			if len(fs.failedTrieDirs) > 0 {
-				fmt.Fprintf(os.Stderr, "  WARNING: %d director(ies) had unrecoverable trie errors:\n", len(fs.failedTrieDirs))
-				for ino := range fs.failedTrieDirs {
-					fmt.Fprintf(os.Stderr, "    ino %d\n", ino)
-				}
+				fmt.Fprintf(os.Stderr, "\nRepair complete. Re-running verification pass...\n")
+				fs.errors = 0
+				fs.inodes = make(map[uint64]*types.Inode)
+				fs.dirs = nil
+				fs.usedBlocks = make(map[uint64]bool)
+				fs.entryCounts = make(map[uint64]int)
+				fs.failedTrieDirs = make(map[uint64]bool)
+				runVerificationPass(fs, blockSize, sb.InodeSize)
 			}
 
-			// 6. Cross-referencing checks
-			fmt.Fprintf(os.Stderr, "\nCross-referencing:\n")
-			verifyInodeBitmapCrossReference(fs, blockSize, sb.InodeSize)
-			verifyBlockCrossReference(fs, blockSize)
-			verifySuperblockFreeCounts(fs, totalInodes)
-			verifyDirEntryCrossReference(fs, allEntries)
-			verifyDuplicateNames(fs, allEntries)
-			verifyLinkCounts(fs)
-			verifyOrphanedInodes(fs)
-			verifyExtentOverlaps(fs)
-			verifyReachability(fs, allEntries)
-
-			// 7. Summary
+			// 8. Summary
 			fmt.Fprintf(os.Stderr, "\n")
 			if fs.errors > 0 {
 				fmt.Fprintf(os.Stderr, "FSCK COMPLETE: %d error(s) found\n", fs.errors)
-				if repair {
-					fmt.Fprintf(os.Stderr, "Repair not yet implemented\n")
-				}
 			} else {
 				fmt.Fprintf(os.Stderr, "FSCK COMPLETE: no errors found\n")
 			}
@@ -1670,4 +1626,246 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// runVerificationPass runs the read-only checks and populates fsckState.
+// It is used both for the initial pass and for the post-repair verification.
+// It returns the number of inodes found, but callers typically only need the
+// side effects on fs.
+func runVerificationPass(fs *fsckState, blockSize, inodeSize uint64) int {
+	file := fs.file
+	sb := fs.sb
+
+	// 1. Superblock fields have already been read and validated.
+
+	// 2. Allocator pools
+	fmt.Fprintf(os.Stderr, "\nInode bitmap:\n")
+	if err := verifyAllocatorPool(file, sb.InodeBMOffset, blockSize, "inode bitmap"); err != nil {
+		fs.errorf("%v", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "\nData block allocator:\n")
+	if err := verifyAllocatorPool(file, sb.TrieNodePoolStart, blockSize, "data allocator"); err != nil {
+		fs.errorf("%v", err)
+	}
+
+	inodeL0w, inodeL1w, inodeL2w, inodeBlockCount, inodeAllocFree, err := readAllocatorHeader(file, sb.InodeBMOffset, blockSize)
+	if err != nil {
+		fs.errorf("read inode allocator header: %v", err)
+	} else {
+		if inodeAllocFree != sb.FreeInodes {
+			fs.errorf("inode free count mismatch: superblock says %d, allocator says %d",
+				sb.FreeInodes, inodeAllocFree)
+		}
+		verifyAllocatorBitmap(fs, sb.InodeBMOffset, blockSize, inodeL0w, inodeL1w, inodeL2w, inodeBlockCount, inodeAllocFree, "inode")
+	}
+
+	dataL0w, dataL1w, dataL2w, dataBlockCount, dataAllocFree, err := readAllocatorHeader(file, sb.TrieNodePoolStart, blockSize)
+	if err != nil {
+		fs.errorf("read data allocator header: %v", err)
+	} else {
+		if dataAllocFree != sb.FreeDataBlks {
+			fs.errorf("data block free count mismatch: superblock says %d, allocator says %d",
+				sb.FreeDataBlks, dataAllocFree)
+		}
+		verifyAllocatorBitmap(fs, sb.TrieNodePoolStart, blockSize, dataL0w, dataL1w, dataL2w, dataBlockCount, dataAllocFree, "data")
+	}
+
+	// 3. Inode table
+	inodeTableStart := sb.InodeTableOffset
+	var inodeTableBlocks uint64
+	{
+		inodeHeader := make([]byte, blockSize)
+		if _, err := file.ReadAt(inodeHeader, int64(sb.InodeBMOffset*blockSize)); err != nil {
+			fs.errorf("read inode allocator header: %v", err)
+		} else {
+			numInodes := binary.LittleEndian.Uint64(inodeHeader[32:])
+			inodeTableBlocks = (numInodes*sb.InodeSize + blockSize - 1) / blockSize
+		}
+	}
+	fmt.Fprintf(os.Stderr, "\nInode table:\n")
+	fmt.Fprintf(os.Stderr, "  start block: %d\n", inodeTableStart)
+	fmt.Fprintf(os.Stderr, "  blocks:      %d\n", inodeTableBlocks)
+
+	totalInodes := verifyInodeTable(fs, inodeTableStart, inodeTableBlocks, blockSize, inodeSize)
+	fmt.Fprintf(os.Stderr, "  inodes found: %d\n", totalInodes)
+
+	// 4. Journal
+	fmt.Fprintf(os.Stderr, "\nJournal:\n")
+	fmt.Fprintf(os.Stderr, "  start block: %d\n", sb.JournalOffset)
+	fmt.Fprintf(os.Stderr, "  blocks:      %d\n", sb.JournalBlocks)
+	fmt.Fprintf(os.Stderr, "  checkpoint:  %d\n", sb.CheckpointSeq)
+	if err := verifyJournal(file, sb.JournalOffset, sb.JournalBlocks, sb.CheckpointSeq, sb.JournalLogStart, sb.JournalLogEnd, blockSize); err != nil {
+		fs.warnf("journal check: %v", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "  journal magic OK\n")
+	}
+	verifyJournalRecords(fs, sb.JournalOffset, sb.JournalBlocks, sb.JournalLogStart, sb.JournalLogEnd, blockSize)
+
+	// 5. Directory trie walk
+	fmt.Fprintf(os.Stderr, "\nDirectory tries:\n")
+	allEntries := verifyAllDirTries(fs, blockSize, fs.dirs)
+	fmt.Fprintf(os.Stderr, "  directories scanned: %d\n", len(fs.dirs))
+	fmt.Fprintf(os.Stderr, "  total entries found: %d\n", len(allEntries))
+	if len(fs.failedTrieDirs) > 0 {
+		fmt.Fprintf(os.Stderr, "  WARNING: %d director(ies) had unrecoverable trie errors:\n", len(fs.failedTrieDirs))
+		for ino := range fs.failedTrieDirs {
+			fmt.Fprintf(os.Stderr, "    ino %d\n", ino)
+		}
+	}
+
+	// 6. Cross-referencing checks
+	fmt.Fprintf(os.Stderr, "\nCross-referencing:\n")
+	verifyInodeBitmapCrossReference(fs, blockSize, inodeSize)
+	verifyBlockCrossReference(fs, blockSize)
+	verifySuperblockFreeCounts(fs, totalInodes)
+	verifyDirEntryCrossReference(fs, allEntries)
+	verifyDuplicateNames(fs, allEntries)
+	verifyLinkCounts(fs)
+	verifyOrphanedInodes(fs)
+	verifyExtentOverlaps(fs)
+	verifyReachability(fs, allEntries)
+
+	return totalInodes
+}
+
+// runRepair rebuilds allocator state from the verified metadata and writes the
+// repaired allocator, superblock free counts, and a fresh checkpoint back to disk.
+// This covers Phase 2 of the fsck repair roadmap:
+//   - rebuild data/inode allocator bitmaps from the structures fsck found;
+//   - fix superblock free count mismatches;
+//   - free blocks that are allocated but not referenced (no failed trie walks).
+func runRepair(fs *fsckState, blockSize uint64, totalInodes int) error {
+	plan := &repairPlan{
+		inodes: make(map[uint64]*types.Inode),
+	}
+
+	// 1. Rebuild data allocator from the structures fsck found.
+	dataRegionStart := fs.sb.TrieNodePoolStart + fs.sb.TrieNodePoolSize
+	if dataRegionStart > fs.sb.TotalBlocks {
+		return fmt.Errorf("data region start %d exceeds total blocks %d", dataRegionStart, fs.sb.TotalBlocks)
+	}
+	dataBlockCount := fs.sb.TotalBlocks - dataRegionStart
+	if fs.sb.JournalOffset > dataRegionStart {
+		dataBlockCount = fs.sb.JournalOffset - dataRegionStart
+	}
+	plan.dataAlloc = types.NewAllocBuilder(dataBlockCount)
+
+	// Mark every block referenced by extents or trie pages as allocated.
+	for absBlk := range fs.usedBlocks {
+		if absBlk >= dataRegionStart && absBlk < dataRegionStart+dataBlockCount {
+			plan.dataAlloc.MarkAllocated(absBlk - dataRegionStart)
+		}
+	}
+
+	// 2. Rebuild inode allocator from the inode table scan.
+	inodeHeader, err := types.ReadAllocatorHeader(fs.file, fs.sb.InodeBMOffset, blockSize)
+	if err != nil {
+		return fmt.Errorf("read inode allocator header: %w", err)
+	}
+	plan.inodeAlloc = types.NewAllocBuilder(inodeHeader.BlockCount)
+	for ino := range fs.inodes {
+		if ino > 0 && ino <= inodeHeader.BlockCount {
+			plan.inodeAlloc.MarkAllocated(ino - 1)
+		}
+	}
+
+	// 3. Stage summary values for superblock and checkpoint.
+	plan.freeDataBlks = plan.dataAlloc.FreeCount
+	plan.freeInodes = plan.inodeAlloc.FreeCount
+	plan.checkpointSeq = fs.sb.CheckpointSeq + 1
+
+	// 4. Write allocators.
+	if err := writeAllocator(fs.file, fs.sb.InodeBMOffset, blockSize, plan.inodeAlloc); err != nil {
+		return fmt.Errorf("write inode allocator: %w", err)
+	}
+	if err := writeAllocator(fs.file, fs.sb.TrieNodePoolStart, blockSize, plan.dataAlloc); err != nil {
+		return fmt.Errorf("write data allocator: %w", err)
+	}
+
+	// 5. Write superblock with corrected free counts.
+	fs.sb.FreeDataBlks = plan.freeDataBlks
+	fs.sb.FreeInodes = plan.freeInodes
+	fs.sb.CheckpointSeq = plan.checkpointSeq
+	fs.sb.JournalLogStart = fs.sb.JournalOffset
+	fs.sb.JournalLogEnd = fs.sb.JournalOffset
+	if err := writeSuperblock(fs.file, fs.sb, blockSize); err != nil {
+		return fmt.Errorf("write superblock: %w", err)
+	}
+
+	// 6. Write fresh checkpoint block.
+	if err := writeCheckpoint(fs.file, fs.sb, blockSize, plan); err != nil {
+		return fmt.Errorf("write checkpoint: %w", err)
+	}
+
+	return nil
+}
+
+// writeAllocator writes a freshly built allocator pyramid to disk.
+func writeAllocator(file *os.File, poolBlock, blockSize uint64, alloc *types.AllocBuilder) error {
+	blocks := alloc.WriteBlocks()
+	for i, buf := range blocks {
+		off := int64((poolBlock + uint64(i)) * blockSize)
+		if len(buf) < int(blockSize) {
+			// WriteBlocks always returns full 4096-byte blocks; guard anyway.
+			padded := make([]byte, blockSize)
+			copy(padded, buf)
+			buf = padded
+		}
+		if _, err := file.WriteAt(buf, off); err != nil {
+			return fmt.Errorf("write allocator block %d at offset %d: %w", i, off, err)
+		}
+	}
+	return nil
+}
+
+// writeSuperblock writes the updated superblock to block 0.
+func writeSuperblock(file *os.File, sb *types.SuperblockLayout, blockSize uint64) error {
+	super := &types.Superblock{Lay: *sb}
+	buf := make([]byte, blockSize)
+	copy(buf, super.MarshalBinary())
+	if _, err := file.WriteAt(buf, 0); err != nil {
+		return fmt.Errorf("write superblock: %w", err)
+	}
+	return nil
+}
+
+// writeCheckpoint writes a fresh JRN_CHECKPOINT record to the last journal
+// block, clearing the active log range so the kernel sees a clean journal.
+func writeCheckpoint(file *os.File, sb *types.SuperblockLayout, blockSize uint64, plan *repairPlan) error {
+	checkpointBlock := sb.JournalOffset + sb.JournalBlocks - 1
+	buf := make([]byte, blockSize)
+
+	// Checkpoint block header (16 bytes)
+	binary.LittleEndian.PutUint32(buf[0:], types.MagicCheckpoint)
+	binary.LittleEndian.PutUint32(buf[4:], 0) // block_seq (unused by fsck)
+	binary.LittleEndian.PutUint32(buf[8:], 1) // record_count
+
+	// Record header at offset 16
+	const recOff = 16
+	binary.LittleEndian.PutUint32(buf[recOff:], uint32(types.JRN_CHECKPOINT))
+	binary.LittleEndian.PutUint32(buf[recOff+4:], 0) // flags
+	binary.LittleEndian.PutUint32(buf[recOff+8:], types.CheckpointSize)
+
+	cp := &types.Checkpoint{
+		Seq:            plan.checkpointSeq,
+		RecordCount:    1,
+		LogSequenceEnd: sb.JournalOffset,
+		TrieRootNode:   sb.TrieRootBlock,
+		FreeDataCount:  plan.freeDataBlks,
+		FreeInodeCount: plan.freeInodes,
+	}
+	cpData, err := cp.MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("marshal checkpoint: %w", err)
+	}
+	copy(buf[recOff+16:], cpData)
+
+	checksum := types.ComputeJournalRecordChecksum(uint32(types.JRN_CHECKPOINT), 0, cpData)
+	binary.LittleEndian.PutUint32(buf[recOff+12:], checksum)
+
+	if _, err := file.WriteAt(buf, int64(checkpointBlock*blockSize)); err != nil {
+		return fmt.Errorf("write checkpoint block %d: %w", checkpointBlock, err)
+	}
+	return nil
 }
