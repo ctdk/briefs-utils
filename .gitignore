@@ -1,9 +1,9 @@
 .*.sw?
 **/.*.sw?
-mkfs
-fsck
-mkfs.briefs
-fsck.briefs
-fuse.briefs
+/mkfs
+/fsck
+/mkfs.briefs
+/fsck.briefs
+/fuse.briefs
 *.exe
 .claude

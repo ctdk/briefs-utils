@@ -145,6 +145,14 @@ func main() {
 			// Compute final data blocks and exact allocator size (one pass).
 			// No flat data bitmap is written; the allocator pyramid lives in
 			// the trie pool region.
+			// Ensure there is enough room for superblock, inode bitmap, inode
+			// table, EAT, a one-block allocator, and the journal, plus at least
+			// one data block.
+			minBlocks := uint64(1) + inodeAllocBlocks + inodeTableBlocks + 1 + 1 + journalBlocks + 1
+			if uint64(totalBlocks) < minBlocks {
+				return fmt.Errorf("filesystem too small")
+			}
+
 			finalDataBlocks := uint64(totalBlocks) - 1 - inodeAllocBlocks - inodeTableBlocks - 1 - journalBlocks
 			builder := types.NewAllocBuilder(finalDataBlocks)
 			allocBlocks := builder.NbBlocks()
