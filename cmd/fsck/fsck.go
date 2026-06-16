@@ -1477,10 +1477,20 @@ func main() {
 		},
 		Action: func(c *cli.Context) error {
 			path := c.Args().First()
+			repair := c.Bool("repair")
 
-			file, err := os.Open(path)
-			if err != nil {
-				return fmt.Errorf("open device: %w", err)
+			var file *os.File
+			var err error
+			if repair {
+				file, err = os.OpenFile(path, os.O_RDWR, 0)
+				if err != nil {
+					return fmt.Errorf("open device read-write for repair: %w", err)
+				}
+			} else {
+				file, err = os.Open(path)
+				if err != nil {
+					return fmt.Errorf("open device: %w", err)
+				}
 			}
 			defer file.Close()
 
@@ -1645,7 +1655,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "\n")
 			if fs.errors > 0 {
 				fmt.Fprintf(os.Stderr, "FSCK COMPLETE: %d error(s) found\n", fs.errors)
-				if c.Bool("repair") {
+				if repair {
 					fmt.Fprintf(os.Stderr, "Repair not yet implemented\n")
 				}
 			} else {
