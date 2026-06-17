@@ -1,0 +1,313 @@
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"os"
+
+	"github.com/ctdk/briefs-utils/types"
+)
+
+// verifyAllocatorPool reads and prints the allocator pool header.
+func verifyAllocatorPool(file *os.File, poolBlock, blockSize uint64, label string) error {
+	hdr, err := types.ReadAllocatorHeader(file, poolBlock, blockSize)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "  %s: pool at block %d, %d entries, %d free\n", label, poolBlock, hdr.BlockCount, hdr.FreeCount)
+	fmt.Fprintf(os.Stderr, "    levels: L0=%d words, L1=%d words, L2=%d words\n", hdr.L0Words, hdr.L1Words, hdr.L2Words)
+
+	return nil
+}
+
+// readAllocatorHeader reads the allocator pool header and returns all fields.
+func readAllocatorHeader(file *os.File, poolBlock, blockSize uint64) (l0w, l1w, l2w, blockCount, freeCount uint64, err error) {
+	hdr, err := types.ReadAllocatorHeader(file, poolBlock, blockSize)
+	if err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+	return hdr.L0Words, hdr.L1Words, hdr.L2Words, hdr.BlockCount, hdr.FreeCount, nil
+}
+
+// verifyAllocatorBitmap reads and validates the full 3-level allocator bitmap.
+// It checks:
+//   - L0 bits correctly summarize L1 (a set L0 bit means at least one L1 word under it is non-zero)
+//   - L1 bits correctly summarize L2 (a set L1 bit means at least one L2 word under it is non-zero)
+//   - Trailing bits in the last L0/L1/L2 word are properly masked
+//   - Computed free count from L2 matches the header's free count
+func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize uint64, l0w, l1w, l2w, blockCount, headerFree uint64, label string) {
+	wordsPerBlock := blockSize / 8 // 512 u64 words per 4096-byte block
+
+	// Compute expected level sizes
+	expectedL2 := (blockCount + 63) / 64
+	expectedL1 := (expectedL2 + 63) / 64
+	expectedL0 := (expectedL1 + 63) / 64
+	if expectedL0 < 1 {
+		expectedL0 = 1
+	}
+	if expectedL1 < 1 {
+		expectedL1 = 1
+	}
+	if expectedL2 < 1 {
+		expectedL2 = 1
+	}
+
+	if l0w != expectedL0 {
+		fs.errorf("%s: L0 word count mismatch: header says %d, expected %d", label, l0w, expectedL0)
+	}
+	if l1w != expectedL1 {
+		fs.errorf("%s: L1 word count mismatch: header says %d, expected %d", label, l1w, expectedL1)
+	}
+	if l2w != expectedL2 {
+		fs.errorf("%s: L2 word count mismatch: header says %d, expected %d", label, l2w, expectedL2)
+	}
+
+	// Read all L0 words
+	l0Blocks := (l0w + wordsPerBlock - 1) / wordsPerBlock
+	l0 := make([]uint64, l0w)
+	for bi := uint64(0); bi < l0Blocks; bi++ {
+		buf := make([]byte, blockSize)
+		block := poolBlock + 1 + bi
+		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
+			fs.errorf("%s: read L0 block %d: %v", label, block, err)
+			return
+		}
+		start := bi * wordsPerBlock
+		for j := uint64(0); j < wordsPerBlock && start+j < l0w; j++ {
+			l0[start+j] = binary.LittleEndian.Uint64(buf[j*8:])
+		}
+	}
+
+	// Read all L1 words
+	l1Start := poolBlock + 1 + l0Blocks
+	l1Blocks := (l1w + wordsPerBlock - 1) / wordsPerBlock
+	l1 := make([]uint64, l1w)
+	for bi := uint64(0); bi < l1Blocks; bi++ {
+		buf := make([]byte, blockSize)
+		block := l1Start + bi
+		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
+			fs.errorf("%s: read L1 block %d: %v", label, block, err)
+			return
+		}
+		start := bi * wordsPerBlock
+		for j := uint64(0); j < wordsPerBlock && start+j < l1w; j++ {
+			l1[start+j] = binary.LittleEndian.Uint64(buf[j*8:])
+		}
+	}
+
+	// Read all L2 words
+	l2Start := l1Start + l1Blocks
+	l2Blocks := (l2w + wordsPerBlock - 1) / wordsPerBlock
+	l2 := make([]uint64, l2w)
+	for bi := uint64(0); bi < l2Blocks; bi++ {
+		buf := make([]byte, blockSize)
+		block := l2Start + bi
+		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
+			fs.errorf("%s: read L2 block %d: %v", label, block, err)
+			return
+		}
+		start := bi * wordsPerBlock
+		for j := uint64(0); j < wordsPerBlock && start+j < l2w; j++ {
+			l2[start+j] = binary.LittleEndian.Uint64(buf[j*8:])
+		}
+	}
+
+	// Verify trailing bits in last L2 word are properly masked
+	if tail := blockCount % 64; tail != 0 {
+		lastWord := l2[len(l2)-1]
+		mask := (uint64(1) << tail) - 1
+		if lastWord&^mask != 0 {
+			fs.errorf("%s: trailing bits set in last L2 word (0x%016X, mask 0x%016X)", label, lastWord, mask)
+		}
+	}
+
+	// Verify trailing bits in last L1 word
+	if tail := l2w % 64; tail != 0 {
+		lastWord := l1[len(l1)-1]
+		mask := (uint64(1) << tail) - 1
+		if lastWord&^mask != 0 {
+			fs.errorf("%s: trailing bits set in last L1 word (0x%016X, mask 0x%016X)", label, lastWord, mask)
+		}
+	}
+
+	// Verify trailing bits in last L0 word
+	if tail := l1w % 64; tail != 0 {
+		lastWord := l0[len(l0)-1]
+		mask := (uint64(1) << tail) - 1
+		if lastWord&^mask != 0 {
+			fs.errorf("%s: trailing bits set in last L0 word (0x%016X, mask 0x%016X)", label, lastWord, mask)
+		}
+	}
+
+	// Verify L1 -> L2 pyramid: for each L1 word, check its bits correctly
+	// summarize the corresponding L2 words.
+	l1Errors := 0
+	for i := uint64(0); i < l1w; i++ {
+		expected := uint64(0)
+		start := i * 64
+		for j := uint64(0); j < 64 && start+j < l2w; j++ {
+			if l2[start+j] != 0 {
+				expected |= 1 << j
+			}
+		}
+		if l1[i] != expected {
+			if l1Errors < 10 {
+				fs.errorf("%s: L1 word %d mismatch: on-disk 0x%016X, computed 0x%016X", label, i, l1[i], expected)
+			} else if l1Errors == 10 {
+				fs.errorf("%s: (more L1 errors suppressed)", label)
+			}
+			l1Errors++
+		}
+	}
+
+	// Verify L0 -> L1 pyramid
+	l0Errors := 0
+	for i := uint64(0); i < l0w; i++ {
+		expected := uint64(0)
+		start := i * 64
+		for j := uint64(0); j < 64 && start+j < l1w; j++ {
+			if l1[start+j] != 0 {
+				expected |= 1 << j
+			}
+		}
+		if l0[i] != expected {
+			if l0Errors < 10 {
+				fs.errorf("%s: L0 word %d mismatch: on-disk 0x%016X, computed 0x%016X", label, i, l0[i], expected)
+			} else if l0Errors == 10 {
+				fs.errorf("%s: (more L0 errors suppressed)", label)
+			}
+			l0Errors++
+		}
+	}
+
+	// Compute actual free count from L2 bitmap
+	computedFree := uint64(0)
+	for i := uint64(0); i < l2w; i++ {
+		computedFree += uint64(popcount64(l2[i]))
+	}
+
+	if computedFree != headerFree {
+		fs.errorf("%s: free count mismatch: header says %d, bitmap scan says %d", label, headerFree, computedFree)
+	}
+
+	if l1Errors > 0 || l0Errors > 0 {
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "  %s bitmap pyramid: consistent (%d L0, %d L1, %d L2 words, %d free)\n",
+		label, l0w, l1w, l2w, computedFree)
+}
+
+// popcount64 returns the number of set bits in a 64-bit word.
+func popcount64(x uint64) int {
+	// simple parallel popcount
+	x = x - ((x >> 1) & 0x5555555555555555)
+	x = (x & 0x3333333333333333) + ((x >> 2) & 0x3333333333333333)
+	x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0F
+	return int((x * 0x0101010101010101) >> 56)
+}
+
+// readAllocatorL2 reads the L2 bitmap words from an allocator pool.
+func readAllocatorL2(file *os.File, poolBlock, blockSize uint64) (l2 []uint64, l2w uint64, blockCount uint64, err error) {
+	_, _, l2, hdr, err := types.ReadAllocatorBitmap(file, poolBlock, blockSize)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	return l2, hdr.L2Words, hdr.BlockCount, nil
+}
+
+// verifyInodeBitmapCrossReference checks that every allocated inode bitmap slot
+// corresponds to an inode with valid magic on disk, and every unallocated slot
+// truly lacks valid magic.
+func verifyInodeBitmapCrossReference(fs *fsckState, blockSize, inodeSize uint64) {
+	inodeTableStart := fs.sb.InodeTableOffset
+	inodesPerBlock := blockSize / inodeSize
+
+	l2, _, blockCount, err := readAllocatorL2(fs.file, fs.sb.InodeBMOffset, blockSize)
+	if err != nil {
+		fs.errorf("inode bitmap cross-ref: %v", err)
+		return
+	}
+
+	// Check each inode slot
+	badAllocated := 0 // bitmap says allocated, but no valid inode magic
+	badFree := 0      // bitmap says free, but has valid inode magic
+	ino := uint64(1)
+
+	for bi := uint64(0); bi < (blockCount+inodesPerBlock-1)/inodesPerBlock; bi++ {
+		absBlock := inodeTableStart + bi
+		buf := make([]byte, blockSize)
+		if _, err := fs.file.ReadAt(buf, int64(absBlock*blockSize)); err != nil {
+			fs.errorf("inode bitmap cross-ref: read inode table block %d: %v", absBlock, err)
+			ino += inodesPerBlock
+			continue
+		}
+
+		for j := uint64(0); j < inodesPerBlock && ino <= blockCount; j++ {
+			offset := j * inodeSize
+			magic := binary.LittleEndian.Uint64(buf[offset+8:])
+
+			w := (ino - 1) / 64
+			b := (ino - 1) % 64
+			allocated := w < uint64(len(l2)) && (l2[w]&(1<<b)) == 0
+
+			hasMagic := magic == types.MagicInode
+
+			if allocated && !hasMagic {
+				if badAllocated < 20 {
+					fs.errorf("ino %d: bitmap says allocated but inode has no valid magic (0x%016X)", ino, magic)
+				} else if badAllocated == 20 {
+					fs.errorf("(more inode bitmap/table mismatch errors suppressed)")
+				}
+				badAllocated++
+			}
+			if !allocated && hasMagic {
+				if badFree < 20 {
+					fs.errorf("ino %d: bitmap says free but inode has valid magic (0x%016X)", ino, magic)
+				} else if badFree == 20 {
+					fs.errorf("(more inode bitmap/table mismatch errors suppressed)")
+				}
+				badFree++
+			}
+			ino++
+		}
+	}
+
+	if badAllocated == 0 && badFree == 0 {
+		fmt.Fprintf(os.Stderr, "  inode bitmap cross-ref: all bitmap entries match inode table\n")
+	}
+}
+
+// verifySuperblockFreeCounts cross-checks the superblock free counts against
+// the allocator headers and the actual inode/found counts.
+func verifySuperblockFreeCounts(fs *fsckState, totalInodesFound int) {
+	// Read data allocator free count
+	_, _, _, _, dataFree, err := readAllocatorHeader(fs.file, fs.sb.TrieNodePoolStart, fs.sb.BlockSize)
+	if err == nil {
+		if dataFree != fs.sb.FreeDataBlks {
+			fs.errorf("superblock free data blocks mismatch: superblock says %d, allocator says %d",
+				fs.sb.FreeDataBlks, dataFree)
+		}
+	}
+
+	// Read inode allocator free count
+	_, _, _, _, inodeFree, err := readAllocatorHeader(fs.file, fs.sb.InodeBMOffset, fs.sb.BlockSize)
+	if err == nil {
+		if inodeFree != fs.sb.FreeInodes {
+			fs.errorf("superblock free inodes mismatch: superblock says %d, allocator says %d",
+				fs.sb.FreeInodes, inodeFree)
+		}
+	}
+
+	// Cross-check: total inodes = (blockCount - inodeFree), should be totalInodesFound
+	inodeHeader := make([]byte, fs.sb.BlockSize)
+	if _, err := fs.file.ReadAt(inodeHeader, int64(fs.sb.InodeBMOffset*fs.sb.BlockSize)); err == nil {
+		inodeBlockCount := binary.LittleEndian.Uint64(inodeHeader[32:])
+		expectedInodes := int(inodeBlockCount - inodeFree)
+		if expectedInodes != totalInodesFound {
+			fs.errorf("inode count mismatch: bitmap says %d in-use, inode table scan found %d",
+				expectedInodes, totalInodesFound)
+		}
+	}
+}
