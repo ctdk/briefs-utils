@@ -4,13 +4,18 @@ import (
 	"bytes"
 	"testing"
 	"unsafe"
+
+	"github.com/google/uuid"
 )
 
 func TestSuperblockLayoutSize(t *testing.T) {
 	if got := int(unsafe.Sizeof(SuperblockLayout{})); got != BrieFSSuperSize {
 		t.Fatalf("SuperblockLayout size: want %d, got %d", BrieFSSuperSize, got)
 	}
-	sb := NewSuperblock(100, 4096, 512, 4, "test")
+	sb, err := NewSuperblock(100, 4096, 512, 4, "test", "")
+	if err != nil {
+		t.Fatalf("Error creating superblock: %v", err)
+	}
 	data := sb.MarshalBinary()
 	if len(data) != BrieFSSuperSize {
 		t.Fatalf("MarshalBinary length: want %d, got %d", BrieFSSuperSize, len(data))
@@ -18,7 +23,10 @@ func TestSuperblockLayoutSize(t *testing.T) {
 }
 
 func TestSuperblockLayoutMarshalRoundTrip(t *testing.T) {
-	sb := NewSuperblock(10000, 4096, 512, 64, "test-label")
+	sb, err := NewSuperblock(10000, 4096, 512, 64, "test-label", "")
+	if err != nil {
+		t.Fatalf("Error creating superblock: %v", err)
+	}
 
 	// Set fields that NewSuperblock doesn't set (normally done by mkfs)
 	sb.Lay.DataBlocks = 9845
@@ -114,7 +122,10 @@ func TestSuperblockLayoutUnmarshalErrors(t *testing.T) {
 }
 
 func TestReadSuperblock(t *testing.T) {
-	sb := NewSuperblock(10000, 4096, 512, 64, "test")
+	sb, err := NewSuperblock(10000, 4096, 512, 64, "test", "")
+	if err != nil {
+		t.Fatalf("Error creating superblock: %v", err)
+	}
 	sb.Lay.DataBlocks = 9845
 	sb.Lay.FreeDataBlks = 9844
 	sb.Lay.FreeInodes = 639
@@ -151,5 +162,22 @@ func TestReadSuperblockBadMagic(t *testing.T) {
 	_, err := ReadSuperblock(r, 4096)
 	if err == nil {
 		t.Fatal("expected error for bad magic")
+	}
+}
+
+func TestSuperblockUUID(t *testing.T) {
+	uuidStr := "bee364c3-fff3-4967-9fb2-f03b5d29eecf"
+	sb, err := NewSuperblock(100, 4096, 512, 4, "test", uuidStr)
+	if err != nil {
+		t.Fatalf("Error creating superblock with custom UUID: %v", err)
+	}
+	uuidP, _ := uuid.Parse(uuidStr)
+	if len(uuidP) != len(sb.Lay.UUID) {
+		t.Fatalf("original UUID and the superblock UUID do not have the same length: got %d and %d respectively", len(uuidP), len(sb.Lay.UUID))
+	}
+	for i := 0; i < len(uuidP); i++ {
+		if uuidP[i] != sb.Lay.UUID[i] {
+			t.Errorf("uuid bytes do not match at position %d! 0x%x vs. 0x%x", i, uuidP[i], sb.Lay.UUID[i])
+		}
 	}
 }

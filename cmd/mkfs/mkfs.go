@@ -82,6 +82,11 @@ func main() {
 				Value:    8,
 				Usage:    "blocks per inode (one inode per N blocks)",
 			},
+			&cli.StringFlag{
+				Name: "uuid",
+				Aliases: []string{"U"},
+				Usage: "Specify a UUID for the new volume.",
+			},
 		},
 		Action: func(c *cli.Context) error {
 			path := c.Args().First()
@@ -91,6 +96,7 @@ func main() {
 			journalBlocks := uint64(c.Int("journal-size"))
 			label := c.String("label")
 			inodeRatio := c.Int("inode-ratio")
+			uuidStr := c.String("uuid")
 
 			// Validate that blockSize and inodeSize are powers of
 			// two.
@@ -209,7 +215,10 @@ func main() {
 			}
 
 			// --- Build superblock ---
-			sb := types.NewSuperblock(uint64(totalBlocks), blockSize, inodeSize, journalBlocks, label)
+			sb, err := types.NewSuperblock(uint64(totalBlocks), blockSize, inodeSize, journalBlocks, label, uuidStr)
+			if err != nil {
+				return err
+			}
 			sb.Lay.DataBlocks = finalDataBlocks
 			sb.Lay.FreeDataBlks = finalDataBlocks
 			sb.Lay.FreeInodes = estInodes - 1 // -1 for root inode

@@ -78,7 +78,7 @@ func (sb *Superblock) TotalInodes() uint64 { return sb.Lay.FreeInodes + 100 } //
 
 // NewSuperblock creates a new superblock with the given metadata.
 // mkfs.briefs will set the layout fields (bitmap offsets, etc.) after creation.
-func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, label string) *Superblock {
+func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, label string, uuidStr string) (*Superblock, error) {
 	sb := &Superblock{}
 
 	sb.Lay.Magic = MagicSuperblock
@@ -105,14 +105,23 @@ func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, labe
 	// Set label
 	copy(sb.Lay.Label[:], []byte(label))
 
-	// Generate a UUID for this volume. TODO: Allow passing in a UUID for
-	// this volume.
-	fsUuid := uuid.New()
+	// Generate a UUID for this volume, or use one passed into this
+	// function. Return an error if it fails.
+	var fsUuid uuid.UUID
+	var err error
+	if uuidStr != "" {
+		if fsUuid, err = uuid.Parse(uuidStr); err != nil {
+			return nil, err
+		}
+	} else {
+		fsUuid = uuid.New()
+	}
+
 	for i, v := range fsUuid {
 		sb.Lay.UUID[i] = v
 	}
 
-	return sb
+	return sb, nil
 }
 
 // Write writes the superblock to a file and initializes the full filesystem image.

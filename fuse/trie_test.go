@@ -152,7 +152,7 @@ func TestTrieIterator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenFile: %v", err)
 	}
-	sb := types.NewSuperblock(100, 4096, 512, 4, "test")
+	sb, _ := types.NewSuperblock(100, 4096, 512, 4, "test", "")
 	sb.Lay.DataBlocks = 90
 	sb.Lay.FreeDataBlks = 89
 	sb.Lay.FreeInodes = 99
