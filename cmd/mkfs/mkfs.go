@@ -73,6 +73,7 @@ func main() {
 			},
 			&cli.StringFlag{
 				Name:     "label",
+				Aliases:  []string{"L"},
 				Value:    "BRIEFS",
 				Usage:    "filesystem label",
 			},

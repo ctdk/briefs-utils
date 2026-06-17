@@ -1535,6 +1535,7 @@ func main() {
 			},
 			&cli.BoolFlag{
 				Name:  "repair",
+				Aliases: []string{"r"},
 				Usage: "attempt to repair found errors",
 			},
 			&cli.StringFlag{
