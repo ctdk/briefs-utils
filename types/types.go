@@ -4,6 +4,7 @@ package types
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 )
 
 // ErrChecksumMismatch is returned when a stored CRC32C checksum does not
@@ -97,6 +98,8 @@ const (
 	BrieFSMinorVersion = 8
 	BrieFSPatchVersion = 0
 )
+
+var VersionStr = fmt.Sprintf("v%d.%d.%d", types.BrieFSMajorVersion, types.BrieFSMinorVersion, types.BrieFSPatchVersion)
 
 // Block layout constants - defines the order of metadata on disk
 // Block 0: Superblock
