@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 // readJournalMagic reads the first 4 bytes of the given journal block and
@@ -29,14 +29,14 @@ func verifyJournal(file *os.File, journalOffset, journalBlocks, checkpointSeq, l
 	if err != nil {
 		return fmt.Errorf("read journal checkpoint block %d: %w", checkpointBlock, err)
 	}
-	if magic != types.MagicJournal && magic != types.MagicCheckpoint {
+	if magic != briefs.MagicJournal && magic != briefs.MagicCheckpoint {
 		// Fallback: older mkfs.briefs wrote the initial checkpoint to the
 		// first journal block with JOURNAL_MAGIC.
 		fallbackMagic, fallbackErr := readJournalMagic(file, journalOffset, blockSize)
 		if fallbackErr != nil {
 			return fmt.Errorf("read fallback journal block %d: %w", journalOffset, fallbackErr)
 		}
-		if fallbackMagic != types.MagicJournal && fallbackMagic != types.MagicCheckpoint {
+		if fallbackMagic != briefs.MagicJournal && fallbackMagic != briefs.MagicCheckpoint {
 			return fmt.Errorf("bad journal magic at checkpoint block %d (0x%08X) and fallback block %d (0x%08X)",
 				checkpointBlock, magic, journalOffset, fallbackMagic)
 		}
@@ -97,7 +97,7 @@ func verifyJournalRecords(fs *fsckState, journalOffset, journalBlocks, logStart,
 		}
 
 		magic := binary.LittleEndian.Uint32(buf[0:])
-		if magic != types.MagicJournal && magic != types.MagicCheckpoint {
+		if magic != briefs.MagicJournal && magic != briefs.MagicCheckpoint {
 			if logStart == logEnd && !fallbackClean && cur == journalOffset+journalBlocks-1 {
 				// Old mkfs.briefs images have the initial checkpoint in the
 				// first journal block. Try that as a fallback once.
@@ -133,7 +133,7 @@ func verifyJournalRecords(fs *fsckState, journalOffset, journalBlocks, logStart,
 					legacyWarned = true
 				}
 			} else {
-				computed := types.ComputeJournalRecordChecksum(recType, recFlags, recData)
+				computed := briefs.ComputeJournalRecordChecksum(recType, recFlags, recData)
 				if computed != storedChecksum {
 					fs.errorf("journal block %d record %d: checksum mismatch (stored=0x%08X computed=0x%08X)",
 						cur, i, storedChecksum, computed)
@@ -142,12 +142,12 @@ func verifyJournalRecords(fs *fsckState, journalOffset, journalBlocks, logStart,
 			}
 
 			// Parse and validate checkpoint payloads when the checksum is good.
-			if recType == uint32(types.JRN_CHECKPOINT) {
-				if dataLen != types.CheckpointSize {
+			if recType == uint32(briefs.JRN_CHECKPOINT) {
+				if dataLen != briefs.CheckpointSize {
 					fs.warnf("journal block %d record %d: checkpoint payload has unexpected length %d (want %d)",
-						cur, i, dataLen, types.CheckpointSize)
+						cur, i, dataLen, briefs.CheckpointSize)
 				} else {
-					var cp types.Checkpoint
+					var cp briefs.Checkpoint
 					if err := cp.UnmarshalBinary(recData); err != nil {
 						fs.warnf("journal block %d record %d: checkpoint parse error: %v", cur, i, err)
 					} else {

@@ -6,7 +6,7 @@ import (
 	"math/bits"
 	"os"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 // runRepair rebuilds allocator state from the verified metadata and writes the
@@ -17,7 +17,7 @@ import (
 //   - free blocks that are allocated but not referenced (no failed trie walks).
 func runRepair(fs *fsckState, blockSize uint64, totalInodes int, opts *repairOptions) error {
 	plan := &repairPlan{
-		inodes: make(map[uint64]*types.Inode),
+		inodes: make(map[uint64]*briefs.Inode),
 	}
 
 	// 1. Set up data allocator.
@@ -32,7 +32,7 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int, opts *repairOpt
 
 	if opts.RebuildAllocator {
 		// Rebuild data allocator from the structures fsck found.
-		plan.dataAlloc = types.NewAllocBuilder(dataBlockCount)
+		plan.dataAlloc = briefs.NewAllocBuilder(dataBlockCount)
 		for absBlk := range fs.usedBlocks {
 			if absBlk >= dataRegionStart && absBlk < dataRegionStart+dataBlockCount {
 				plan.dataAlloc.MarkAllocated(absBlk - dataRegionStart)
@@ -49,12 +49,12 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int, opts *repairOpt
 	}
 
 	// 2. Set up inode allocator.
-	inodeHeader, err := types.ReadAllocatorHeader(fs.file, fs.sb.InodeBMOffset, blockSize)
+	inodeHeader, err := briefs.ReadAllocatorHeader(fs.file, fs.sb.InodeBMOffset, blockSize)
 	if err != nil {
 		return fmt.Errorf("read inode allocator header: %w", err)
 	}
 	if opts.RebuildAllocator {
-		plan.inodeAlloc = types.NewAllocBuilder(inodeHeader.BlockCount)
+		plan.inodeAlloc = briefs.NewAllocBuilder(inodeHeader.BlockCount)
 		for ino := range fs.inodes {
 			if ino > 0 && ino <= inodeHeader.BlockCount {
 				plan.inodeAlloc.MarkAllocated(ino - 1)
@@ -143,7 +143,7 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int, opts *repairOpt
 // off bits beyond BlockCount. In the BrieFS allocator a set bit means "free",
 // so FreeCount is the number of set bits in the valid range. This is used after
 // loading an allocator from disk so any written header count matches the bitmap.
-func recomputeAllocatorFreeCount(b *types.AllocBuilder) {
+func recomputeAllocatorFreeCount(b *briefs.AllocBuilder) {
 	if b.BlockCount == 0 {
 		b.FreeCount = 0
 		return
@@ -167,13 +167,13 @@ func recomputeAllocatorFreeCount(b *types.AllocBuilder) {
 // loadAllocatorFromDisk reads an allocator pool from disk into an AllocBuilder.
 // This is used for selective repairs that must allocate/free blocks without
 // rebuilding the allocator bitmaps from scratch.
-func loadAllocatorFromDisk(file *os.File, poolBlock, blockSize, blockCount uint64) (*types.AllocBuilder, error) {
-	l0, l1, l2, hdr, err := types.ReadAllocatorBitmap(file, poolBlock, blockSize)
+func loadAllocatorFromDisk(file *os.File, poolBlock, blockSize, blockCount uint64) (*briefs.AllocBuilder, error) {
+	l0, l1, l2, hdr, err := briefs.ReadAllocatorBitmap(file, poolBlock, blockSize)
 	if err != nil {
 		return nil, err
 	}
 	_ = blockCount // kept for symmetry with NewAllocBuilder; hdr.BlockCount is authoritative
-	b := &types.AllocBuilder{
+	b := &briefs.AllocBuilder{
 		L0:         l0,
 		L1:         l1,
 		L2:         l2,
@@ -189,7 +189,7 @@ func loadAllocatorFromDisk(file *os.File, poolBlock, blockSize, blockCount uint6
 // blocks are returned to the plan's allocator.
 func compactFileExtents(fs *fsckState, plan *repairPlan, blockSize uint64) error {
 	for ino, in := range fs.inodes {
-		if in.Flags&types.InodeFlagInlineData != 0 {
+		if in.Flags&briefs.InodeFlagInlineData != 0 {
 			continue
 		}
 		if !in.IsFile() && !in.IsSymlink() {
@@ -228,8 +228,8 @@ func compactFileExtents(fs *fsckState, plan *repairPlan, blockSize uint64) error
 
 // collectInodeExtentsForRepair returns all logical extents for an inode,
 // including inline and chain extents, sorted by logical offset.
-func collectInodeExtentsForRepair(fs *fsckState, in *types.Inode, blockSize uint64) ([]types.Extent, error) {
-	var extents []types.Extent
+func collectInodeExtentsForRepair(fs *fsckState, in *briefs.Inode, blockSize uint64) ([]briefs.Extent, error) {
+	var extents []briefs.Extent
 	inline := in.InlineExtents()
 	for i := uint32(0); i < in.NumExtentsInline; i++ {
 		extents = append(extents, inline[i])
@@ -242,16 +242,16 @@ func collectInodeExtentsForRepair(fs *fsckState, in *types.Inode, blockSize uint
 		if _, err := fs.file.ReadAt(buf, int64(chainBlock*blockSize)); err != nil {
 			return nil, fmt.Errorf("read chain block %d: %w", chainBlock, err)
 		}
-		if err := types.VerifyChainChecksum(buf, blockSize); err != nil {
+		if err := briefs.VerifyChainChecksum(buf, blockSize); err != nil {
 			return nil, fmt.Errorf("chain block %d checksum: %w", chainBlock, err)
 		}
-		hdr := types.UnmarshalExtentChainHeader(buf)
+		hdr := briefs.UnmarshalExtentChainHeader(buf)
 		n := int(hdr.NumExtentsInBlock)
 		if n > remaining {
 			n = remaining
 		}
 		for i := 0; i < n; i++ {
-			extents = append(extents, types.ReadChainExtent(buf, i))
+			extents = append(extents, briefs.ReadChainExtent(buf, i))
 		}
 		remaining -= n
 		chainBlock = hdr.NextOverflowBlock
@@ -263,7 +263,7 @@ func collectInodeExtentsForRepair(fs *fsckState, in *types.Inode, blockSize uint
 }
 
 // sortExtentsByOffset sorts extents in place by logical offset.
-func sortExtentsByOffset(extents []types.Extent) {
+func sortExtentsByOffset(extents []briefs.Extent) {
 	// Simple insertion sort; extent lists are usually tiny.
 	for i := 1; i < len(extents); i++ {
 		j := i
@@ -275,11 +275,11 @@ func sortExtentsByOffset(extents []types.Extent) {
 }
 
 // mergeAdjacentExtents merges extents that are logically and physically adjacent.
-func mergeAdjacentExtents(extents []types.Extent) []types.Extent {
+func mergeAdjacentExtents(extents []briefs.Extent) []briefs.Extent {
 	if len(extents) == 0 {
 		return nil
 	}
-	out := []types.Extent{extents[0]}
+	out := []briefs.Extent{extents[0]}
 	for i := 1; i < len(extents); i++ {
 		last := &out[len(out)-1]
 		cur := extents[i]
@@ -299,16 +299,16 @@ func mergeAdjacentExtents(extents []types.Extent) []types.Extent {
 // rewriteInodeExtents stores the compacted extent list in the inode. If it fits
 // inline, all extents go into the inline region and chain blocks are cleared.
 // Otherwise it packs extents into the minimum number of chain blocks.
-func rewriteInodeExtents(in *types.Inode, extents []types.Extent, blockSize uint64) error {
+func rewriteInodeExtents(in *briefs.Inode, extents []briefs.Extent, blockSize uint64) error {
 	// Zero the inline region first.
-	var zeroInline [8]types.Extent
+	var zeroInline [8]briefs.Extent
 	in.SetInlineExtents(zeroInline)
 	in.NumExtentsInline = 0
 	in.NumExtentsTotal = uint64(len(extents))
 	in.ExtentInlineBase = 0
 
 	if len(extents) <= 8 {
-		var inline [8]types.Extent
+		var inline [8]briefs.Extent
 		copy(inline[:], extents)
 		in.SetInlineExtents(inline)
 		in.NumExtentsInline = uint32(len(extents))
@@ -327,13 +327,13 @@ func rewriteInodeExtents(in *types.Inode, extents []types.Extent, blockSize uint
 // freeOldExtentStorage frees the old chain blocks and any physical blocks that
 // are no longer covered by the new extent list. It then allocates fresh chain
 // blocks (if needed) and writes the compacted extents.
-func freeOldExtentStorage(fs *fsckState, plan *repairPlan, newIn *types.Inode, oldExtents []types.Extent, blockSize uint64) error {
+func freeOldExtentStorage(fs *fsckState, plan *repairPlan, newIn *briefs.Inode, oldExtents []briefs.Extent, blockSize uint64) error {
 	ino := newIn.InodeNumber
 
 	// Build sets of physical blocks used by old and new extents.
 	oldPhys := make(map[uint64]bool)
 	for _, ext := range oldExtents {
-		if ext.Flags&types.ExtentFlagHole != 0 {
+		if ext.Flags&briefs.ExtentFlagHole != 0 {
 			continue
 		}
 		for b := uint64(0); b < ext.Len; b++ {
@@ -342,7 +342,7 @@ func freeOldExtentStorage(fs *fsckState, plan *repairPlan, newIn *types.Inode, o
 	}
 
 	newExtents := newIn.InlineExtents()
-	var newExtentsList []types.Extent
+	var newExtentsList []briefs.Extent
 	for i := uint32(0); i < newIn.NumExtentsInline; i++ {
 		newExtentsList = append(newExtentsList, newExtents[i])
 	}
@@ -354,7 +354,7 @@ func freeOldExtentStorage(fs *fsckState, plan *repairPlan, newIn *types.Inode, o
 
 	newPhys := make(map[uint64]bool)
 	for _, ext := range newExtentsList {
-		if ext.Flags&types.ExtentFlagHole != 0 {
+		if ext.Flags&briefs.ExtentFlagHole != 0 {
 			continue
 		}
 		for b := uint64(0); b < ext.Len; b++ {
@@ -374,7 +374,7 @@ func freeOldExtentStorage(fs *fsckState, plan *repairPlan, newIn *types.Inode, o
 			if _, err := fs.file.ReadAt(buf, int64(chainBlock*blockSize)); err != nil {
 				break
 			}
-			hdr := types.UnmarshalExtentChainHeader(buf)
+			hdr := briefs.UnmarshalExtentChainHeader(buf)
 			if chainBlock >= fs.sb.TrieNodePoolStart+fs.sb.TrieNodePoolSize &&
 				chainBlock < fs.sb.JournalOffset {
 				plan.dataAlloc.MarkFree(chainBlock - (fs.sb.TrieNodePoolStart + fs.sb.TrieNodePoolSize))
@@ -408,8 +408,8 @@ func freeOldExtentStorage(fs *fsckState, plan *repairPlan, newIn *types.Inode, o
 // allocateChainBlocks reserves chain blocks for a chain-backed inode and
 // returns the list of absolute chain block numbers. The caller must later call
 // writeChainBlocks to serialize the extents into those blocks.
-func allocateChainBlocks(plan *repairPlan, sb *types.SuperblockLayout, in *types.Inode, blockSize uint64) ([]uint64, error) {
-	extentsPerBlock := types.ExtentsPerChainBlock(blockSize)
+func allocateChainBlocks(plan *repairPlan, sb *briefs.SuperblockLayout, in *briefs.Inode, blockSize uint64) ([]uint64, error) {
+	extentsPerBlock := briefs.ExtentsPerChainBlock(blockSize)
 	numExtents := int(in.NumExtentsTotal)
 	numChainBlocks := (numExtents + extentsPerBlock - 1) / extentsPerBlock
 	if numChainBlocks == 0 {
@@ -431,8 +431,8 @@ func allocateChainBlocks(plan *repairPlan, sb *types.SuperblockLayout, in *types
 
 // writeChainBlocks serializes the extents of a chain-backed inode into the
 // allocated chain blocks and writes them to disk.
-func writeChainBlocks(file *os.File, in *types.Inode, chainBlocks []uint64, blockSize, dataRegionStart uint64) error {
-	extentsPerBlock := types.ExtentsPerChainBlock(blockSize)
+func writeChainBlocks(file *os.File, in *briefs.Inode, chainBlocks []uint64, blockSize, dataRegionStart uint64) error {
+	extentsPerBlock := briefs.ExtentsPerChainBlock(blockSize)
 	extents := in.InlineExtents()
 	// For a chain-backed inode we store all extents in chain blocks.
 	totalExtents := int(in.NumExtentsTotal)
@@ -456,7 +456,7 @@ func writeChainBlocks(file *os.File, in *types.Inode, chainBlocks []uint64, bloc
 
 		for i := 0; i < numExtents; i++ {
 			ext := extents[start+i]
-			off := types.ExtentChainHeaderSize + i*32
+			off := briefs.ExtentChainHeaderSize + i*32
 			binary.LittleEndian.PutUint64(buf[off:], ext.Offset)
 			binary.LittleEndian.PutUint64(buf[off+8:], ext.Phys)
 			binary.LittleEndian.PutUint64(buf[off+16:], ext.Len)
@@ -464,8 +464,8 @@ func writeChainBlocks(file *os.File, in *types.Inode, chainBlocks []uint64, bloc
 			binary.LittleEndian.PutUint32(buf[off+28:], ext.Pad)
 		}
 
-		checksum := types.ComputeChainChecksum(buf, blockSize)
-		binary.LittleEndian.PutUint64(buf[types.ExtentChainChecksumOffset:], checksum)
+		checksum := briefs.ComputeChainChecksum(buf, blockSize)
+		binary.LittleEndian.PutUint64(buf[briefs.ExtentChainChecksumOffset:], checksum)
 
 		if _, err := file.WriteAt(buf, int64(absBlock*blockSize)); err != nil {
 			return fmt.Errorf("write chain block %d: %w", absBlock, err)
@@ -475,7 +475,7 @@ func writeChainBlocks(file *os.File, in *types.Inode, chainBlocks []uint64, bloc
 }
 
 // writeAllocator writes a freshly built allocator pyramid to disk.
-func writeAllocator(file *os.File, poolBlock, blockSize uint64, alloc *types.AllocBuilder) error {
+func writeAllocator(file *os.File, poolBlock, blockSize uint64, alloc *briefs.AllocBuilder) error {
 	blocks := alloc.WriteBlocks()
 	for i, buf := range blocks {
 		off := int64((poolBlock + uint64(i)) * blockSize)
@@ -493,8 +493,8 @@ func writeAllocator(file *os.File, poolBlock, blockSize uint64, alloc *types.All
 }
 
 // writeSuperblock writes the updated superblock to block 0.
-func writeSuperblock(file *os.File, sb *types.SuperblockLayout, blockSize uint64) error {
-	super := &types.Superblock{Lay: *sb}
+func writeSuperblock(file *os.File, sb *briefs.SuperblockLayout, blockSize uint64) error {
+	super := &briefs.Superblock{Lay: *sb}
 	buf := make([]byte, blockSize)
 	copy(buf, super.MarshalBinary())
 	if _, err := file.WriteAt(buf, 0); err != nil {
@@ -505,22 +505,22 @@ func writeSuperblock(file *os.File, sb *types.SuperblockLayout, blockSize uint64
 
 // writeCheckpoint writes a fresh JRN_CHECKPOINT record to the last journal
 // block, clearing the active log range so the kernel sees a clean journal.
-func writeCheckpoint(file *os.File, sb *types.SuperblockLayout, blockSize uint64, plan *repairPlan) error {
+func writeCheckpoint(file *os.File, sb *briefs.SuperblockLayout, blockSize uint64, plan *repairPlan) error {
 	checkpointBlock := sb.JournalOffset + sb.JournalBlocks - 1
 	buf := make([]byte, blockSize)
 
 	// Checkpoint block header (16 bytes)
-	binary.LittleEndian.PutUint32(buf[0:], types.MagicCheckpoint)
+	binary.LittleEndian.PutUint32(buf[0:], briefs.MagicCheckpoint)
 	binary.LittleEndian.PutUint32(buf[4:], 0) // block_seq (unused by fsck)
 	binary.LittleEndian.PutUint32(buf[8:], 1) // record_count
 
 	// Record header at offset 16
 	const recOff = 16
-	binary.LittleEndian.PutUint32(buf[recOff:], uint32(types.JRN_CHECKPOINT))
+	binary.LittleEndian.PutUint32(buf[recOff:], uint32(briefs.JRN_CHECKPOINT))
 	binary.LittleEndian.PutUint32(buf[recOff+4:], 0) // flags
-	binary.LittleEndian.PutUint32(buf[recOff+8:], types.CheckpointSize)
+	binary.LittleEndian.PutUint32(buf[recOff+8:], briefs.CheckpointSize)
 
-	cp := &types.Checkpoint{
+	cp := &briefs.Checkpoint{
 		Seq:            plan.checkpointSeq,
 		RecordCount:    1,
 		LogSequenceEnd: sb.JournalOffset,
@@ -534,7 +534,7 @@ func writeCheckpoint(file *os.File, sb *types.SuperblockLayout, blockSize uint64
 	}
 	copy(buf[recOff+16:], cpData)
 
-	checksum := types.ComputeJournalRecordChecksum(uint32(types.JRN_CHECKPOINT), 0, cpData)
+	checksum := briefs.ComputeJournalRecordChecksum(uint32(briefs.JRN_CHECKPOINT), 0, cpData)
 	binary.LittleEndian.PutUint32(buf[recOff+12:], checksum)
 
 	if _, err := file.WriteAt(buf, int64(checkpointBlock*blockSize)); err != nil {

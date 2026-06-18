@@ -5,23 +5,23 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 // verifyInode checks a single inode from an already-read buffer.
 // Returns the parsed inode if valid, or an error.
-func verifyInode(buf []byte, ino, byteOffset, inodeSize uint64) (*types.Inode, error) {
+func verifyInode(buf []byte, ino, byteOffset, inodeSize uint64) (*briefs.Inode, error) {
 	inodeBuf := buf[byteOffset : byteOffset+inodeSize]
 	magic := binary.LittleEndian.Uint64(inodeBuf[8:])
 	if magic == 0 {
 		return nil, nil // unallocated inode
 	}
-	if magic != types.MagicInode {
+	if magic != briefs.MagicInode {
 		return nil, fmt.Errorf("ino %d: bad magic 0x%016X", ino, magic)
 	}
 
 	// Use the existing UnmarshalInode for full parsing
-	in, err := types.UnmarshalInode(inodeBuf)
+	in, err := briefs.UnmarshalInode(inodeBuf)
 	if err != nil {
 		return nil, fmt.Errorf("ino %d: unmarshal failed: %w", ino, err)
 	}
@@ -32,7 +32,7 @@ func verifyInode(buf []byte, ino, byteOffset, inodeSize uint64) (*types.Inode, e
 	}
 
 	// Validate inline-data inodes
-	if in.Flags&types.InodeFlagInlineData != 0 {
+	if in.Flags&briefs.InodeFlagInlineData != 0 {
 		if in.FileSize > 256 {
 			return nil, fmt.Errorf("ino %d: inline-data file size %d > 256", ino, in.FileSize)
 		}
@@ -63,7 +63,7 @@ func verifyInode(buf []byte, ino, byteOffset, inodeSize uint64) (*types.Inode, e
 	if mode == 0 {
 		return nil, fmt.Errorf("ino %d: zero file mode", ino)
 	}
-	if mode&types.ModeDir == 0 && mode&types.ModeFile == 0 && mode&types.ModeSymlink == 0 {
+	if mode&briefs.ModeDir == 0 && mode&briefs.ModeFile == 0 && mode&briefs.ModeSymlink == 0 {
 		// Not a dir, file, or symlink — could be a special device, which is fine
 	}
 
@@ -86,7 +86,7 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 	ino := uint64(1)
 
 	// Initialize maps for cross-referencing
-	fs.inodes = make(map[uint64]*types.Inode)
+	fs.inodes = make(map[uint64]*briefs.Inode)
 	fs.dirs = nil
 	fs.usedBlocks = make(map[uint64]bool)
 	fs.entryCounts = make(map[uint64]int)
@@ -129,7 +129,7 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 						fs.errorf("ino %d: directory with no trie root", ino)
 					} else {
 						fs.dirs = append(fs.dirs, dirInfo{ino: ino, trieRoot: in.DirTrieRoot})
-						fs.usedBlocks[types.TrieRefBlock(in.DirTrieRoot)] = true
+						fs.usedBlocks[briefs.TrieRefBlock(in.DirTrieRoot)] = true
 					}
 				}
 
@@ -138,7 +138,7 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 					fs.warnf("ino %d: file with zero size but %d extents", ino, in.NumExtentsTotal)
 				}
 				// Non-inline file with non-zero size but no extents
-				if in.IsFile() && in.FileSize > 0 && in.NumExtentsTotal == 0 && in.Flags&types.InodeFlagInlineData == 0 {
+				if in.IsFile() && in.FileSize > 0 && in.NumExtentsTotal == 0 && in.Flags&briefs.InodeFlagInlineData == 0 {
 					fs.warnf("ino %d: file with size %d but no extents (not inline)", ino, in.FileSize)
 				}
 			}
@@ -151,25 +151,25 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 
 // collectInodeExtents collects all blocks referenced by an inode's extents,
 // including both inline extents and overflow chain blocks.
-func collectInodeExtents(fs *fsckState, ino uint64, in *types.Inode, blockSize uint64) {
+func collectInodeExtents(fs *fsckState, ino uint64, in *briefs.Inode, blockSize uint64) {
 	// Inline-data inodes reference no data blocks.
-	if in.Flags&types.InodeFlagInlineData != 0 {
+	if in.Flags&briefs.InodeFlagInlineData != 0 {
 		return
 	}
 
 	// Helper to record the blocks from a single extent.
 	// Skips hole extents (ExtentFlagHole) which have no physical backing.
-	addExtentBlocks := func(ext types.Extent) {
+	addExtentBlocks := func(ext briefs.Extent) {
 		// Validate extent flags
-		if ext.Flags&types.ExtentFlagHole != 0 {
+		if ext.Flags&briefs.ExtentFlagHole != 0 {
 			// Hole extent — no physical blocks, skip
 			return
 		}
-		if ext.Flags&types.ExtentFlagEof != 0 {
+		if ext.Flags&briefs.ExtentFlagEof != 0 {
 			// EOF marker — should only appear on the last extent
 			// (we can't easily verify that here, but it's valid)
 		}
-		if ext.Flags & ^(uint32(types.ExtentFlagHole|types.ExtentFlagEof)) != 0 {
+		if ext.Flags & ^(uint32(briefs.ExtentFlagHole|briefs.ExtentFlagEof)) != 0 {
 			fs.warnf("ino %d: extent with unknown flags 0x%08X (phys=%d, len=%d)",
 				ino, ext.Flags, ext.Phys, ext.Len)
 		}
@@ -189,7 +189,7 @@ func collectInodeExtents(fs *fsckState, ino uint64, in *types.Inode, blockSize u
 
 	// Collect overflow extents from chain blocks
 	if in.NumExtentsTotal > uint64(in.NumExtentsInline) && in.ExtentInlineBase != 0 {
-		extentsPerBlock := types.ExtentsPerChainBlock(blockSize)
+		extentsPerBlock := briefs.ExtentsPerChainBlock(blockSize)
 		remaining := int(in.NumExtentsTotal) - int(in.NumExtentsInline)
 		chainBlock := in.ExtentInlineBase
 
@@ -201,12 +201,12 @@ func collectInodeExtents(fs *fsckState, ino uint64, in *types.Inode, blockSize u
 			}
 
 			// Verify extent chain block checksum
-			if err := types.VerifyChainChecksum(buf, blockSize); err != nil {
-				fs.errorf("ino %d: extent chain block %d: checksum mismatch (stored=0x%08X computed=0x%08X)", ino, chainBlock, types.ReadChainChecksum(buf, blockSize), types.ComputeChainChecksum(buf, blockSize))
+			if err := briefs.VerifyChainChecksum(buf, blockSize); err != nil {
+				fs.errorf("ino %d: extent chain block %d: checksum mismatch (stored=0x%08X computed=0x%08X)", ino, chainBlock, briefs.ReadChainChecksum(buf, blockSize), briefs.ComputeChainChecksum(buf, blockSize))
 				break
 			}
 
-			hdr := types.UnmarshalExtentChainHeader(buf)
+			hdr := briefs.UnmarshalExtentChainHeader(buf)
 
 			// Validate extent count vs capacity
 			if hdr.NumExtentsInBlock > uint32(extentsPerBlock) {
@@ -224,7 +224,7 @@ func collectInodeExtents(fs *fsckState, ino uint64, in *types.Inode, blockSize u
 				n = remaining
 			}
 			for i := 0; i < n; i++ {
-				ext := types.ReadChainExtent(buf, i)
+				ext := briefs.ReadChainExtent(buf, i)
 				addExtentBlocks(ext)
 			}
 
@@ -241,7 +241,7 @@ func collectInodeExtents(fs *fsckState, ino uint64, in *types.Inode, blockSize u
 
 // writeModifiedInodes writes any inodes staged in the repair plan back to
 // their fixed slots in the inode table.
-func writeModifiedInodes(file *os.File, sb *types.SuperblockLayout, plan *repairPlan, blockSize uint64) error {
+func writeModifiedInodes(file *os.File, sb *briefs.SuperblockLayout, plan *repairPlan, blockSize uint64) error {
 	inodesPerBlock := blockSize / sb.InodeSize
 	for ino, in := range plan.inodes {
 		blockOffset := sb.InodeTableOffset + (ino-1)/inodesPerBlock

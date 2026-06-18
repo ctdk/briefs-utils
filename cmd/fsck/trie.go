@@ -6,7 +6,7 @@ import (
 	"math/bits"
 	"os"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 // trieSlot mirrors the kernel's packed trie node slot.
@@ -26,7 +26,7 @@ type trieSlot struct {
 
 const trieSlotSize = 36
 const triePageHeaderSize = 20
-const trieSlotCount = types.TrieSlotsPerBlock
+const trieSlotCount = briefs.TrieSlotsPerBlock
 
 // trieEntry represents a single directory entry found in the trie.
 type trieEntry struct {
@@ -44,7 +44,7 @@ type dirInfo struct {
 
 // trieIsLeaf returns true if the node has leaf data (pure leaf or INTERM+NODE_STATUS_LEAF).
 func trieIsLeaf(nt uint8) bool {
-	return (nt&types.NodeTypeInterm) == 0 || (nt&types.NodeStatusLeaf) != 0
+	return (nt&briefs.NodeTypeInterm) == 0 || (nt&briefs.NodeStatusLeaf) != 0
 }
 
 // readTriePage reads and validates a packed trie page header.
@@ -53,8 +53,8 @@ func readTriePage(buf []byte) (magic uint32, liveCount uint16, freeSlots uint64,
 		return 0, 0, 0, fmt.Errorf("buffer too small for trie page header")
 	}
 	magic = binary.LittleEndian.Uint32(buf[0:])
-	if magic != types.MagicTriePage {
-		return magic, 0, 0, fmt.Errorf("bad trie page magic 0x%08X (expected 0x%08X)", magic, types.MagicTriePage)
+	if magic != briefs.MagicTriePage {
+		return magic, 0, 0, fmt.Errorf("bad trie page magic 0x%08X (expected 0x%08X)", magic, briefs.MagicTriePage)
 	}
 	liveCount = binary.LittleEndian.Uint16(buf[8:])
 	freeSlots = binary.LittleEndian.Uint64(buf[12:])
@@ -95,7 +95,7 @@ func extractTrieNodeName(buf []byte, node trieSlot) string {
 		return ""
 	}
 	storedLen := int(binary.LittleEndian.Uint16(buf[nameStart:]))
-	if storedLen < 1 || storedLen > types.BrieFSMaxNameLen {
+	if storedLen < 1 || storedLen > briefs.BrieFSMaxNameLen {
 		return ""
 	}
 	if nameStart+2+storedLen > len(buf) {
@@ -133,8 +133,8 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootRef uint64, blockS
 			visited[ref] = true
 		}
 
-		block := types.TrieRefBlock(ref)
-		slot := types.TrieRefSlot(ref)
+		block := briefs.TrieRefBlock(ref)
+		slot := briefs.TrieRefSlot(ref)
 
 		// Record the containing page as used.
 		fs.usedBlocks[block] = true
@@ -180,22 +180,22 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootRef uint64, blockS
 		}
 
 		// Validate node type.
-		if node.NodeType != 0 && node.NodeType != types.NodeTypeInterm &&
-			node.NodeType != (types.NodeTypeInterm|types.NodeStatusLeaf) {
+		if node.NodeType != 0 && node.NodeType != briefs.NodeTypeInterm &&
+			node.NodeType != (briefs.NodeTypeInterm|briefs.NodeStatusLeaf) {
 			fs.errorf("ino %d dir trie: ref %d: invalid node type 0x%02X", parentIno, ref, node.NodeType)
 		}
 
 		// Validate node flags.
-		if node.Flags&uint16(types.NodeFlagDeleted) != 0 {
+		if node.Flags&uint16(briefs.NodeFlagDeleted) != 0 {
 			fs.warnf("ino %d dir trie: ref %d: NODE_FLAG_DELETED set (pending cleanup)", parentIno, ref)
 		}
-		if ref == rootRef && node.Flags&uint16(types.NodeFlagRoot) != 0 {
+		if ref == rootRef && node.Flags&uint16(briefs.NodeFlagRoot) != 0 {
 			// NODE_FLAG_ROOT defined but unused.
 		}
-		if ref != rootRef && node.Flags&uint16(types.NodeFlagRoot) != 0 {
+		if ref != rootRef && node.Flags&uint16(briefs.NodeFlagRoot) != 0 {
 			fs.errorf("ino %d dir trie: ref %d: NODE_FLAG_ROOT set on non-root node", parentIno, ref)
 		}
-		if node.Flags&^(uint16(types.NodeFlagDeleted|types.NodeFlagRoot)) != 0 {
+		if node.Flags&^(uint16(briefs.NodeFlagDeleted|briefs.NodeFlagRoot)) != 0 {
 			fs.warnf("ino %d dir trie: ref %d: unknown flags 0x%04X", parentIno, ref, node.Flags)
 		}
 
@@ -216,13 +216,13 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootRef uint64, blockS
 		}
 
 		// Validate child/sibling ref ranges.
-		if node.FirstChild > 0 && types.TrieRefBlock(node.FirstChild) >= fs.sb.TotalBlocks {
+		if node.FirstChild > 0 && briefs.TrieRefBlock(node.FirstChild) >= fs.sb.TotalBlocks {
 			fs.errorf("ino %d dir trie: ref %d: first_child block %d exceeds total blocks %d",
-				parentIno, ref, types.TrieRefBlock(node.FirstChild), fs.sb.TotalBlocks)
+				parentIno, ref, briefs.TrieRefBlock(node.FirstChild), fs.sb.TotalBlocks)
 		}
-		if node.NextSibling > 0 && types.TrieRefBlock(node.NextSibling) >= fs.sb.TotalBlocks {
+		if node.NextSibling > 0 && briefs.TrieRefBlock(node.NextSibling) >= fs.sb.TotalBlocks {
 			fs.errorf("ino %d dir trie: ref %d: next_sibling block %d exceeds total blocks %d",
-				parentIno, ref, types.TrieRefBlock(node.NextSibling), fs.sb.TotalBlocks)
+				parentIno, ref, briefs.TrieRefBlock(node.NextSibling), fs.sb.TotalBlocks)
 		}
 
 		// If already emitted, just push children.
@@ -232,7 +232,7 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootRef uint64, blockS
 
 		// Extract leaf entry if this node has one.
 		if trieIsLeaf(node.NodeType) {
-			if node.Flags&uint16(types.NodeFlagDeleted) == 0 {
+			if node.Flags&uint16(briefs.NodeFlagDeleted) == 0 {
 				name := extractTrieNodeName(buf, node)
 				if name == "" {
 					fs.errorf("ino %d dir trie: ref %d: empty or invalid name (name_len=%d, name_offset=%d)",
@@ -261,8 +261,8 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootRef uint64, blockS
 			child := node.FirstChild
 			for child != 0 {
 				siblings = append(siblings, child)
-				childBlock := types.TrieRefBlock(child)
-				childSlot := types.TrieRefSlot(child)
+				childBlock := briefs.TrieRefBlock(child)
+				childSlot := briefs.TrieRefSlot(child)
 				cbuf := make([]byte, blockSize)
 				if _, err := fs.file.ReadAt(cbuf, int64(childBlock*blockSize)); err != nil {
 					fs.errorf("ino %d dir trie: read child page %d: %v", parentIno, childBlock, err)
@@ -328,8 +328,8 @@ func collectDirectoryEntries(fs *fsckState, parentIno uint64, rootRef uint64, bl
 			visited[ref] = true
 		}
 
-		block := types.TrieRefBlock(ref)
-		slot := types.TrieRefSlot(ref)
+		block := briefs.TrieRefBlock(ref)
+		slot := briefs.TrieRefSlot(ref)
 
 		buf := make([]byte, blockSize)
 		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
@@ -353,7 +353,7 @@ func collectDirectoryEntries(fs *fsckState, parentIno uint64, rootRef uint64, bl
 		}
 
 		if trieIsLeaf(node.NodeType) {
-			if node.Flags&uint16(types.NodeFlagDeleted) == 0 {
+			if node.Flags&uint16(briefs.NodeFlagDeleted) == 0 {
 				name := extractTrieNodeName(buf, node)
 				if name != "" {
 					entries = append(entries, trieEntry{
@@ -388,10 +388,10 @@ func pushChildren(stack []uint64, leafEmitted []bool, file *os.File, node trieSl
 	for child != 0 {
 		siblings = append(siblings, child)
 		cbuf := make([]byte, blockSize)
-		if _, err := file.ReadAt(cbuf, int64(types.TrieRefBlock(child)*blockSize)); err != nil {
+		if _, err := file.ReadAt(cbuf, int64(briefs.TrieRefBlock(child)*blockSize)); err != nil {
 			break
 		}
-		cn, err := parseTrieSlot(cbuf, types.TrieRefSlot(child))
+		cn, err := parseTrieSlot(cbuf, briefs.TrieRefSlot(child))
 		if err != nil {
 			break
 		}
@@ -422,8 +422,8 @@ func collectDirectoryTrieBlocks(fs *fsckState, parentIno uint64, rootRef uint64,
 		}
 		visited[ref] = true
 
-		block := types.TrieRefBlock(ref)
-		slot := types.TrieRefSlot(ref)
+		block := briefs.TrieRefBlock(ref)
+		slot := briefs.TrieRefSlot(ref)
 		blocks[block] = true
 
 		buf := make([]byte, blockSize)
@@ -445,10 +445,10 @@ func collectDirectoryTrieBlocks(fs *fsckState, parentIno uint64, rootRef uint64,
 				stack = append(stack, child)
 			}
 			cbuf := make([]byte, blockSize)
-			if _, err := fs.file.ReadAt(cbuf, int64(types.TrieRefBlock(child)*blockSize)); err != nil {
+			if _, err := fs.file.ReadAt(cbuf, int64(briefs.TrieRefBlock(child)*blockSize)); err != nil {
 				break
 			}
-			cn, err := parseTrieSlot(cbuf, types.TrieRefSlot(child))
+			cn, err := parseTrieSlot(cbuf, briefs.TrieRefSlot(child))
 			if err != nil {
 				break
 			}

@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 func TestFsckCleanImage(t *testing.T) {
@@ -191,10 +191,10 @@ func TestFsckRepairFragmentedFile(t *testing.T) {
 		dataStartAbs  = uint64(100)
 	)
 
-	inode := &types.Inode{
+	inode := &briefs.Inode{
 		InodeNumber:      2,
-		Magic:            types.MagicInode,
-		Filemode:         types.ModeFile | 0644,
+		Magic:            briefs.MagicInode,
+		Filemode:         briefs.ModeFile | 0644,
 		Uid:              0,
 		Gid:              0,
 		FileSize:         9 * 4096,
@@ -205,9 +205,9 @@ func TestFsckRepairFragmentedFile(t *testing.T) {
 		Flags:            0,
 	}
 	// Eight inline extents at logical offsets 0..7.
-	var inlineExtents [8]types.Extent
+	var inlineExtents [8]briefs.Extent
 	for i := 0; i < 8; i++ {
-		inlineExtents[i] = types.Extent{Offset: uint64(i), Phys: dataStartAbs + uint64(i), Len: 1, Flags: 0, Pad: 0}
+		inlineExtents[i] = briefs.Extent{Offset: uint64(i), Phys: dataStartAbs + uint64(i), Len: 1, Flags: 0, Pad: 0}
 	}
 	inode.SetInlineExtents(inlineExtents)
 
@@ -226,14 +226,14 @@ func TestFsckRepairFragmentedFile(t *testing.T) {
 	binary.LittleEndian.PutUint64(chainBuf[0:], 0) // next_overflow_block
 	binary.LittleEndian.PutUint32(chainBuf[8:], 1) // num_extents_in_block
 	binary.LittleEndian.PutUint32(chainBuf[12:], 0)
-	const extOff = types.ExtentChainHeaderSize
+	const extOff = briefs.ExtentChainHeaderSize
 	binary.LittleEndian.PutUint64(chainBuf[extOff:], 8)                         // offset
 	binary.LittleEndian.PutUint64(chainBuf[extOff+8:], dataStartAbs+8)           // phys
 	binary.LittleEndian.PutUint64(chainBuf[extOff+16:], 1)                     // len
 	binary.LittleEndian.PutUint32(chainBuf[extOff+24:], 0)                     // flags
 	binary.LittleEndian.PutUint32(chainBuf[extOff+28:], 0)                     // pad
-	checksum := types.ComputeChainChecksum(chainBuf, 4096)
-	binary.LittleEndian.PutUint64(chainBuf[types.ExtentChainChecksumOffset:], checksum)
+	checksum := briefs.ComputeChainChecksum(chainBuf, 4096)
+	binary.LittleEndian.PutUint64(chainBuf[briefs.ExtentChainChecksumOffset:], checksum)
 	if _, err := f.WriteAt(chainBuf, int64(chainBlockAbs*4096)); err != nil {
 		t.Fatalf("write chain block: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestFsckRepairFragmentedFile(t *testing.T) {
 	if _, err := f.ReadAt(buf, 5*4096+512); err != nil {
 		t.Fatalf("read repaired inode: %v", err)
 	}
-	repaired, err := types.UnmarshalInode(buf)
+	repaired, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal repaired inode: %v", err)
 	}
@@ -361,10 +361,10 @@ func TestFsckRepairCompactDirectoryTrie(t *testing.T) {
 	defer f.Close()
 
 	// Write inode 2 as a plain empty file so the directory entry is valid.
-	inode := &types.Inode{
+	inode := &briefs.Inode{
 		InodeNumber: targetIno,
-		Magic:       types.MagicInode,
-		Filemode:    types.ModeFile | 0644,
+		Magic:       briefs.MagicInode,
+		Filemode:    briefs.ModeFile | 0644,
 		FileSize:    0,
 		Nlinks:      1,
 	}
@@ -390,26 +390,26 @@ func TestFsckRepairCompactDirectoryTrie(t *testing.T) {
 	// root node; page two holds the leaf for "test". This is valid but
 	// fragmented, so repair should compact it into a single page.
 	rootPage := make([]byte, 4096)
-	binary.LittleEndian.PutUint32(rootPage[0:], types.MagicTriePage)
-	binary.LittleEndian.PutUint32(rootPage[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint32(rootPage[0:], briefs.MagicTriePage)
+	binary.LittleEndian.PutUint32(rootPage[4:], briefs.TriePageVersion)
 	binary.LittleEndian.PutUint16(rootPage[8:], 1) // live_count
 	binary.LittleEndian.PutUint16(rootPage[10:], 0)
 	binary.LittleEndian.PutUint64(rootPage[12:], ^uint64(1)) // slot 0 used
-	leafRef := types.TrieMakeRef(extraTrieBlock, 0)
-	writeTrieNode(rootPage, 0, leafRef, 0, 0, 0, 0, 0, types.NodeTypeInterm, 0, 0, 0, 1)
+	leafRef := briefs.TrieMakeRef(extraTrieBlock, 0)
+	writeTrieNode(rootPage, 0, leafRef, 0, 0, 0, 0, 0, briefs.NodeTypeInterm, 0, 0, 0, 1)
 	if _, err := f.WriteAt(rootPage, int64(rootTrieBlock*4096)); err != nil {
 		t.Fatalf("write root trie page: %v", err)
 	}
 
 	leafPage := make([]byte, 4096)
-	binary.LittleEndian.PutUint32(leafPage[0:], types.MagicTriePage)
-	binary.LittleEndian.PutUint32(leafPage[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint32(leafPage[0:], briefs.MagicTriePage)
+	binary.LittleEndian.PutUint32(leafPage[4:], briefs.TriePageVersion)
 	binary.LittleEndian.PutUint16(leafPage[8:], 1) // live_count
 	binary.LittleEndian.PutUint16(leafPage[10:], 0)
 	binary.LittleEndian.PutUint64(leafPage[12:], ^uint64(1)) // slot 0 used
 	nameOff := writeTrieName(leafPage, 4096, "test")
 	writeTrieNode(leafPage, 0, 0, 0, targetIno, uint16(len("test")), nameOff,
-		uint8(len("test")), types.NodeTypeInterm|types.NodeStatusLeaf, 't', 8, 0, 0)
+		uint8(len("test")), briefs.NodeTypeInterm|briefs.NodeStatusLeaf, 't', 8, 0, 0)
 	if _, err := f.WriteAt(leafPage, int64(extraTrieBlock*4096)); err != nil {
 		t.Fatalf("write leaf trie page: %v", err)
 	}
@@ -490,10 +490,10 @@ func TestFsckRepairLinkCounts(t *testing.T) {
 	defer f.Close()
 
 	// Write file inode 2 and directory inode 3 with intentionally wrong nlinks.
-	fileInode := &types.Inode{
+	fileInode := &briefs.Inode{
 		InodeNumber: fileIno,
-		Magic:       types.MagicInode,
-		Filemode:    types.ModeFile | 0644,
+		Magic:       briefs.MagicInode,
+		Filemode:    briefs.ModeFile | 0644,
 		FileSize:    0,
 		Nlinks:      0, // will be repaired to 1
 	}
@@ -501,13 +501,13 @@ func TestFsckRepairLinkCounts(t *testing.T) {
 		t.Fatalf("write file inode: %v", err)
 	}
 
-	subdirInode := &types.Inode{
+	subdirInode := &briefs.Inode{
 		InodeNumber: dirIno,
-		Magic:       types.MagicInode,
-		Filemode:    types.ModeDir | 0755,
+		Magic:       briefs.MagicInode,
+		Filemode:    briefs.ModeDir | 0755,
 		FileSize:    4096,
 		Nlinks:      1, // will be repaired to 2
-		DirTrieRoot: types.TrieMakeRef(subdirTrieBlock, 0),
+		DirTrieRoot: briefs.TrieMakeRef(subdirTrieBlock, 0),
 		ParentInode: 1,
 	}
 	if err := subdirInode.WriteAt(f, 5*4096+1024); err != nil {
@@ -520,12 +520,12 @@ func TestFsckRepairLinkCounts(t *testing.T) {
 	if _, err := f.ReadAt(rootInodeBuf, 5*4096); err != nil {
 		t.Fatalf("read root inode: %v", err)
 	}
-	rootInode, err := types.UnmarshalInode(rootInodeBuf)
+	rootInode, err := briefs.UnmarshalInode(rootInodeBuf)
 	if err != nil {
 		t.Fatalf("unmarshal root inode: %v", err)
 	}
 	rootInode.Nlinks = 2 // will be repaired to 3
-	rootInode.DirTrieRoot = types.TrieMakeRef(rootTrieBlock, 0)
+	rootInode.DirTrieRoot = briefs.TrieMakeRef(rootTrieBlock, 0)
 	rootInode.ParentInode = 1
 	if err := rootInode.WriteAt(f, 5*4096); err != nil {
 		t.Fatalf("write root inode: %v", err)
@@ -547,8 +547,8 @@ func TestFsckRepairLinkCounts(t *testing.T) {
 
 	// Build a root trie page with two leaf children: "file" and "dir".
 	rootPage := make([]byte, 4096)
-	binary.LittleEndian.PutUint32(rootPage[0:], types.MagicTriePage)
-	binary.LittleEndian.PutUint32(rootPage[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint32(rootPage[0:], briefs.MagicTriePage)
+	binary.LittleEndian.PutUint32(rootPage[4:], briefs.TriePageVersion)
 	binary.LittleEndian.PutUint16(rootPage[8:], 3) // live_count
 	binary.LittleEndian.PutUint16(rootPage[10:], 0)
 	freeSlots := ^uint64(0)
@@ -567,13 +567,13 @@ func TestFsckRepairLinkCounts(t *testing.T) {
 	binary.LittleEndian.PutUint16(rootPage[4085:], uint16(len("file")))
 	copy(rootPage[4087:], "file")
 
-	leafFileRef := types.TrieMakeRef(rootTrieBlock, 1)
-	leafDirRef := types.TrieMakeRef(rootTrieBlock, 2)
-	writeTrieNode(rootPage, 0, leafFileRef, 0, 0, 0, 0, 0, types.NodeTypeInterm, 0, 0, 0, 2)
+	leafFileRef := briefs.TrieMakeRef(rootTrieBlock, 1)
+	leafDirRef := briefs.TrieMakeRef(rootTrieBlock, 2)
+	writeTrieNode(rootPage, 0, leafFileRef, 0, 0, 0, 0, 0, briefs.NodeTypeInterm, 0, 0, 0, 2)
 	writeTrieNode(rootPage, 1, 0, leafDirRef, fileIno, uint16(len("file")), nameOffFile,
-		1, types.NodeTypeInterm|types.NodeStatusLeaf, 'f', 8, 0, 0)
+		1, briefs.NodeTypeInterm|briefs.NodeStatusLeaf, 'f', 8, 0, 0)
 	writeTrieNode(rootPage, 2, 0, 0, dirIno, uint16(len("dir")), nameOffDir,
-		1, types.NodeTypeInterm|types.NodeStatusLeaf, 'd', 4, 0, 0)
+		1, briefs.NodeTypeInterm|briefs.NodeStatusLeaf, 'd', 4, 0, 0)
 
 	if _, err := f.WriteAt(rootPage, int64(rootTrieBlock*4096)); err != nil {
 		t.Fatalf("write root trie page: %v", err)
@@ -581,12 +581,12 @@ func TestFsckRepairLinkCounts(t *testing.T) {
 
 	// Build an empty subdirectory trie page.
 	subdirPage := make([]byte, 4096)
-	binary.LittleEndian.PutUint32(subdirPage[0:], types.MagicTriePage)
-	binary.LittleEndian.PutUint32(subdirPage[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint32(subdirPage[0:], briefs.MagicTriePage)
+	binary.LittleEndian.PutUint32(subdirPage[4:], briefs.TriePageVersion)
 	binary.LittleEndian.PutUint16(subdirPage[8:], 1) // live_count
 	binary.LittleEndian.PutUint16(subdirPage[10:], 0)
 	binary.LittleEndian.PutUint64(subdirPage[12:], ^uint64(1)) // slot 0 used
-	writeTrieNode(subdirPage, 0, 0, 0, 0, 0, 0, 0, types.NodeTypeInterm, 0, 0, 0, 0)
+	writeTrieNode(subdirPage, 0, 0, 0, 0, 0, 0, 0, briefs.NodeTypeInterm, 0, 0, 0, 0)
 	if _, err := f.WriteAt(subdirPage, int64(subdirTrieBlock*4096)); err != nil {
 		t.Fatalf("write subdir trie page: %v", err)
 	}
@@ -648,7 +648,7 @@ func TestFsckRepairLinkCounts(t *testing.T) {
 	if _, err := f.ReadAt(buf, 5*4096); err != nil {
 		t.Fatalf("read repaired root inode: %v", err)
 	}
-	root, err := types.UnmarshalInode(buf)
+	root, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal root inode: %v", err)
 	}
@@ -659,7 +659,7 @@ func TestFsckRepairLinkCounts(t *testing.T) {
 	if _, err := f.ReadAt(buf, 5*4096+512); err != nil {
 		t.Fatalf("read repaired file inode: %v", err)
 	}
-	file, err := types.UnmarshalInode(buf)
+	file, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal file inode: %v", err)
 	}
@@ -670,7 +670,7 @@ func TestFsckRepairLinkCounts(t *testing.T) {
 	if _, err := f.ReadAt(buf, 5*4096+1024); err != nil {
 		t.Fatalf("read repaired subdir inode: %v", err)
 	}
-	dir, err := types.UnmarshalInode(buf)
+	dir, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal subdir inode: %v", err)
 	}
@@ -712,19 +712,19 @@ func TestFsckRepairCombinedFragmentation(t *testing.T) {
 
 	// File inode 2: fragmented across nine single-block extents (eight inline,
 	// ninth in a chain block), with a corrupted link count.
-	fileInode := &types.Inode{
+	fileInode := &briefs.Inode{
 		InodeNumber:      fileIno,
-		Magic:            types.MagicInode,
-		Filemode:         types.ModeFile | 0644,
+		Magic:            briefs.MagicInode,
+		Filemode:         briefs.ModeFile | 0644,
 		FileSize:         9 * 4096,
 		Nlinks:           0, // will be repaired to 1
 		NumExtentsInline: 8,
 		NumExtentsTotal:  9,
 		ExtentInlineBase: chainBlockAbs,
 	}
-	var inlineExtents [8]types.Extent
+	var inlineExtents [8]briefs.Extent
 	for i := 0; i < 8; i++ {
-		inlineExtents[i] = types.Extent{Offset: uint64(i), Phys: dataStartAbs + uint64(i), Len: 1, Flags: 0, Pad: 0}
+		inlineExtents[i] = briefs.Extent{Offset: uint64(i), Phys: dataStartAbs + uint64(i), Len: 1, Flags: 0, Pad: 0}
 	}
 	fileInode.SetInlineExtents(inlineExtents)
 	if err := fileInode.WriteAt(f, 5*4096+512); err != nil {
@@ -736,26 +736,26 @@ func TestFsckRepairCombinedFragmentation(t *testing.T) {
 	binary.LittleEndian.PutUint64(chainBuf[0:], 0) // next_overflow_block
 	binary.LittleEndian.PutUint32(chainBuf[8:], 1) // num_extents_in_block
 	binary.LittleEndian.PutUint32(chainBuf[12:], 0)
-	const extOff = types.ExtentChainHeaderSize
+	const extOff = briefs.ExtentChainHeaderSize
 	binary.LittleEndian.PutUint64(chainBuf[extOff:], 8)
 	binary.LittleEndian.PutUint64(chainBuf[extOff+8:], dataStartAbs+8)
 	binary.LittleEndian.PutUint64(chainBuf[extOff+16:], 1)
 	binary.LittleEndian.PutUint32(chainBuf[extOff+24:], 0)
 	binary.LittleEndian.PutUint32(chainBuf[extOff+28:], 0)
-	checksum := types.ComputeChainChecksum(chainBuf, 4096)
-	binary.LittleEndian.PutUint64(chainBuf[types.ExtentChainChecksumOffset:], checksum)
+	checksum := briefs.ComputeChainChecksum(chainBuf, 4096)
+	binary.LittleEndian.PutUint64(chainBuf[briefs.ExtentChainChecksumOffset:], checksum)
 	if _, err := f.WriteAt(chainBuf, int64(chainBlockAbs*4096)); err != nil {
 		t.Fatalf("write chain block: %v", err)
 	}
 
 	// Directory inode 3: empty directory with a corrupted link count.
-	subdirInode := &types.Inode{
+	subdirInode := &briefs.Inode{
 		InodeNumber: dirIno,
-		Magic:       types.MagicInode,
-		Filemode:    types.ModeDir | 0755,
+		Magic:       briefs.MagicInode,
+		Filemode:    briefs.ModeDir | 0755,
 		FileSize:    4096,
 		Nlinks:      1, // will be repaired to 2
-		DirTrieRoot: types.TrieMakeRef(subdirTrieBlock, 0),
+		DirTrieRoot: briefs.TrieMakeRef(subdirTrieBlock, 0),
 		ParentInode: 1,
 	}
 	if err := subdirInode.WriteAt(f, 5*4096+1024); err != nil {
@@ -767,12 +767,12 @@ func TestFsckRepairCombinedFragmentation(t *testing.T) {
 	if _, err := f.ReadAt(rootInodeBuf, 5*4096); err != nil {
 		t.Fatalf("read root inode: %v", err)
 	}
-	rootInode, err := types.UnmarshalInode(rootInodeBuf)
+	rootInode, err := briefs.UnmarshalInode(rootInodeBuf)
 	if err != nil {
 		t.Fatalf("unmarshal root inode: %v", err)
 	}
 	rootInode.Nlinks = 2 // will be repaired to 3
-	rootInode.DirTrieRoot = types.TrieMakeRef(rootTrieBlock, 0)
+	rootInode.DirTrieRoot = briefs.TrieMakeRef(rootTrieBlock, 0)
 	rootInode.ParentInode = 1
 	if err := rootInode.WriteAt(f, 5*4096); err != nil {
 		t.Fatalf("write root inode: %v", err)
@@ -794,8 +794,8 @@ func TestFsckRepairCombinedFragmentation(t *testing.T) {
 
 	// Root trie page with two leaf children: "file" and "dir".
 	rootPage := make([]byte, 4096)
-	binary.LittleEndian.PutUint32(rootPage[0:], types.MagicTriePage)
-	binary.LittleEndian.PutUint32(rootPage[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint32(rootPage[0:], briefs.MagicTriePage)
+	binary.LittleEndian.PutUint32(rootPage[4:], briefs.TriePageVersion)
 	binary.LittleEndian.PutUint16(rootPage[8:], 3) // live_count
 	binary.LittleEndian.PutUint16(rootPage[10:], 0)
 	freeSlots := ^uint64(0)
@@ -811,13 +811,13 @@ func TestFsckRepairCombinedFragmentation(t *testing.T) {
 	binary.LittleEndian.PutUint16(rootPage[4085:], uint16(len("file")))
 	copy(rootPage[4087:], "file")
 
-	leafFileRef := types.TrieMakeRef(rootTrieBlock, 1)
-	leafDirRef := types.TrieMakeRef(rootTrieBlock, 2)
-	writeTrieNode(rootPage, 0, leafFileRef, 0, 0, 0, 0, 0, types.NodeTypeInterm, 0, 0, 0, 2)
+	leafFileRef := briefs.TrieMakeRef(rootTrieBlock, 1)
+	leafDirRef := briefs.TrieMakeRef(rootTrieBlock, 2)
+	writeTrieNode(rootPage, 0, leafFileRef, 0, 0, 0, 0, 0, briefs.NodeTypeInterm, 0, 0, 0, 2)
 	writeTrieNode(rootPage, 1, 0, leafDirRef, fileIno, uint16(len("file")), nameOffFile,
-		1, types.NodeTypeInterm|types.NodeStatusLeaf, 'f', 8, 0, 0)
+		1, briefs.NodeTypeInterm|briefs.NodeStatusLeaf, 'f', 8, 0, 0)
 	writeTrieNode(rootPage, 2, 0, 0, dirIno, uint16(len("dir")), nameOffDir,
-		1, types.NodeTypeInterm|types.NodeStatusLeaf, 'd', 4, 0, 0)
+		1, briefs.NodeTypeInterm|briefs.NodeStatusLeaf, 'd', 4, 0, 0)
 
 	if _, err := f.WriteAt(rootPage, int64(rootTrieBlock*4096)); err != nil {
 		t.Fatalf("write root trie page: %v", err)
@@ -825,12 +825,12 @@ func TestFsckRepairCombinedFragmentation(t *testing.T) {
 
 	// Empty subdirectory trie page.
 	subdirPage := make([]byte, 4096)
-	binary.LittleEndian.PutUint32(subdirPage[0:], types.MagicTriePage)
-	binary.LittleEndian.PutUint32(subdirPage[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint32(subdirPage[0:], briefs.MagicTriePage)
+	binary.LittleEndian.PutUint32(subdirPage[4:], briefs.TriePageVersion)
 	binary.LittleEndian.PutUint16(subdirPage[8:], 1) // live_count
 	binary.LittleEndian.PutUint16(subdirPage[10:], 0)
 	binary.LittleEndian.PutUint64(subdirPage[12:], ^uint64(1)) // slot 0 used
-	writeTrieNode(subdirPage, 0, 0, 0, 0, 0, 0, 0, types.NodeTypeInterm, 0, 0, 0, 0)
+	writeTrieNode(subdirPage, 0, 0, 0, 0, 0, 0, 0, briefs.NodeTypeInterm, 0, 0, 0, 0)
 	if _, err := f.WriteAt(subdirPage, int64(subdirTrieBlock*4096)); err != nil {
 		t.Fatalf("write subdir trie page: %v", err)
 	}
@@ -909,7 +909,7 @@ func TestFsckRepairCombinedFragmentation(t *testing.T) {
 	if _, err := f.ReadAt(buf, 5*4096); err != nil {
 		t.Fatalf("read repaired root inode: %v", err)
 	}
-	root, err := types.UnmarshalInode(buf)
+	root, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal root inode: %v", err)
 	}
@@ -920,7 +920,7 @@ func TestFsckRepairCombinedFragmentation(t *testing.T) {
 	if _, err := f.ReadAt(buf, 5*4096+512); err != nil {
 		t.Fatalf("read repaired file inode: %v", err)
 	}
-	file, err := types.UnmarshalInode(buf)
+	file, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal file inode: %v", err)
 	}
@@ -945,7 +945,7 @@ func TestFsckRepairCombinedFragmentation(t *testing.T) {
 	if _, err := f.ReadAt(buf, 5*4096+1024); err != nil {
 		t.Fatalf("read repaired subdir inode: %v", err)
 	}
-	dir, err := types.UnmarshalInode(buf)
+	dir, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal subdir inode: %v", err)
 	}
@@ -980,19 +980,19 @@ func writeCombinedFixture(t *testing.T, mkfsPath, imgPath string, corruptNlinks 
 	}
 	defer f.Close()
 
-	fileInode := &types.Inode{
+	fileInode := &briefs.Inode{
 		InodeNumber:      fileIno,
-		Magic:            types.MagicInode,
-		Filemode:         types.ModeFile | 0644,
+		Magic:            briefs.MagicInode,
+		Filemode:         briefs.ModeFile | 0644,
 		FileSize:         9 * 4096,
 		Nlinks:           1,
 		NumExtentsInline: 8,
 		NumExtentsTotal:  9,
 		ExtentInlineBase: chainBlockAbs,
 	}
-	var inlineExtents [8]types.Extent
+	var inlineExtents [8]briefs.Extent
 	for i := 0; i < 8; i++ {
-		inlineExtents[i] = types.Extent{Offset: uint64(i), Phys: dataStartAbs + uint64(i), Len: 1, Flags: 0, Pad: 0}
+		inlineExtents[i] = briefs.Extent{Offset: uint64(i), Phys: dataStartAbs + uint64(i), Len: 1, Flags: 0, Pad: 0}
 	}
 	fileInode.SetInlineExtents(inlineExtents)
 	if corruptNlinks {
@@ -1006,25 +1006,25 @@ func writeCombinedFixture(t *testing.T, mkfsPath, imgPath string, corruptNlinks 
 	binary.LittleEndian.PutUint64(chainBuf[0:], 0)
 	binary.LittleEndian.PutUint32(chainBuf[8:], 1)
 	binary.LittleEndian.PutUint32(chainBuf[12:], 0)
-	const extOff = types.ExtentChainHeaderSize
+	const extOff = briefs.ExtentChainHeaderSize
 	binary.LittleEndian.PutUint64(chainBuf[extOff:], 8)
 	binary.LittleEndian.PutUint64(chainBuf[extOff+8:], dataStartAbs+8)
 	binary.LittleEndian.PutUint64(chainBuf[extOff+16:], 1)
 	binary.LittleEndian.PutUint32(chainBuf[extOff+24:], 0)
 	binary.LittleEndian.PutUint32(chainBuf[extOff+28:], 0)
-	checksum := types.ComputeChainChecksum(chainBuf, 4096)
-	binary.LittleEndian.PutUint64(chainBuf[types.ExtentChainChecksumOffset:], checksum)
+	checksum := briefs.ComputeChainChecksum(chainBuf, 4096)
+	binary.LittleEndian.PutUint64(chainBuf[briefs.ExtentChainChecksumOffset:], checksum)
 	if _, err := f.WriteAt(chainBuf, int64(chainBlockAbs*4096)); err != nil {
 		t.Fatalf("write chain block: %v", err)
 	}
 
-	subdirInode := &types.Inode{
+	subdirInode := &briefs.Inode{
 		InodeNumber: dirIno,
-		Magic:       types.MagicInode,
-		Filemode:    types.ModeDir | 0755,
+		Magic:       briefs.MagicInode,
+		Filemode:    briefs.ModeDir | 0755,
 		FileSize:    4096,
 		Nlinks:      2,
-		DirTrieRoot: types.TrieMakeRef(subdirTrieBlock, 0),
+		DirTrieRoot: briefs.TrieMakeRef(subdirTrieBlock, 0),
 		ParentInode: 1,
 	}
 	if corruptNlinks {
@@ -1038,12 +1038,12 @@ func writeCombinedFixture(t *testing.T, mkfsPath, imgPath string, corruptNlinks 
 	if _, err := f.ReadAt(rootInodeBuf, 5*4096); err != nil {
 		t.Fatalf("read root inode: %v", err)
 	}
-	rootInode, err := types.UnmarshalInode(rootInodeBuf)
+	rootInode, err := briefs.UnmarshalInode(rootInodeBuf)
 	if err != nil {
 		t.Fatalf("unmarshal root inode: %v", err)
 	}
 	rootInode.Nlinks = 3
-	rootInode.DirTrieRoot = types.TrieMakeRef(rootTrieBlock, 0)
+	rootInode.DirTrieRoot = briefs.TrieMakeRef(rootTrieBlock, 0)
 	rootInode.ParentInode = 1
 	if corruptNlinks {
 		rootInode.Nlinks = 2
@@ -1066,8 +1066,8 @@ func writeCombinedFixture(t *testing.T, mkfsPath, imgPath string, corruptNlinks 
 	}
 
 	rootPage := make([]byte, 4096)
-	binary.LittleEndian.PutUint32(rootPage[0:], types.MagicTriePage)
-	binary.LittleEndian.PutUint32(rootPage[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint32(rootPage[0:], briefs.MagicTriePage)
+	binary.LittleEndian.PutUint32(rootPage[4:], briefs.TriePageVersion)
 	binary.LittleEndian.PutUint16(rootPage[8:], 3)
 	binary.LittleEndian.PutUint16(rootPage[10:], 0)
 	freeSlots := ^uint64(0)
@@ -1083,24 +1083,24 @@ func writeCombinedFixture(t *testing.T, mkfsPath, imgPath string, corruptNlinks 
 	binary.LittleEndian.PutUint16(rootPage[4085:], uint16(len("file")))
 	copy(rootPage[4087:], "file")
 
-	leafFileRef := types.TrieMakeRef(rootTrieBlock, 1)
-	leafDirRef := types.TrieMakeRef(rootTrieBlock, 2)
-	writeTrieNode(rootPage, 0, leafFileRef, 0, 0, 0, 0, 0, types.NodeTypeInterm, 0, 0, 0, 2)
+	leafFileRef := briefs.TrieMakeRef(rootTrieBlock, 1)
+	leafDirRef := briefs.TrieMakeRef(rootTrieBlock, 2)
+	writeTrieNode(rootPage, 0, leafFileRef, 0, 0, 0, 0, 0, briefs.NodeTypeInterm, 0, 0, 0, 2)
 	writeTrieNode(rootPage, 1, 0, leafDirRef, fileIno, uint16(len("file")), nameOffFile,
-		1, types.NodeTypeInterm|types.NodeStatusLeaf, 'f', 8, 0, 0)
+		1, briefs.NodeTypeInterm|briefs.NodeStatusLeaf, 'f', 8, 0, 0)
 	writeTrieNode(rootPage, 2, 0, 0, dirIno, uint16(len("dir")), nameOffDir,
-		1, types.NodeTypeInterm|types.NodeStatusLeaf, 'd', 4, 0, 0)
+		1, briefs.NodeTypeInterm|briefs.NodeStatusLeaf, 'd', 4, 0, 0)
 	if _, err := f.WriteAt(rootPage, int64(rootTrieBlock*4096)); err != nil {
 		t.Fatalf("write root trie page: %v", err)
 	}
 
 	subdirPage := make([]byte, 4096)
-	binary.LittleEndian.PutUint32(subdirPage[0:], types.MagicTriePage)
-	binary.LittleEndian.PutUint32(subdirPage[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint32(subdirPage[0:], briefs.MagicTriePage)
+	binary.LittleEndian.PutUint32(subdirPage[4:], briefs.TriePageVersion)
 	binary.LittleEndian.PutUint16(subdirPage[8:], 1)
 	binary.LittleEndian.PutUint16(subdirPage[10:], 0)
 	binary.LittleEndian.PutUint64(subdirPage[12:], ^uint64(1))
-	writeTrieNode(subdirPage, 0, 0, 0, 0, 0, 0, 0, types.NodeTypeInterm, 0, 0, 0, 0)
+	writeTrieNode(subdirPage, 0, 0, 0, 0, 0, 0, 0, briefs.NodeTypeInterm, 0, 0, 0, 0)
 	if _, err := f.WriteAt(subdirPage, int64(subdirTrieBlock*4096)); err != nil {
 		t.Fatalf("write subdir trie page: %v", err)
 	}
@@ -1169,7 +1169,7 @@ func TestFsckRepairOnlyAllocator(t *testing.T) {
 	if _, err := f.ReadAt(buf, 5*4096+512); err != nil {
 		t.Fatalf("read file inode: %v", err)
 	}
-	file, err := types.UnmarshalInode(buf)
+	file, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal file inode: %v", err)
 	}
@@ -1223,7 +1223,7 @@ func TestFsckRepairOnlyExtents(t *testing.T) {
 	if _, err := f.ReadAt(buf, 5*4096+512); err != nil {
 		t.Fatalf("read file inode: %v", err)
 	}
-	file, err := types.UnmarshalInode(buf)
+	file, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal file inode: %v", err)
 	}
@@ -1237,7 +1237,7 @@ func TestFsckRepairOnlyExtents(t *testing.T) {
 	if _, err := f.ReadAt(buf, 5*4096); err != nil {
 		t.Fatalf("read root inode: %v", err)
 	}
-	root, err := types.UnmarshalInode(buf)
+	root, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal root inode: %v", err)
 	}
@@ -1288,7 +1288,7 @@ func TestFsckRepairOnlyLinks(t *testing.T) {
 	if _, err := f.ReadAt(buf, 5*4096+512); err != nil {
 		t.Fatalf("read file inode: %v", err)
 	}
-	file, err := types.UnmarshalInode(buf)
+	file, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal file inode: %v", err)
 	}
@@ -1305,7 +1305,7 @@ func TestFsckRepairOnlyLinks(t *testing.T) {
 	if _, err := f.ReadAt(buf, 5*4096+1024); err != nil {
 		t.Fatalf("read subdir inode: %v", err)
 	}
-	subdir, err := types.UnmarshalInode(buf)
+	subdir, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal subdir inode: %v", err)
 	}
@@ -1316,7 +1316,7 @@ func TestFsckRepairOnlyLinks(t *testing.T) {
 	if _, err := f.ReadAt(buf, 5*4096); err != nil {
 		t.Fatalf("read root inode: %v", err)
 	}
-	root, err := types.UnmarshalInode(buf)
+	root, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal root inode: %v", err)
 	}
@@ -1370,7 +1370,7 @@ func TestFsckOptimize(t *testing.T) {
 	if _, err := f.ReadAt(buf, 5*4096+512); err != nil {
 		t.Fatalf("read file inode: %v", err)
 	}
-	file, err := types.UnmarshalInode(buf)
+	file, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal file inode: %v", err)
 	}

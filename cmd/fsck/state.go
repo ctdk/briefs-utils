@@ -4,16 +4,16 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 // fsckError tracks the total error count across all checks.
 type fsckState struct {
 	errors int
 	file   *os.File
-	sb     *types.SuperblockLayout
+	sb     *briefs.SuperblockLayout
 	// Collected during inode table scan for cross-referencing
-	inodes      map[uint64]*types.Inode // ino -> inode
+	inodes      map[uint64]*briefs.Inode // ino -> inode
 	dirs        []dirInfo               // directories with trie roots
 	usedBlocks  map[uint64]bool         // all blocks referenced by extents or trie nodes
 	entryCounts map[uint64]int          // ino -> number of directory entries referencing it
@@ -27,11 +27,11 @@ type fsckState struct {
 // are staged here before being written back to disk.
 type repairPlan struct {
 	// Allocator state rebuilt from the post-repair metadata.
-	dataAlloc  *types.AllocBuilder
-	inodeAlloc *types.AllocBuilder
+	dataAlloc  *briefs.AllocBuilder
+	inodeAlloc *briefs.AllocBuilder
 
 	// Inodes that have been modified and need to be written back.
-	inodes map[uint64]*types.Inode
+	inodes map[uint64]*briefs.Inode
 
 	// Allocator and superblock free counts derived from the plan.
 	freeDataBlks  uint64

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 // verifyBlockCrossReference checks that every block referenced by inode extents
@@ -143,12 +143,12 @@ func verifyDirEntryCrossReference(fs *fsckState, entries []trieEntry) {
 		// ftype is stored as (S_IFMT >> 12): 4 for directories, 8 for regular
 		// files, 10 for symbolic links.
 		var expectedFType uint8
-		switch in.Filemode & types.ModeTypeMask {
-		case types.ModeDir:
+		switch in.Filemode & briefs.ModeTypeMask {
+		case briefs.ModeDir:
 			expectedFType = 4 // S_IFDIR >> 12
-		case types.ModeFile:
+		case briefs.ModeFile:
 			expectedFType = 8 // S_IFREG >> 12
-		case types.ModeSymlink:
+		case briefs.ModeSymlink:
 			expectedFType = 10 // S_IFLNK >> 12
 		}
 		if expectedFType != 0 && e.FType != expectedFType {
@@ -200,12 +200,12 @@ func verifyExtentOverlaps(fs *fsckState) {
 	}
 	var allExtents []extentRef
 
-	addExtent := func(ino uint64, ext types.Extent) {
+	addExtent := func(ino uint64, ext briefs.Extent) {
 		// Skip hole extents — no physical backing
-		if ext.Flags&types.ExtentFlagHole != 0 {
+		if ext.Flags&briefs.ExtentFlagHole != 0 {
 			return
 		}
-		if ext.Flags&^(uint32(types.ExtentFlagHole|types.ExtentFlagEof)) != 0 {
+		if ext.Flags&^(uint32(briefs.ExtentFlagHole|briefs.ExtentFlagEof)) != 0 {
 			fs.warnf("ino %d: extent with unknown flags 0x%08X (phys=%d, len=%d)",
 				ino, ext.Flags, ext.Phys, ext.Len)
 		}
@@ -215,7 +215,7 @@ func verifyExtentOverlaps(fs *fsckState) {
 	}
 
 	for ino, in := range fs.inodes {
-		if in.Flags&types.InodeFlagInlineData != 0 {
+		if in.Flags&briefs.InodeFlagInlineData != 0 {
 			continue
 		}
 		// Walk inline extents
@@ -226,20 +226,20 @@ func verifyExtentOverlaps(fs *fsckState) {
 
 		// Walk overflow chain extents
 		if in.NumExtentsTotal > uint64(in.NumExtentsInline) && in.ExtentInlineBase != 0 {
-			extentsPerBlock := types.ExtentsPerChainBlock(fs.sb.BlockSize)
+			extentsPerBlock := briefs.ExtentsPerChainBlock(fs.sb.BlockSize)
 			chainBlock := in.ExtentInlineBase
 			for chainBlock != 0 {
 				buf := make([]byte, fs.sb.BlockSize)
 				if _, err := fs.file.ReadAt(buf, int64(chainBlock*fs.sb.BlockSize)); err != nil {
 					break
 				}
-				if err := types.VerifyChainChecksum(buf, fs.sb.BlockSize); err != nil {
+				if err := briefs.VerifyChainChecksum(buf, fs.sb.BlockSize); err != nil {
 					fs.errorf("ino %d: extent chain block %d: checksum mismatch", ino, chainBlock)
 					break
 				}
-				hdr := types.UnmarshalExtentChainHeader(buf)
+				hdr := briefs.UnmarshalExtentChainHeader(buf)
 				for i := uint32(0); i < hdr.NumExtentsInBlock && i < uint32(extentsPerBlock); i++ {
-					ext := types.ReadChainExtent(buf, int(i))
+					ext := briefs.ReadChainExtent(buf, int(i))
 					addExtent(ino, ext)
 				}
 				chainBlock = hdr.NextOverflowBlock

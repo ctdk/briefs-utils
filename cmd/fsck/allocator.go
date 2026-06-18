@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 // verifyAllocatorPool reads and prints the allocator pool header.
 func verifyAllocatorPool(file *os.File, poolBlock, blockSize uint64, label string) error {
-	hdr, err := types.ReadAllocatorHeader(file, poolBlock, blockSize)
+	hdr, err := briefs.ReadAllocatorHeader(file, poolBlock, blockSize)
 	if err != nil {
 		return err
 	}
@@ -23,7 +23,7 @@ func verifyAllocatorPool(file *os.File, poolBlock, blockSize uint64, label strin
 
 // readAllocatorHeader reads the allocator pool header and returns all fields.
 func readAllocatorHeader(file *os.File, poolBlock, blockSize uint64) (l0w, l1w, l2w, blockCount, freeCount uint64, err error) {
-	hdr, err := types.ReadAllocatorHeader(file, poolBlock, blockSize)
+	hdr, err := briefs.ReadAllocatorHeader(file, poolBlock, blockSize)
 	if err != nil {
 		return 0, 0, 0, 0, 0, err
 	}
@@ -210,7 +210,7 @@ func popcount64(x uint64) int {
 
 // readAllocatorL2 reads the L2 bitmap words from an allocator pool.
 func readAllocatorL2(file *os.File, poolBlock, blockSize uint64) (l2 []uint64, l2w uint64, blockCount uint64, err error) {
-	_, _, l2, hdr, err := types.ReadAllocatorBitmap(file, poolBlock, blockSize)
+	_, _, l2, hdr, err := briefs.ReadAllocatorBitmap(file, poolBlock, blockSize)
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -252,7 +252,7 @@ func verifyInodeBitmapCrossReference(fs *fsckState, blockSize, inodeSize uint64)
 			b := (ino - 1) % 64
 			allocated := w < uint64(len(l2)) && (l2[w]&(1<<b)) == 0
 
-			hasMagic := magic == types.MagicInode
+			hasMagic := magic == briefs.MagicInode
 
 			if allocated && !hasMagic {
 				if badAllocated < 20 {

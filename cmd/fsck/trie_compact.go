@@ -6,7 +6,7 @@ import (
 	"os"
 	"sort"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 // compactTrieNode is an in-memory node used while rebuilding a directory trie.
@@ -77,7 +77,7 @@ func compactDirectoryTries(fs *fsckState, plan *repairPlan, blockSize uint64) er
 			clone := *orig
 			dirIno = &clone
 		}
-		dirIno.DirTrieRoot = types.TrieMakeRef(root.Block, root.Slot)
+		dirIno.DirTrieRoot = briefs.TrieMakeRef(root.Block, root.Slot)
 		plan.inodes[d.ino] = dirIno
 
 		// Free old trie blocks.
@@ -94,7 +94,7 @@ func compactDirectoryTries(fs *fsckState, plan *repairPlan, blockSize uint64) er
 func buildCompactTrie(entries []trieEntry) *compactTrieNode {
 	root := &compactTrieNode{
 		Depth:    0,
-		NodeType: types.NodeTypeInterm,
+		NodeType: briefs.NodeTypeInterm,
 	}
 	for _, e := range entries {
 		insertCompactTrieEntry(root, e.Name, e.Inode, e.FType)
@@ -119,7 +119,7 @@ func insertCompactTrieEntry(root *compactTrieNode, name string, inode uint64, ft
 			child = &compactTrieNode{
 				Depth:    depth,
 				ByteVal:  b,
-				NodeType: types.NodeTypeInterm,
+				NodeType: briefs.NodeTypeInterm,
 				Parent:   cur,
 			}
 			cur.Children = append(cur.Children, child)
@@ -129,10 +129,10 @@ func insertCompactTrieEntry(root *compactTrieNode, name string, inode uint64, ft
 	cur.Name = name
 	cur.Inode = inode
 	cur.FType = ftype
-	if cur.NodeType&types.NodeTypeInterm != 0 {
-		cur.NodeType |= types.NodeStatusLeaf
+	if cur.NodeType&briefs.NodeTypeInterm != 0 {
+		cur.NodeType |= briefs.NodeStatusLeaf
 	} else {
-		cur.NodeType = types.NodeTypeInterm | types.NodeStatusLeaf
+		cur.NodeType = briefs.NodeTypeInterm | briefs.NodeStatusLeaf
 	}
 }
 
@@ -236,8 +236,8 @@ func packCompactTrie(root *compactTrieNode, blockSize uint64, allocBlock func() 
 func writeCompactTriePages(file *os.File, pages []*compactTriePage, blockSize uint64) error {
 	for _, p := range pages {
 		buf := make([]byte, blockSize)
-		binary.LittleEndian.PutUint32(buf[0:], types.MagicTriePage)
-		binary.LittleEndian.PutUint32(buf[4:], types.TriePageVersion)
+		binary.LittleEndian.PutUint32(buf[0:], briefs.MagicTriePage)
+		binary.LittleEndian.PutUint32(buf[4:], briefs.TriePageVersion)
 		binary.LittleEndian.PutUint16(buf[8:], uint16(p.SlotsUsed))
 		binary.LittleEndian.PutUint16(buf[10:], p.NameOff)
 		freeSlots := ^uint64(0)
@@ -252,7 +252,7 @@ func writeCompactTriePages(file *os.File, pages []*compactTriePage, blockSize ui
 			var firstChild uint64
 			if len(node.Children) > 0 {
 				c := node.Children[0]
-				firstChild = types.TrieMakeRef(c.Block, c.Slot)
+				firstChild = briefs.TrieMakeRef(c.Block, c.Slot)
 			}
 
 			var nextSibling uint64
@@ -260,7 +260,7 @@ func writeCompactTriePages(file *os.File, pages []*compactTriePage, blockSize ui
 				for i, sibling := range node.Parent.Children {
 					if sibling == node && i+1 < len(node.Parent.Children) {
 						next := node.Parent.Children[i+1]
-						nextSibling = types.TrieMakeRef(next.Block, next.Slot)
+						nextSibling = briefs.TrieMakeRef(next.Block, next.Slot)
 						break
 					}
 				}

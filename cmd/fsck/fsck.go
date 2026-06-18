@@ -8,11 +8,9 @@ import (
 	"strings"
 
 	"github.com/ctdk/briefs-utils/device"
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 	"github.com/urfave/cli/v2"
 )
-
-var versionStr = fmt.Sprintf("v%d.%d.%d", types.BrieFSMajorVersion, types.BrieFSMinorVersion, types.BrieFSPatchVersion)
 
 // parseRepairOptions converts a comma-separated phase list into a repairOptions
 // value. An empty list or "all" enables every phase.
@@ -53,7 +51,7 @@ func main() {
 		Name:     "fsck.briefs",
 		Usage:    "Check and repair a BrieFS filesystem",
 		ArgsUsage: "DEVICE",
-		Version:  versionStr,
+		Version:  briefs.VersionStr,
 		Before: func(c *cli.Context) error {
 			if c.Args().Len() < 1 {
 				return fmt.Errorf("missing required argument: DEVICE")
@@ -225,7 +223,7 @@ func main() {
 				}
 				fmt.Fprintf(os.Stderr, "\nRepair complete. Re-running verification pass...\n")
 				fs.errors = 0
-				fs.inodes = make(map[uint64]*types.Inode)
+				fs.inodes = make(map[uint64]*briefs.Inode)
 				fs.dirs = nil
 				fs.usedBlocks = make(map[uint64]bool)
 				fs.entryCounts = make(map[uint64]int)
