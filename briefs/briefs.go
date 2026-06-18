@@ -95,8 +95,14 @@ const (
 
 	// BrieFS version numbers for this version of briefs-utils
 	BrieFSMajorVersion = 0
-	BrieFSMinorVersion = 8
+	BrieFSMinorVersion = 9
 	BrieFSPatchVersion = 0
+
+	// feature_incompat bits (superblock FeatIncompat field). A clean break gates
+	// the on-disk format: mkfs sets the bits for the features it writes;
+	// ReadSuperblock rejects an image whose incompat bits are not all understood.
+	// The v0.9.0 B+ tree extent index is the first one.
+	FeatureIncompatBtree = 0x0000000000000001 // B+ tree extent index (v0.9.0)
 )
 
 var VersionStr = fmt.Sprintf("v%d.%d.%d", BrieFSMajorVersion, BrieFSMinorVersion, BrieFSPatchVersion)
@@ -167,43 +173,9 @@ const ExtentChainHeaderSize = 16
 const ExtentChainChecksumSize = 8
 
 // ExtentChainChecksumOffset is the byte offset of the checksum field within a
-// chain block. It follows the 16-byte header and 127 inline extents.
+// 4096-byte metadata block (chain block historically; now also the B+ tree
+// node). It follows the 16-byte header and 127 inline extents / leaf records.
 const ExtentChainChecksumOffset = ExtentChainHeaderSize + 127*32 // 4080 for 4KiB blocks
-
-// ExtentsPerChainBlock returns how many extents fit in one chain block.
-func ExtentsPerChainBlock(blockSize uint64) int {
-	return int((blockSize - ExtentChainHeaderSize - ExtentChainChecksumSize) / 32)
-}
-
-// ExtentChainHeader is the on-disk header of an extent chain block.
-// Matches struct briefs_extent_chain in the kernel module.
-type ExtentChainHeader struct {
-	NextOverflowBlock uint64 // block number of next chain block, 0 if last
-	NumExtentsInBlock uint32 // number of extents stored in this block
-	Pad               uint32
-	// Followed by extents, then a u64 checksum at block_size - 8
-}
-
-// UnmarshalExtentChainHeader reads the chain header from a block buffer.
-func UnmarshalExtentChainHeader(buf []byte) *ExtentChainHeader {
-	return &ExtentChainHeader{
-		NextOverflowBlock: binary.LittleEndian.Uint64(buf[0:]),
-		NumExtentsInBlock: binary.LittleEndian.Uint32(buf[8:]),
-		Pad:               binary.LittleEndian.Uint32(buf[12:]),
-	}
-}
-
-// ReadChainExtent reads the i-th extent from a chain block buffer.
-func ReadChainExtent(buf []byte, i int) Extent {
-	offset := ExtentChainHeaderSize + i*32
-	return Extent{
-		Offset: binary.LittleEndian.Uint64(buf[offset:]),
-		Phys:   binary.LittleEndian.Uint64(buf[offset+8:]),
-		Len:    binary.LittleEndian.Uint64(buf[offset+16:]),
-		Flags:  binary.LittleEndian.Uint32(buf[offset+24:]),
-		Pad:    binary.LittleEndian.Uint32(buf[offset+28:]),
-	}
-}
 
 // ReadChainChecksum reads the checksum field from a chain block buffer.
 func ReadChainChecksum(buf []byte, blockSize uint64) uint64 {

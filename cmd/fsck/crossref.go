@@ -218,32 +218,15 @@ func verifyExtentOverlaps(fs *fsckState) {
 		if in.Flags&briefs.InodeFlagInlineData != 0 {
 			continue
 		}
-		// Walk inline extents
-		inlineExtents := in.InlineExtents()
-		for ei := uint32(0); ei < in.NumExtentsInline; ei++ {
-			addExtent(ino, inlineExtents[ei])
+		// Walk every extent (inline array or B+ tree) in ascending offset order.
+		visit := func(ext briefs.Extent) error {
+			addExtent(ino, ext)
+			return nil
 		}
-
-		// Walk overflow chain extents
-		if in.NumExtentsTotal > uint64(in.NumExtentsInline) && in.ExtentInlineBase != 0 {
-			extentsPerBlock := briefs.ExtentsPerChainBlock(fs.sb.BlockSize)
-			chainBlock := in.ExtentInlineBase
-			for chainBlock != 0 {
-				buf := make([]byte, fs.sb.BlockSize)
-				if _, err := fs.file.ReadAt(buf, int64(chainBlock*fs.sb.BlockSize)); err != nil {
-					break
-				}
-				if err := briefs.VerifyChainChecksum(buf, fs.sb.BlockSize); err != nil {
-					fs.errorf("ino %d: extent chain block %d: checksum mismatch", ino, chainBlock)
-					break
-				}
-				hdr := briefs.UnmarshalExtentChainHeader(buf)
-				for i := uint32(0); i < hdr.NumExtentsInBlock && i < uint32(extentsPerBlock); i++ {
-					ext := briefs.ReadChainExtent(buf, int(i))
-					addExtent(ino, ext)
-				}
-				chainBlock = hdr.NextOverflowBlock
-			}
+		if err := briefs.IterateInodeExtents(fs.file, in, fs.sb.BlockSize, briefs.InodeExtentVisitor{
+			VisitExtent: visit,
+		}); err != nil {
+			fs.errorf("ino %d: %v", ino, err)
 		}
 	}
 

@@ -48,13 +48,28 @@ func verifyInode(buf []byte, ino, byteOffset, inodeSize uint64) (*briefs.Inode, 
 		if in.IsDir() {
 			return nil, fmt.Errorf("ino %d: directory cannot use inline data", ino)
 		}
+	} else if in.Flags&briefs.InodeFlagIndexed != 0 {
+		// Tree-backed: extents live in a B+ tree rooted at ExtentInlineBase.
+		// On spill the kernel zeroes the inline array and NumExtentsInline.
+		if in.NumExtentsInline != 0 {
+			return nil, fmt.Errorf("ino %d: tree-backed inode has %d inline extents (must be 0)", ino, in.NumExtentsInline)
+		}
+		if in.ExtentInlineBase == 0 {
+			return nil, fmt.Errorf("ino %d: tree-backed inode has no root (extent_inline_base=0)", ino)
+		}
+		if in.NumExtentsTotal == 0 {
+			return nil, fmt.Errorf("ino %d: tree-backed inode claims 0 extents (should be inline-only)", ino)
+		}
 	} else {
-		// Validate extent counts
+		// Inline-only: up to 8 extents in the inode.
 		if in.NumExtentsInline > 8 {
 			return nil, fmt.Errorf("ino %d: too many inline extents %d", ino, in.NumExtentsInline)
 		}
 		if in.NumExtentsTotal < uint64(in.NumExtentsInline) {
 			return nil, fmt.Errorf("ino %d: total extents %d < inline extents %d", ino, in.NumExtentsTotal, in.NumExtentsInline)
+		}
+		if in.ExtentInlineBase != 0 {
+			return nil, fmt.Errorf("ino %d: inline-only inode has extent_inline_base %d (must be 0)", ino, in.ExtentInlineBase)
 		}
 	}
 
@@ -149,93 +164,43 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 	return
 }
 
-// collectInodeExtents collects all blocks referenced by an inode's extents,
-// including both inline extents and overflow chain blocks.
+// collectInodeExtents collects all blocks referenced by an inode's extents
+// (and, for tree-backed inodes, the B-tree node blocks themselves) into
+// fs.usedBlocks for cross-referencing against the allocator bitmap.
 func collectInodeExtents(fs *fsckState, ino uint64, in *briefs.Inode, blockSize uint64) {
 	// Inline-data inodes reference no data blocks.
 	if in.Flags&briefs.InodeFlagInlineData != 0 {
 		return
 	}
 
-	// Helper to record the blocks from a single extent.
-	// Skips hole extents (ExtentFlagHole) which have no physical backing.
-	addExtentBlocks := func(ext briefs.Extent) {
-		// Validate extent flags
+	// Record the blocks from a single extent (skips hole extents).
+	addExtentBlocks := func(ext briefs.Extent) error {
 		if ext.Flags&briefs.ExtentFlagHole != 0 {
-			// Hole extent — no physical blocks, skip
-			return
+			return nil
 		}
-		if ext.Flags&briefs.ExtentFlagEof != 0 {
-			// EOF marker — should only appear on the last extent
-			// (we can't easily verify that here, but it's valid)
-		}
-		if ext.Flags & ^(uint32(briefs.ExtentFlagHole|briefs.ExtentFlagEof)) != 0 {
+		if ext.Flags&^(uint32(briefs.ExtentFlagHole|briefs.ExtentFlagEof)) != 0 {
 			fs.warnf("ino %d: extent with unknown flags 0x%08X (phys=%d, len=%d)",
 				ino, ext.Flags, ext.Phys, ext.Len)
 		}
-
 		if ext.Len > 0 && ext.Phys > 0 {
 			for bk := uint64(0); bk < ext.Len; bk++ {
 				fs.usedBlocks[ext.Phys+bk] = true
 			}
 		}
+		return nil
 	}
 
-	// Collect inline extents
-	inlineExtents := in.InlineExtents()
-	for ei := uint32(0); ei < in.NumExtentsInline; ei++ {
-		addExtentBlocks(inlineExtents[ei])
+	// Record every B-tree node block as used metadata.
+	addNodeBlock := func(block uint64) error {
+		fs.usedBlocks[block] = true
+		return nil
 	}
 
-	// Collect overflow extents from chain blocks
-	if in.NumExtentsTotal > uint64(in.NumExtentsInline) && in.ExtentInlineBase != 0 {
-		extentsPerBlock := briefs.ExtentsPerChainBlock(blockSize)
-		remaining := int(in.NumExtentsTotal) - int(in.NumExtentsInline)
-		chainBlock := in.ExtentInlineBase
-
-		for chainBlock != 0 && remaining > 0 {
-			buf := make([]byte, blockSize)
-			if _, err := fs.file.ReadAt(buf, int64(chainBlock*blockSize)); err != nil {
-				fs.errorf("ino %d: read extent chain block %d: %v", ino, chainBlock, err)
-				break
-			}
-
-			// Verify extent chain block checksum
-			if err := briefs.VerifyChainChecksum(buf, blockSize); err != nil {
-				fs.errorf("ino %d: extent chain block %d: checksum mismatch (stored=0x%08X computed=0x%08X)", ino, chainBlock, briefs.ReadChainChecksum(buf, blockSize), briefs.ComputeChainChecksum(buf, blockSize))
-				break
-			}
-
-			hdr := briefs.UnmarshalExtentChainHeader(buf)
-
-			// Validate extent count vs capacity
-			if hdr.NumExtentsInBlock > uint32(extentsPerBlock) {
-				fs.errorf("ino %d: extent chain block %d: %d extents exceeds block capacity %d",
-					ino, chainBlock, hdr.NumExtentsInBlock, extentsPerBlock)
-				break
-			}
-
-			// Record chain block itself as used (it's metadata)
-			fs.usedBlocks[chainBlock] = true
-
-			// Process extents in this chain block
-			n := int(hdr.NumExtentsInBlock)
-			if n > remaining {
-				n = remaining
-			}
-			for i := 0; i < n; i++ {
-				ext := briefs.ReadChainExtent(buf, i)
-				addExtentBlocks(ext)
-			}
-
-			remaining -= n
-			chainBlock = hdr.NextOverflowBlock
-		}
-
-		if remaining > 0 {
-			fs.errorf("ino %d: extent chain ended early: %d extents left unreachable (total=%d, inline=%d)",
-				ino, remaining, in.NumExtentsTotal, in.NumExtentsInline)
-		}
+	if err := briefs.IterateInodeExtents(fs.file, in, blockSize, briefs.InodeExtentVisitor{
+		VisitNode:   addNodeBlock,
+		VisitExtent: addExtentBlocks,
+	}); err != nil {
+		fs.errorf("ino %d: %v", ino, err)
 	}
 }
 

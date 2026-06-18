@@ -111,31 +111,21 @@ var _ = (fs.NodeOpener)((*brieFSNode)(nil))
 var _ = (fs.NodeReader)((*brieFSNode)(nil))
 var _ = (fs.NodeStatfser)((*brieFSNode)(nil))
 
-// readExtent reads the i-th extent from an inode, walking chain blocks
-// if the extent is beyond the 8 inline slots.
-func (n *brieFSNode) readExtent(diskInode *briefs.Inode, idx int) (briefs.Extent, error) {
-	if idx < 8 {
-		return diskInode.InlineExtents()[idx], nil
-	}
-
-	chainIdx := idx - 8
-	chainBlock := diskInode.ExtentInlineBase
-	for chainBlock != 0 {
-		buf, err := n.bfs.dev.ReadBlock(chainBlock)
-		if err != nil {
-			return briefs.Extent{}, fmt.Errorf("read chain block %d: %w", chainBlock, err)
-		}
-		if err := briefs.VerifyChainChecksum(buf, n.bfs.blockSize); err != nil {
-			return briefs.Extent{}, fmt.Errorf("chain block %d: checksum mismatch", chainBlock)
-		}
-		hdr := briefs.UnmarshalExtentChainHeader(buf)
-		if chainIdx < int(hdr.NumExtentsInBlock) {
-			return briefs.ReadChainExtent(buf, chainIdx), nil
-		}
-		chainIdx -= int(hdr.NumExtentsInBlock)
-		chainBlock = hdr.NextOverflowBlock
-	}
-	return briefs.Extent{}, fmt.Errorf("extent index %d out of range (total=%d)", idx, diskInode.NumExtentsTotal)
+// collectExtents returns every extent of an inode in ascending offset order,
+// via briefs.IterateInodeExtents (which dispatches on InodeFlagIndexed: inline
+// array for inline-only inodes, B+ tree leaves for tree-backed inodes, and no
+// extents for inline-data inodes). Replaces the old chain-block walk; the chain
+// format no longer exists on v0.9 images.
+func (n *brieFSNode) collectExtents(diskInode *briefs.Inode) ([]briefs.Extent, error) {
+	var exts []briefs.Extent
+	err := briefs.IterateInodeExtents(n.bfs.dev.File(), diskInode, n.bfs.blockSize,
+		briefs.InodeExtentVisitor{
+			VisitExtent: func(ext briefs.Extent) error {
+				exts = append(exts, ext)
+				return nil
+			},
+		})
+	return exts, err
 }
 
 func (n *brieFSNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -157,11 +147,11 @@ func (n *brieFSNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.Att
 	out.Ctimensec = uint32(diskInode.CtimeNsec)
 
 	totalBlocks := uint64(0)
-	for i := 0; i < int(diskInode.NumExtentsTotal); i++ {
-		ext, err := n.readExtent(diskInode, i)
-		if err != nil {
-			break
-		}
+	exts, err := n.collectExtents(diskInode)
+	if err != nil {
+		return syscall.EIO
+	}
+	for _, ext := range exts {
 		totalBlocks += ext.Len
 	}
 	out.Blocks = totalBlocks * (n.bfs.blockSize / 512)
@@ -199,11 +189,11 @@ func (n *brieFSNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 	out.Ctimensec = uint32(childInode.CtimeNsec)
 
 	totalBlocks := uint64(0)
-	for i := 0; i < int(childInode.NumExtentsTotal); i++ {
-		ext, err := n.readExtent(childInode, i)
-		if err != nil {
-			break
-		}
+	childExts, err := n.collectExtents(childInode)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	for _, ext := range childExts {
 		totalBlocks += ext.Len
 	}
 	out.Blocks = totalBlocks * (n.bfs.blockSize / 512)
@@ -311,13 +301,12 @@ func (n *brieFSNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off
 		return fuse.ReadResultData(readBuf[:nc]), 0
 	}
 
-	// Walk all extents (inline + chain)
-	for i := 0; i < int(diskInode.NumExtentsTotal); i++ {
-		ext, err := n.readExtent(diskInode, i)
-		if err != nil {
-			return nil, syscall.EIO
-		}
-
+	// Walk all extents (inline array or B+ tree) in ascending offset order.
+	exts, err := n.collectExtents(diskInode)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	for _, ext := range exts {
 		extStart := int64(ext.Offset) * blkSize
 		extEnd := extStart + int64(ext.Len)*blkSize
 

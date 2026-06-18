@@ -1,0 +1,248 @@
+package briefs
+
+// B+ tree extent index (v0.9.0). Mirrors struct briefs_extent_btree_node and
+// friends from the kernel module's briefs.h / briefs_btree.c.
+//
+// A tree-backed inode (InodeFlagIndexed set, ExtentInlineBase == root block)
+// stores its extents in the leaves of an offset-keyed B+ tree. An inline-only
+// inode (flag clear, ExtentInlineBase == 0) keeps up to 8 extents in the inode
+// itself. The 9th extent spills inline -> tree.
+//
+// Node layout (4096 bytes): 24-byte header, payload, u64 checksum at offset
+// 4080, 8 bytes slack. The checksum covers bytes [0, 4080) — identical coverage
+// to the legacy extent chain block — so ComputeChainChecksum / ReadChainChecksum
+// are reused verbatim.
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"os"
+)
+
+// BtreeMagic is the magic number stored in every B+ tree node header ("BTRE").
+const BtreeMagic = 0x42545245
+
+// BtreeFlagLeaf is the flags bit marking a node as a leaf (bit 0).
+const BtreeFlagLeaf = 0x0001
+
+// BtreeHeaderSize is the size of struct briefs_btree_header in bytes.
+const BtreeHeaderSize = 24
+
+// BtreeChecksumOffset is the byte offset of the checksum field. Same as the
+// chain block (4080): coverage is [0, BtreeChecksumOffset).
+const BtreeChecksumOffset = ExtentChainChecksumOffset
+
+// BtreeLeafFanout is the max number of extent records in a leaf node:
+// (BlockSize - HeaderSize - ChecksumAndSlack) / 32 = (4096 - 24 - 16) / 32 = 126.
+const BtreeLeafFanout = 126
+
+// BtreeIdxFanout is the max number of separator keys (and idx entries) in an
+// internal node: (4096 - 24 - 16 - 8 trailing_child) / 16 = 253.
+const BtreeIdxFanout = 253
+
+// BtreeTrailingChildOffset is the fixed offset of an internal node's
+// trailing_child field: HeaderSize + BtreeIdxFanout*16 = 24 + 4048 = 4072.
+const BtreeTrailingChildOffset = BtreeHeaderSize + BtreeIdxFanout*16
+
+// BtreeMaxDepth caps recursive descent as a guard against corrupt/cyclic
+// trees. A 16-level tree holds far more extents than any real file.
+const BtreeMaxDepth = 16
+
+// Errors returned by the B-tree walk. fsck formats these with the offending
+// inode/block number.
+var (
+	ErrBtreeBadMagic    = errors.New("bad magic")
+	ErrBtreeChecksum    = errors.New("checksum mismatch")
+	ErrBtreeDepth       = errors.New("depth exceeded")
+	ErrBtreeCycle       = errors.New("cycle detected")
+	ErrBtreeUnsorted    = errors.New("extents unsorted")
+	ErrBtreeCountOverflow = errors.New("count exceeds fanout")
+)
+
+// BtreeNodeHeader is the 24-byte on-disk header of a B+ tree node.
+type BtreeNodeHeader struct {
+	Magic    uint32
+	Flags    uint32
+	Level    uint16
+	NumKeys  uint16
+	PrevLeaf uint64
+	NextLeaf uint64
+}
+
+// UnmarshalBtreeHeader reads the node header from a block buffer.
+func UnmarshalBtreeHeader(buf []byte) BtreeNodeHeader {
+	return BtreeNodeHeader{
+		Magic:    binary.LittleEndian.Uint32(buf[0:]),
+		Flags:    binary.LittleEndian.Uint32(buf[4:]),
+		Level:    binary.LittleEndian.Uint16(buf[8:]),
+		NumKeys:  binary.LittleEndian.Uint16(buf[10:]),
+		PrevLeaf: binary.LittleEndian.Uint64(buf[12:]),
+		NextLeaf: binary.LittleEndian.Uint64(buf[20:]),
+	}
+}
+
+// IsLeaf reports whether the node header marks a leaf.
+func (h BtreeNodeHeader) IsLeaf() bool {
+	return h.Flags&BtreeFlagLeaf != 0
+}
+
+// ReadBtreeLeafExtent reads the i-th extent from a B-tree leaf node buffer.
+func ReadBtreeLeafExtent(buf []byte, i int) Extent {
+	offset := BtreeHeaderSize + i*32
+	return Extent{
+		Offset: binary.LittleEndian.Uint64(buf[offset:]),
+		Phys:   binary.LittleEndian.Uint64(buf[offset+8:]),
+		Len:    binary.LittleEndian.Uint64(buf[offset+16:]),
+		Flags:  binary.LittleEndian.Uint32(buf[offset+24:]),
+		Pad:    binary.LittleEndian.Uint32(buf[offset+28:]),
+	}
+}
+
+// BtreeIdxEntry is one internal-node entry: a child block pointer and the
+// high_key separator (the smallest key in the right sibling, > 0).
+type BtreeIdxEntry struct {
+	Child   uint64
+	HighKey uint64
+}
+
+// ReadBtreeIdxEntry reads the i-th internal idx entry from a node buffer.
+func ReadBtreeIdxEntry(buf []byte, i int) BtreeIdxEntry {
+	offset := BtreeHeaderSize + i*16
+	return BtreeIdxEntry{
+		Child:   binary.LittleEndian.Uint64(buf[offset:]),
+		HighKey: binary.LittleEndian.Uint64(buf[offset+8:]),
+	}
+}
+
+// BtreeTrailingChild reads the trailing_child pointer of an internal node.
+func BtreeTrailingChild(buf []byte) uint64 {
+	return binary.LittleEndian.Uint64(buf[BtreeTrailingChildOffset:])
+}
+
+// VerifyBtreeNodeChecksum checks a B-tree node's checksum (no legacy zero
+// exemption: a B-tree node always carries a real checksum). Returns nil if OK.
+func VerifyBtreeNodeChecksum(buf []byte, blockSize uint64) error {
+	if uint64(len(buf)) < blockSize || blockSize < BtreeChecksumOffset {
+		return ErrBtreeChecksum
+	}
+	stored := ReadChainChecksum(buf, blockSize)
+	if stored == 0 {
+		return ErrBtreeChecksum
+	}
+	if stored != ComputeChainChecksum(buf, blockSize) {
+		return ErrBtreeChecksum
+	}
+	return nil
+}
+
+// InodeExtentVisitor is called by IterateInodeExtents. VisitNode is invoked
+// for every B-tree node block read (leaf or internal) so the caller can record
+// it as a used metadata block; VisitExtent is invoked once per leaf extent in
+// ascending offset order. For inline-only inodes only VisitExtent is called
+// (no nodes). A non-nil error from either aborts the walk.
+type InodeExtentVisitor struct {
+	VisitNode   func(block uint64) error
+	VisitExtent func(ext Extent) error
+}
+
+// IterateInodeExtents walks every extent of @in in ascending logical-offset
+// order, dispatching to the visitor. Handles inline-data (no extents),
+// inline-only (the inline array), and tree-backed (B+ tree leaves via
+// next_leaf) inodes. The tree descent is bounded by BtreeMaxDepth and a
+// visited-set cycle guard. Returns the first visitor error or a tree-structure
+// error (wrapped with the offending block number).
+func IterateInodeExtents(file *os.File, in *Inode, blockSize uint64, v InodeExtentVisitor) error {
+	// Inline-data inodes reference no data extents.
+	if in.Flags&InodeFlagInlineData != 0 {
+		return nil
+	}
+
+	// Inline-only: walk the inline array (already sorted).
+	if in.Flags&InodeFlagIndexed == 0 {
+		inlineExtents := in.InlineExtents()
+		for ei := uint32(0); ei < in.NumExtentsInline; ei++ {
+			if v.VisitExtent != nil {
+				if err := v.VisitExtent(inlineExtents[ei]); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	// Tree-backed.
+	root := in.ExtentInlineBase
+	if root == 0 {
+		return nil
+	}
+	visited := make(map[uint64]bool)
+	return btreeWalk(file, root, blockSize, 0, visited, v)
+}
+
+// btreeWalk recursively descends the subtree rooted at @block, yielding leaf
+// extents. @depth bounds recursion; @visited guards against cycles.
+func btreeWalk(file *os.File, block, blockSize uint64, depth int, visited map[uint64]bool, v InodeExtentVisitor) error {
+	if block == 0 {
+		return nil
+	}
+	if depth > BtreeMaxDepth {
+		return fmt.Errorf("btree node %d: %w", block, ErrBtreeDepth)
+	}
+	if visited[block] {
+		return fmt.Errorf("btree node %d: %w", block, ErrBtreeCycle)
+	}
+	visited[block] = true
+
+	if v.VisitNode != nil {
+		if err := v.VisitNode(block); err != nil {
+			return err
+		}
+	}
+
+	buf := make([]byte, blockSize)
+	if _, err := file.ReadAt(buf, int64(block*blockSize)); err != nil {
+		return fmt.Errorf("btree node %d: read: %w", block, err)
+	}
+
+	hdr := UnmarshalBtreeHeader(buf)
+	if hdr.Magic != BtreeMagic {
+		return fmt.Errorf("btree node %d: %w (0x%08X)", block, ErrBtreeBadMagic, hdr.Magic)
+	}
+	if err := VerifyBtreeNodeChecksum(buf, blockSize); err != nil {
+		return fmt.Errorf("btree node %d: %w", block, err)
+	}
+
+	if hdr.IsLeaf() {
+		if int(hdr.NumKeys) > BtreeLeafFanout {
+			return fmt.Errorf("btree node %d: %w (leaf %d > %d)", block, ErrBtreeCountOverflow, hdr.NumKeys, BtreeLeafFanout)
+		}
+		var prevOffset uint64
+		for i := uint16(0); i < hdr.NumKeys; i++ {
+			ext := ReadBtreeLeafExtent(buf, int(i))
+			if i > 0 && ext.Offset <= prevOffset {
+				return fmt.Errorf("btree node %d: %w (offset %d after %d)", block, ErrBtreeUnsorted, ext.Offset, prevOffset)
+			}
+			prevOffset = ext.Offset
+			if v.VisitExtent != nil {
+				if err := v.VisitExtent(ext); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	// Internal node.
+	if int(hdr.NumKeys) > BtreeIdxFanout {
+		return fmt.Errorf("btree node %d: %w (internal %d > %d)", block, ErrBtreeCountOverflow, hdr.NumKeys, BtreeIdxFanout)
+	}
+	for i := uint16(0); i < hdr.NumKeys; i++ {
+		entry := ReadBtreeIdxEntry(buf, int(i))
+		if err := btreeWalk(file, entry.Child, blockSize, depth+1, visited, v); err != nil {
+			return err
+		}
+	}
+	trailing := BtreeTrailingChild(buf)
+	return btreeWalk(file, trailing, blockSize, depth+1, visited, v)
+}

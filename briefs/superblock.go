@@ -85,6 +85,7 @@ func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, labe
 	sb.Lay.MajorVer = BrieFSMajorVersion
 	sb.Lay.MinorVer = BrieFSMinorVersion
 	sb.Lay.PatchVer = BrieFSPatchVersion
+	sb.Lay.FeatIncompat = FeatureIncompatBtree
 	sb.Lay.TotalBlocks = totalBlocks
 	sb.Lay.BlockSize = blockSize
 	sb.Lay.InodeSize = inodeSize
@@ -172,6 +173,16 @@ func ReadSuperblock(r io.ReaderAt, blockSize uint64) (*SuperblockLayout, error) 
 	}
 	if sb.Magic != MagicSuperblock {
 		return nil, fmt.Errorf("bad superblock magic: 0x%016X (expected 0x%016X)", sb.Magic, MagicSuperblock)
+	}
+	// On-disk format gate (clean break, v0.9.0 B+ tree extent index).
+	if sb.MinorVer != BrieFSMinorVersion {
+		return nil, fmt.Errorf("incompatible on-disk minor version %d (need %d)", sb.MinorVer, BrieFSMinorVersion)
+	}
+	if sb.FeatIncompat&FeatureIncompatBtree == 0 {
+		return nil, fmt.Errorf("image is not B-tree formatted (feature_incompat 0x%016X)", sb.FeatIncompat)
+	}
+	if sb.FeatIncompat&^FeatureIncompatBtree != 0 {
+		return nil, fmt.Errorf("unknown incompatible feature bits 0x%016X", sb.FeatIncompat&^FeatureIncompatBtree)
 	}
 	return sb, nil
 }

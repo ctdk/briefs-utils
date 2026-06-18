@@ -39,6 +39,10 @@ func OpenBlockDevice(path string) (*BlockDevice, uint64, error) {
 	return bd, blockSize, nil
 }
 
+// File returns the underlying *os.File, so callers can use helpers that read
+// the device directly (e.g. briefs.IterateInodeExtents).
+func (bd *BlockDevice) File() *os.File { return bd.file }
+
 // ReadBlock reads a single block into a newly allocated []byte.
 // blockNum is 0-based.
 func (bd *BlockDevice) ReadBlock(blockNum uint64) ([]byte, error) {

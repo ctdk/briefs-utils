@@ -167,30 +167,68 @@ func writeTrieName(buf []byte, blockSize int, name string) uint16 {
 	return needed
 }
 
-// TestFsckRepairFragmentedFile creates a file with nine single-block extents
-// (so it must use chain blocks), then runs fsck --repair and verifies the
-// extents are merged into one inline extent and the file still passes fsck.
-func TestFsckRepairFragmentedFile(t *testing.T) {
+// TestFsckTreeBackedFile pokes a v0.9 B+ tree-backed file inode directly into
+// the inode table (9 single-block extents — one more than the 8 inline slots,
+// so it must live in a tree), then runs fsck and verifies:
+//   - the verify pass walks the B-tree root leaf cleanly (correct magic,
+//     checksum, sorted extents, no structural errors) and cross-references
+//     every data block and the tree node block against the allocator;
+//   - --repair does NOT corrupt the tree-backed inode (extent compaction is
+//     chain-based and must skip tree-backed inodes until tree-aware compaction
+//     lands — see #7 phase 4); after repair the inode is still tree-backed with
+//     9 extents and the same root.
+//
+// The inode is intentionally not linked into the root directory, so the final
+// pass reports it as unreachable. That single reachability error is expected and
+// tolerated — the test is validating the B-tree walk and repair-skip, not
+// directory connectivity.
+func TestFsckTreeBackedFile(t *testing.T) {
 	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
 	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
 
-	imgPath := filepath.Join(t.TempDir(), "frag.briefs")
+	imgPath := filepath.Join(t.TempDir(), "btree.briefs")
 	cmd := exec.Command(mkfsPath, "-s", "5000", imgPath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("mkfs failed: %v\n%s", err, out)
 	}
 
-	// Poke a fragmented file inode directly into the inode table.
-	// File inode 2 at inode table slot 1 (block 5, byte offset 512).
-	// Data region starts at TrieNodePoolStart + TrieNodePoolSize. For a 5000-block
-	// image that is block 90. We use a chain block at absolute block 110 and data
-	// blocks 100..108 for the file content.
+	// Layout for a 5000-block image (matches the chain test above):
+	//   inode bitmap   -> block 1   (bit 1 = inode 2)
+	//   inode table     -> block 5   (ino 2 at slot 1, byte offset 512)
+	//   data region     -> block 90  (data-relative 0 = abs 90)
+	//   data alloc L2   -> block 89  (data-relative N maps to L2 word 0, bit N)
+	// We use data blocks 100..108 (data-relative 10..18) for the file content
+	// and block 110 (data-relative 20) as the B-tree root leaf.
 	const (
-		chainBlockAbs = uint64(110)
-		dataStartAbs  = uint64(100)
+		rootLeafAbs   = uint64(110)
+		dataStartAbs   = uint64(100)
+		rootLeafRelBit = uint64(20) // data-relative block of the root leaf
 	)
 
+	// Build the B-tree root leaf: 9 single-block extents at logical offsets
+	// 0..8, physical blocks 100..108. A single leaf holds up to 126 extents,
+	// so 9 fits with no split.
+	leafBuf := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(leafBuf[0:], briefs.BtreeMagic) // magic
+	binary.LittleEndian.PutUint32(leafBuf[4:], briefs.BtreeFlagLeaf) // flags: leaf
+	binary.LittleEndian.PutUint16(leafBuf[8:], 0)  // level 0 = leaf
+	binary.LittleEndian.PutUint16(leafBuf[10:], 9) // num_keys
+	binary.LittleEndian.PutUint64(leafBuf[12:], 0) // prev_leaf
+	binary.LittleEndian.PutUint64(leafBuf[20:], 0) // next_leaf
+	for i := 0; i < 9; i++ {
+		off := briefs.BtreeHeaderSize + i*32
+		binary.LittleEndian.PutUint64(leafBuf[off:], uint64(i))          // offset
+		binary.LittleEndian.PutUint64(leafBuf[off+8:], dataStartAbs+uint64(i)) // phys
+		binary.LittleEndian.PutUint64(leafBuf[off+16:], 1)              // len
+		binary.LittleEndian.PutUint32(leafBuf[off+24:], 0)             // flags
+		binary.LittleEndian.PutUint32(leafBuf[off+28:], 0)             // pad
+	}
+	leafChecksum := briefs.ComputeChainChecksum(leafBuf, 4096)
+	binary.LittleEndian.PutUint64(leafBuf[briefs.BtreeChecksumOffset:], leafChecksum)
+
+	// Tree-backed inode 2: InodeFlagIndexed set, root at rootLeafAbs, inline
+	// array zeroed, num_extents_total = 9.
 	inode := &briefs.Inode{
 		InodeNumber:      2,
 		Magic:            briefs.MagicInode,
@@ -198,48 +236,28 @@ func TestFsckRepairFragmentedFile(t *testing.T) {
 		Uid:              0,
 		Gid:              0,
 		FileSize:         9 * 4096,
-		Nlinks:           0, // orphan; we only care about extent compaction
-		NumExtentsInline: 8,
+		Nlinks:           0, // orphan; we only care about the tree walk
+		NumExtentsInline: 0,
 		NumExtentsTotal:  9,
-		ExtentInlineBase: chainBlockAbs,
-		Flags:            0,
+		ExtentInlineBase: rootLeafAbs,
+		Flags:            briefs.InodeFlagIndexed,
 	}
-	// Eight inline extents at logical offsets 0..7.
-	var inlineExtents [8]briefs.Extent
-	for i := 0; i < 8; i++ {
-		inlineExtents[i] = briefs.Extent{Offset: uint64(i), Phys: dataStartAbs + uint64(i), Len: 1, Flags: 0, Pad: 0}
-	}
-	inode.SetInlineExtents(inlineExtents)
+	inode.SetInlineExtents([8]briefs.Extent{}) // zeroed on spill
 
 	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatalf("open image: %v", err)
 	}
 
-	// Write the fragmented inode.
+	// Write the B-tree root leaf and the tree-backed inode.
+	if _, err := f.WriteAt(leafBuf, int64(rootLeafAbs*4096)); err != nil {
+		t.Fatalf("write btree root leaf: %v", err)
+	}
 	if err := inode.WriteAt(f, 5*4096+512); err != nil {
-		t.Fatalf("write fragmented inode: %v", err)
+		t.Fatalf("write tree-backed inode: %v", err)
 	}
 
-	// Write a chain block containing the ninth extent (logical offset 8).
-	chainBuf := make([]byte, 4096)
-	binary.LittleEndian.PutUint64(chainBuf[0:], 0) // next_overflow_block
-	binary.LittleEndian.PutUint32(chainBuf[8:], 1) // num_extents_in_block
-	binary.LittleEndian.PutUint32(chainBuf[12:], 0)
-	const extOff = briefs.ExtentChainHeaderSize
-	binary.LittleEndian.PutUint64(chainBuf[extOff:], 8)                         // offset
-	binary.LittleEndian.PutUint64(chainBuf[extOff+8:], dataStartAbs+8)           // phys
-	binary.LittleEndian.PutUint64(chainBuf[extOff+16:], 1)                     // len
-	binary.LittleEndian.PutUint32(chainBuf[extOff+24:], 0)                     // flags
-	binary.LittleEndian.PutUint32(chainBuf[extOff+28:], 0)                     // pad
-	checksum := briefs.ComputeChainChecksum(chainBuf, 4096)
-	binary.LittleEndian.PutUint64(chainBuf[briefs.ExtentChainChecksumOffset:], checksum)
-	if _, err := f.WriteAt(chainBuf, int64(chainBlockAbs*4096)); err != nil {
-		t.Fatalf("write chain block: %v", err)
-	}
-
-	// Mark inode 2 allocated in the inode bitmap. The bitmap is at block 1;
-	// bit 1 corresponds to inode 2 (inode numbers are 1-based).
+	// Mark inode 2 allocated in the inode bitmap (block 1, bit 1).
 	inodeBM := make([]byte, 4096)
 	if _, err := f.ReadAt(inodeBM, 4096); err != nil {
 		t.Fatalf("read inode bitmap: %v", err)
@@ -251,20 +269,18 @@ func TestFsckRepairFragmentedFile(t *testing.T) {
 		t.Fatalf("write inode bitmap: %v", err)
 	}
 
-	// Mark data blocks 100..110 allocated in the data allocator. The data
-	// allocator starts at block 86; L2 starts after the header, L0 and L1.
-	// For 4846 data blocks, L0=1 word (1 block), L1=2 words (1 block),
-	// L2=76 words (1 block). So L2 starts at block 86 + 1 + 1 + 1 = 89.
-	// Data-relative block 10 maps to L2 word 0, bit 10. Mark bits 10..18 and
-	// bit 20 (chain block) allocated by clearing them.
+	// Mark data blocks 100..108 (data-relative 10..18) and the root leaf
+	// (data-relative 20) allocated in the data L2 bitmap (block 89). A cleared
+	// bit means allocated. We do not touch data-relative 19 (abs 109).
 	dataL2 := make([]byte, 4096)
 	if _, err := f.ReadAt(dataL2, 89*4096); err != nil {
 		t.Fatalf("read data L2 bitmap: %v", err)
 	}
 	l2Word := binary.LittleEndian.Uint64(dataL2[0:])
-	for b := uint64(10); b <= 20; b++ {
+	for b := uint64(10); b <= 18; b++ {
 		l2Word &^= 1 << b
 	}
+	l2Word &^= 1 << rootLeafRelBit
 	binary.LittleEndian.PutUint64(dataL2[0:], l2Word)
 	if _, err := f.WriteAt(dataL2, 89*4096); err != nil {
 		t.Fatalf("write data L2 bitmap: %v", err)
@@ -274,7 +290,9 @@ func TestFsckRepairFragmentedFile(t *testing.T) {
 		t.Fatalf("close image: %v", err)
 	}
 
-	// Run fsck in repair mode.
+	// Run fsck in repair mode. Repair rebuilds the allocator from the blocks
+	// fsck found (including the tree node block via the B-tree walk) and must
+	// leave the tree-backed inode untouched.
 	cmd = exec.Command(fsckPath, "--repair", "-y", imgPath)
 	out, err = cmd.CombinedOutput()
 	if err != nil {
@@ -284,11 +302,27 @@ func TestFsckRepairFragmentedFile(t *testing.T) {
 	if !contains(output, "Repair complete") {
 		t.Fatalf("fsck did not report repair complete:\n%s", output)
 	}
-	// The test intentionally does not add a directory entry, so inode 2 is an
-	// orphan and the final pass reports it as unreachable. That is acceptable
-	// here: we are validating extent compaction and allocator rebuild, not
-	// directory connectivity. Require only that the single orphan reachability
-	// error remains and that no other ERROR lines appear in the final pass.
+
+	// The B-tree walk must not have produced any structural errors at any
+	// point (bad magic, checksum, unsorted, cycle, depth, count overflow).
+	for _, marker := range []string{
+		"bad magic",
+		"checksum mismatch",
+		"extents unsorted",
+		"cycle detected",
+		"depth exceeded",
+		"count exceeds fanout",
+		"btree node",
+	} {
+		if contains(output, marker) {
+			t.Fatalf("fsck reported B-tree structural error (%q):\n%s", marker, output)
+		}
+	}
+
+	// In the post-repair pass the only tolerated error is the orphan
+	// reachability warning for inode 2 (it has no directory entry). Any other
+	// ERROR — notably a block cross-ref mismatch, which would mean the tree
+	// walk failed to mark a data or node block — is a failure.
 	lines := splitLines(output)
 	postRepair := false
 	for _, line := range lines {
@@ -303,7 +337,8 @@ func TestFsckRepairFragmentedFile(t *testing.T) {
 		t.Fatalf("expected orphan reachability warning not found:\n%s", output)
 	}
 
-	// Read the repaired inode back and verify it has one inline extent.
+	// Read the repaired inode back and verify repair left it tree-backed and
+	// intact (extent compaction must have skipped it, not rewritten it inline).
 	f, err = os.OpenFile(imgPath, os.O_RDONLY, 0)
 	if err != nil {
 		t.Fatalf("reopen image: %v", err)
@@ -317,19 +352,33 @@ func TestFsckRepairFragmentedFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unmarshal repaired inode: %v", err)
 	}
-	if repaired.NumExtentsTotal != 1 {
-		t.Errorf("NumExtentsTotal: want 1, got %d", repaired.NumExtentsTotal)
+	if repaired.Flags&briefs.InodeFlagIndexed == 0 {
+		t.Errorf("repaired inode lost InodeFlagIndexed (compaction must skip tree-backed inodes)")
 	}
-	if repaired.NumExtentsInline != 1 {
-		t.Errorf("NumExtentsInline: want 1, got %d", repaired.NumExtentsInline)
+	if repaired.NumExtentsTotal != 9 {
+		t.Errorf("NumExtentsTotal: want 9, got %d", repaired.NumExtentsTotal)
 	}
-	if repaired.ExtentInlineBase != 0 {
-		t.Errorf("ExtentInlineBase: want 0, got %d", repaired.ExtentInlineBase)
+	if repaired.NumExtentsInline != 0 {
+		t.Errorf("NumExtentsInline: want 0, got %d", repaired.NumExtentsInline)
 	}
-	inline := repaired.InlineExtents()
-	if inline[0].Offset != 0 || inline[0].Phys != dataStartAbs || inline[0].Len != 9 {
-		t.Errorf("extent: want {0,%d,9}, got {%d,%d,%d}",
-			dataStartAbs, inline[0].Offset, inline[0].Phys, inline[0].Len)
+	if repaired.ExtentInlineBase != rootLeafAbs {
+		t.Errorf("ExtentInlineBase: want %d, got %d", rootLeafAbs, repaired.ExtentInlineBase)
+	}
+
+	// The root leaf on disk must still carry a valid magic + checksum and the
+	// same 9 extents.
+	leafRead := make([]byte, 4096)
+	if _, err := f.ReadAt(leafRead, int64(rootLeafAbs*4096)); err != nil {
+		t.Fatalf("read root leaf: %v", err)
+	}
+	if binary.LittleEndian.Uint32(leafRead[0:]) != briefs.BtreeMagic {
+		t.Errorf("root leaf magic: want 0x%X, got 0x%X", briefs.BtreeMagic, binary.LittleEndian.Uint32(leafRead[0:]))
+	}
+	if err := briefs.VerifyBtreeNodeChecksum(leafRead, 4096); err != nil {
+		t.Errorf("root leaf checksum after repair: %v", err)
+	}
+	if got := binary.LittleEndian.Uint16(leafRead[10:]); got != 9 {
+		t.Errorf("root leaf num_keys: want 9, got %d", got)
 	}
 }
 
@@ -680,184 +729,22 @@ func TestFsckRepairLinkCounts(t *testing.T) {
 }
 
 // TestFsckRepairCombinedFragmentation builds an image with several repair-worthy
-// problems at once: a fragmented file inside a directory, a fragmented directory
-// trie, and corrupted link counts. It then runs fsck --repair and verifies the
-// post-repair pass is clean, the file extents were merged, and the link counts
-// were recomputed.
+// problems at once: a tree-backed fragmented file inside a directory, a
+// fragmented directory trie, and corrupted link counts. It then runs fsck
+// --repair and verifies the post-repair pass is clean, the directory entries
+// were preserved, the link counts were recomputed, and the tree-backed file
+// was left intact (extent compaction is a no-op for tree-backed inodes until
+// #7 phase 4 adds leaf compaction).
 func TestFsckRepairCombinedFragmentation(t *testing.T) {
 	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
 	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
 
 	imgPath := filepath.Join(t.TempDir(), "combined.briefs")
-	cmd := exec.Command(mkfsPath, "-s", "5000", imgPath)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("mkfs failed: %v\n%s", err, out)
-	}
-
-	const (
-		rootTrieBlock   = uint64(90)
-		subdirTrieBlock = uint64(91)
-		fileIno         = uint64(2)
-		dirIno          = uint64(3)
-		dataStartAbs    = uint64(100)
-		chainBlockAbs   = uint64(110)
-	)
-
-	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatalf("open image: %v", err)
-	}
-	defer f.Close()
-
-	// File inode 2: fragmented across nine single-block extents (eight inline,
-	// ninth in a chain block), with a corrupted link count.
-	fileInode := &briefs.Inode{
-		InodeNumber:      fileIno,
-		Magic:            briefs.MagicInode,
-		Filemode:         briefs.ModeFile | 0644,
-		FileSize:         9 * 4096,
-		Nlinks:           0, // will be repaired to 1
-		NumExtentsInline: 8,
-		NumExtentsTotal:  9,
-		ExtentInlineBase: chainBlockAbs,
-	}
-	var inlineExtents [8]briefs.Extent
-	for i := 0; i < 8; i++ {
-		inlineExtents[i] = briefs.Extent{Offset: uint64(i), Phys: dataStartAbs + uint64(i), Len: 1, Flags: 0, Pad: 0}
-	}
-	fileInode.SetInlineExtents(inlineExtents)
-	if err := fileInode.WriteAt(f, 5*4096+512); err != nil {
-		t.Fatalf("write file inode: %v", err)
-	}
-
-	// Chain block holding the ninth extent.
-	chainBuf := make([]byte, 4096)
-	binary.LittleEndian.PutUint64(chainBuf[0:], 0) // next_overflow_block
-	binary.LittleEndian.PutUint32(chainBuf[8:], 1) // num_extents_in_block
-	binary.LittleEndian.PutUint32(chainBuf[12:], 0)
-	const extOff = briefs.ExtentChainHeaderSize
-	binary.LittleEndian.PutUint64(chainBuf[extOff:], 8)
-	binary.LittleEndian.PutUint64(chainBuf[extOff+8:], dataStartAbs+8)
-	binary.LittleEndian.PutUint64(chainBuf[extOff+16:], 1)
-	binary.LittleEndian.PutUint32(chainBuf[extOff+24:], 0)
-	binary.LittleEndian.PutUint32(chainBuf[extOff+28:], 0)
-	checksum := briefs.ComputeChainChecksum(chainBuf, 4096)
-	binary.LittleEndian.PutUint64(chainBuf[briefs.ExtentChainChecksumOffset:], checksum)
-	if _, err := f.WriteAt(chainBuf, int64(chainBlockAbs*4096)); err != nil {
-		t.Fatalf("write chain block: %v", err)
-	}
-
-	// Directory inode 3: empty directory with a corrupted link count.
-	subdirInode := &briefs.Inode{
-		InodeNumber: dirIno,
-		Magic:       briefs.MagicInode,
-		Filemode:    briefs.ModeDir | 0755,
-		FileSize:    4096,
-		Nlinks:      1, // will be repaired to 2
-		DirTrieRoot: briefs.TrieMakeRef(subdirTrieBlock, 0),
-		ParentInode: 1,
-	}
-	if err := subdirInode.WriteAt(f, 5*4096+1024); err != nil {
-		t.Fatalf("write subdir inode: %v", err)
-	}
-
-	// Root inode 1: points at a two-entry trie and has a corrupted link count.
-	rootInodeBuf := make([]byte, 512)
-	if _, err := f.ReadAt(rootInodeBuf, 5*4096); err != nil {
-		t.Fatalf("read root inode: %v", err)
-	}
-	rootInode, err := briefs.UnmarshalInode(rootInodeBuf)
-	if err != nil {
-		t.Fatalf("unmarshal root inode: %v", err)
-	}
-	rootInode.Nlinks = 2 // will be repaired to 3
-	rootInode.DirTrieRoot = briefs.TrieMakeRef(rootTrieBlock, 0)
-	rootInode.ParentInode = 1
-	if err := rootInode.WriteAt(f, 5*4096); err != nil {
-		t.Fatalf("write root inode: %v", err)
-	}
-
-	// Mark inodes 2 and 3 allocated in the inode bitmap L2 (block 4).
-	const inodeL2Block = 4
-	inodeBM := make([]byte, 4096)
-	if _, err := f.ReadAt(inodeBM, int64(inodeL2Block*4096)); err != nil {
-		t.Fatalf("read inode bitmap: %v", err)
-	}
-	word := binary.LittleEndian.Uint64(inodeBM[0:])
-	word &^= 1 << 1 // inode 2
-	word &^= 1 << 2 // inode 3
-	binary.LittleEndian.PutUint64(inodeBM[0:], word)
-	if _, err := f.WriteAt(inodeBM, int64(inodeL2Block*4096)); err != nil {
-		t.Fatalf("write inode bitmap: %v", err)
-	}
-
-	// Root trie page with two leaf children: "file" and "dir".
-	rootPage := make([]byte, 4096)
-	binary.LittleEndian.PutUint32(rootPage[0:], briefs.MagicTriePage)
-	binary.LittleEndian.PutUint32(rootPage[4:], briefs.TriePageVersion)
-	binary.LittleEndian.PutUint16(rootPage[8:], 3) // live_count
-	binary.LittleEndian.PutUint16(rootPage[10:], 0)
-	freeSlots := ^uint64(0)
-	freeSlots &^= 1 << 0
-	freeSlots &^= 1 << 1
-	freeSlots &^= 1 << 2
-	binary.LittleEndian.PutUint64(rootPage[12:], freeSlots)
-
-	const nameOffDir = uint16(5)
-	binary.LittleEndian.PutUint16(rootPage[4091:], uint16(len("dir")))
-	copy(rootPage[4093:], "dir")
-	const nameOffFile = uint16(11)
-	binary.LittleEndian.PutUint16(rootPage[4085:], uint16(len("file")))
-	copy(rootPage[4087:], "file")
-
-	leafFileRef := briefs.TrieMakeRef(rootTrieBlock, 1)
-	leafDirRef := briefs.TrieMakeRef(rootTrieBlock, 2)
-	writeTrieNode(rootPage, 0, leafFileRef, 0, 0, 0, 0, 0, briefs.NodeTypeInterm, 0, 0, 0, 2)
-	writeTrieNode(rootPage, 1, 0, leafDirRef, fileIno, uint16(len("file")), nameOffFile,
-		1, briefs.NodeTypeInterm|briefs.NodeStatusLeaf, 'f', 8, 0, 0)
-	writeTrieNode(rootPage, 2, 0, 0, dirIno, uint16(len("dir")), nameOffDir,
-		1, briefs.NodeTypeInterm|briefs.NodeStatusLeaf, 'd', 4, 0, 0)
-
-	if _, err := f.WriteAt(rootPage, int64(rootTrieBlock*4096)); err != nil {
-		t.Fatalf("write root trie page: %v", err)
-	}
-
-	// Empty subdirectory trie page.
-	subdirPage := make([]byte, 4096)
-	binary.LittleEndian.PutUint32(subdirPage[0:], briefs.MagicTriePage)
-	binary.LittleEndian.PutUint32(subdirPage[4:], briefs.TriePageVersion)
-	binary.LittleEndian.PutUint16(subdirPage[8:], 1) // live_count
-	binary.LittleEndian.PutUint16(subdirPage[10:], 0)
-	binary.LittleEndian.PutUint64(subdirPage[12:], ^uint64(1)) // slot 0 used
-	writeTrieNode(subdirPage, 0, 0, 0, 0, 0, 0, 0, briefs.NodeTypeInterm, 0, 0, 0, 0)
-	if _, err := f.WriteAt(subdirPage, int64(subdirTrieBlock*4096)); err != nil {
-		t.Fatalf("write subdir trie page: %v", err)
-	}
-
-	// Mark data blocks 90, 91, and 100..110 allocated in the data allocator L2.
-	dataL2 := make([]byte, 4096)
-	if _, err := f.ReadAt(dataL2, 89*4096); err != nil {
-		t.Fatalf("read data L2 bitmap: %v", err)
-	}
-	l2Word := binary.LittleEndian.Uint64(dataL2[0:])
-	l2Word &^= 1 << 0  // block 90 (root trie)
-	l2Word &^= 1 << 1  // block 91 (subdir trie)
-	for b := uint64(10); b <= 20; b++ {
-		l2Word &^= 1 << b // blocks 100..110 (file data + chain)
-	}
-	binary.LittleEndian.PutUint64(dataL2[0:], l2Word)
-	if _, err := f.WriteAt(dataL2, 89*4096); err != nil {
-		t.Fatalf("write data L2 bitmap: %v", err)
-	}
-
-	if err := f.Close(); err != nil {
-		t.Fatalf("close image: %v", err)
-	}
+	writeCombinedFixture(t, mkfsPath, imgPath, true)
 
 	// Run fsck in repair mode.
-	cmd = exec.Command(fsckPath, "--repair", "-y", imgPath)
-	out, err = cmd.CombinedOutput()
+	cmd := exec.Command(fsckPath, "--repair", "-y", imgPath)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fsck repair failed: %v\n%s", err, out)
 	}
@@ -899,7 +786,7 @@ func TestFsckRepairCombinedFragmentation(t *testing.T) {
 	}
 
 	// Read repaired inodes back and verify the repairs.
-	f, err = os.OpenFile(imgPath, os.O_RDONLY, 0)
+	f, err := os.OpenFile(imgPath, os.O_RDONLY, 0)
 	if err != nil {
 		t.Fatalf("reopen image: %v", err)
 	}
@@ -927,19 +814,19 @@ func TestFsckRepairCombinedFragmentation(t *testing.T) {
 	if file.Nlinks != 1 {
 		t.Errorf("file nlinks: want 1, got %d", file.Nlinks)
 	}
-	if file.NumExtentsTotal != 1 {
-		t.Errorf("file NumExtentsTotal: want 1, got %d", file.NumExtentsTotal)
+	// The file is tree-backed; --repair must leave it intact (extent compaction
+	// does not yet handle B-tree leaves — deferred to #7 phase 4).
+	if file.Flags&briefs.InodeFlagIndexed == 0 {
+		t.Errorf("file lost InodeFlagIndexed after repair")
 	}
-	if file.NumExtentsInline != 1 {
-		t.Errorf("file NumExtentsInline: want 1, got %d", file.NumExtentsInline)
+	if file.NumExtentsTotal != 9 {
+		t.Errorf("file NumExtentsTotal: want 9 (tree-backed, untouched), got %d", file.NumExtentsTotal)
 	}
-	if file.ExtentInlineBase != 0 {
-		t.Errorf("file ExtentInlineBase: want 0, got %d", file.ExtentInlineBase)
+	if file.NumExtentsInline != 0 {
+		t.Errorf("file NumExtentsInline: want 0, got %d", file.NumExtentsInline)
 	}
-	inline := file.InlineExtents()
-	if inline[0].Offset != 0 || inline[0].Phys != dataStartAbs || inline[0].Len != 9 {
-		t.Errorf("file extent: want {0,%d,9}, got {%d,%d,%d}",
-			dataStartAbs, inline[0].Offset, inline[0].Phys, inline[0].Len)
+	if file.ExtentInlineBase == 0 {
+		t.Errorf("file ExtentInlineBase: expected root leaf still in use, got 0")
 	}
 
 	if _, err := f.ReadAt(buf, 5*4096+1024); err != nil {
@@ -986,15 +873,12 @@ func writeCombinedFixture(t *testing.T, mkfsPath, imgPath string, corruptNlinks 
 		Filemode:         briefs.ModeFile | 0644,
 		FileSize:         9 * 4096,
 		Nlinks:           1,
-		NumExtentsInline: 8,
+		NumExtentsInline: 0,
 		NumExtentsTotal:  9,
 		ExtentInlineBase: chainBlockAbs,
+		Flags:            briefs.InodeFlagIndexed,
 	}
-	var inlineExtents [8]briefs.Extent
-	for i := 0; i < 8; i++ {
-		inlineExtents[i] = briefs.Extent{Offset: uint64(i), Phys: dataStartAbs + uint64(i), Len: 1, Flags: 0, Pad: 0}
-	}
-	fileInode.SetInlineExtents(inlineExtents)
+	fileInode.SetInlineExtents([8]briefs.Extent{}) // zeroed on spill
 	if corruptNlinks {
 		fileInode.Nlinks = 0
 	}
@@ -1002,20 +886,28 @@ func writeCombinedFixture(t *testing.T, mkfsPath, imgPath string, corruptNlinks 
 		t.Fatalf("write file inode: %v", err)
 	}
 
-	chainBuf := make([]byte, 4096)
-	binary.LittleEndian.PutUint64(chainBuf[0:], 0)
-	binary.LittleEndian.PutUint32(chainBuf[8:], 1)
-	binary.LittleEndian.PutUint32(chainBuf[12:], 0)
-	const extOff = briefs.ExtentChainHeaderSize
-	binary.LittleEndian.PutUint64(chainBuf[extOff:], 8)
-	binary.LittleEndian.PutUint64(chainBuf[extOff+8:], dataStartAbs+8)
-	binary.LittleEndian.PutUint64(chainBuf[extOff+16:], 1)
-	binary.LittleEndian.PutUint32(chainBuf[extOff+24:], 0)
-	binary.LittleEndian.PutUint32(chainBuf[extOff+28:], 0)
-	checksum := briefs.ComputeChainChecksum(chainBuf, 4096)
-	binary.LittleEndian.PutUint64(chainBuf[briefs.ExtentChainChecksumOffset:], checksum)
-	if _, err := f.WriteAt(chainBuf, int64(chainBlockAbs*4096)); err != nil {
-		t.Fatalf("write chain block: %v", err)
+	// B-tree root leaf holding the nine single-block extents (logical offsets
+	// 0..8, physical blocks 100..108). A single leaf holds up to 126 extents,
+	// so 9 fits with no split.
+	leafBuf := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(leafBuf[0:], briefs.BtreeMagic)
+	binary.LittleEndian.PutUint32(leafBuf[4:], briefs.BtreeFlagLeaf)
+	binary.LittleEndian.PutUint16(leafBuf[8:], 0)  // level 0
+	binary.LittleEndian.PutUint16(leafBuf[10:], 9) // num_keys
+	binary.LittleEndian.PutUint64(leafBuf[12:], 0) // prev_leaf
+	binary.LittleEndian.PutUint64(leafBuf[20:], 0) // next_leaf
+	for i := 0; i < 9; i++ {
+		off := briefs.BtreeHeaderSize + i*32
+		binary.LittleEndian.PutUint64(leafBuf[off:], uint64(i))
+		binary.LittleEndian.PutUint64(leafBuf[off+8:], dataStartAbs+uint64(i))
+		binary.LittleEndian.PutUint64(leafBuf[off+16:], 1)
+		binary.LittleEndian.PutUint32(leafBuf[off+24:], 0)
+		binary.LittleEndian.PutUint32(leafBuf[off+28:], 0)
+	}
+	leafChecksum := briefs.ComputeChainChecksum(leafBuf, 4096)
+	binary.LittleEndian.PutUint64(leafBuf[briefs.BtreeChecksumOffset:], leafChecksum)
+	if _, err := f.WriteAt(leafBuf, int64(chainBlockAbs*4096)); err != nil {
+		t.Fatalf("write btree root leaf: %v", err)
 	}
 
 	subdirInode := &briefs.Inode{
@@ -1177,11 +1069,13 @@ func TestFsckRepairOnlyAllocator(t *testing.T) {
 		t.Errorf("file NumExtentsTotal: want 9 (still fragmented), got %d", file.NumExtentsTotal)
 	}
 	if file.ExtentInlineBase == 0 {
-		t.Errorf("file ExtentInlineBase: expected chain block still in use")
+		t.Errorf("file ExtentInlineBase: expected root leaf still in use")
 	}
 }
 
-// TestFsckRepairOnlyExtents verifies that --repair-only=extents merges file
+// TestFsckRepairOnlyExtents verifies that --repair-only=extents leaves tree-backed
+// file extents untouched (B-tree leaf compaction is deferred to #7 phase 4)
+// without rebuilding the allocator or compacting directory tries.
 // extents without rebuilding the allocator or compacting directory tries.
 func TestFsckRepairOnlyExtents(t *testing.T) {
 	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
@@ -1227,11 +1121,17 @@ func TestFsckRepairOnlyExtents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unmarshal file inode: %v", err)
 	}
-	if file.NumExtentsTotal != 1 {
-		t.Errorf("file NumExtentsTotal: want 1 (merged), got %d", file.NumExtentsTotal)
+	// The file is tree-backed; extent compaction is a no-op for B-tree leaves
+	// until #7 phase 4, so the file must be left untouched (still 9 extents,
+	// root leaf still in use).
+	if file.Flags&briefs.InodeFlagIndexed == 0 {
+		t.Errorf("file lost InodeFlagIndexed")
 	}
-	if file.ExtentInlineBase != 0 {
-		t.Errorf("file ExtentInlineBase: want 0 (no chain block), got %d", file.ExtentInlineBase)
+	if file.NumExtentsTotal != 9 {
+		t.Errorf("file NumExtentsTotal: want 9 (tree-backed, untouched), got %d", file.NumExtentsTotal)
+	}
+	if file.ExtentInlineBase == 0 {
+		t.Errorf("file ExtentInlineBase: expected root leaf still in use, got 0")
 	}
 
 	if _, err := f.ReadAt(buf, 5*4096); err != nil {
@@ -1299,7 +1199,7 @@ func TestFsckRepairOnlyLinks(t *testing.T) {
 		t.Errorf("file NumExtentsTotal: want 9 (still fragmented), got %d", file.NumExtentsTotal)
 	}
 	if file.ExtentInlineBase == 0 {
-		t.Errorf("file ExtentInlineBase: expected chain block still in use")
+		t.Errorf("file ExtentInlineBase: expected root leaf still in use")
 	}
 
 	if _, err := f.ReadAt(buf, 5*4096+1024); err != nil {
@@ -1374,15 +1274,18 @@ func TestFsckOptimize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unmarshal file inode: %v", err)
 	}
-	if file.NumExtentsTotal != 1 {
-		t.Errorf("file NumExtentsTotal: want 1, got %d", file.NumExtentsTotal)
+	// --optimize runs trie + extent compaction, but extent compaction is a no-op
+	// for tree-backed inodes until #7 phase 4, so the file stays tree-backed and
+	// untouched. Directory-trie compaction still ran (the post-repair pass is
+	// clean), which is the part --optimize is meant to exercise here.
+	if file.Flags&briefs.InodeFlagIndexed == 0 {
+		t.Errorf("file lost InodeFlagIndexed")
 	}
-	if file.ExtentInlineBase != 0 {
-		t.Errorf("file ExtentInlineBase: want 0, got %d", file.ExtentInlineBase)
+	if file.NumExtentsTotal != 9 {
+		t.Errorf("file NumExtentsTotal: want 9 (tree-backed, untouched), got %d", file.NumExtentsTotal)
 	}
-	inline := file.InlineExtents()
-	if inline[0].Len != 9 {
-		t.Errorf("file inline extent length: want 9, got %d", inline[0].Len)
+	if file.ExtentInlineBase == 0 {
+		t.Errorf("file ExtentInlineBase: expected root leaf still in use, got 0")
 	}
 }
 
