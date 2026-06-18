@@ -7,7 +7,7 @@ import (
 	"math/bits"
 	"sync"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 // Allocator is the runtime 3-level bitmap pyramid.
@@ -29,7 +29,7 @@ const wordsPerBlock = 4096 / 8 // 512
 
 // OpenAllocator reads the allocator pool from disk and initializes the in-memory bitmap.
 func OpenAllocator(dev *BlockDevice, poolStart uint64) (*Allocator, error) {
-	l0, l1, l2, hdr, err := types.ReadAllocatorBitmap(dev, poolStart, dev.BlockSize())
+	l0, l1, l2, hdr, err := briefs.ReadAllocatorBitmap(dev, poolStart, dev.BlockSize())
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +254,7 @@ func (a *Allocator) Sync() error {
 
 	// Update header with free_count
 	hdr := make([]byte, blockSize)
-	binary.LittleEndian.PutUint32(hdr[0:], types.AllocMagic)
+	binary.LittleEndian.PutUint32(hdr[0:], briefs.AllocMagic)
 	binary.LittleEndian.PutUint32(hdr[4:], 1) // version
 	binary.LittleEndian.PutUint64(hdr[8:], a.l0Words)
 	binary.LittleEndian.PutUint64(hdr[16:], a.l1Words)
@@ -272,13 +272,13 @@ func (a *Allocator) Sync() error {
 // InodeManager handles on-disk inode read/write.
 type InodeManager struct {
 	dev          *BlockDevice
-	sb           *types.SuperblockLayout
+	sb           *briefs.SuperblockLayout
 	inodesPerBlk uint64
 	tableStart   uint64
 }
 
 // NewInodeManager creates an InodeManager from the superblock.
-func NewInodeManager(dev *BlockDevice, sb *types.SuperblockLayout) *InodeManager {
+func NewInodeManager(dev *BlockDevice, sb *briefs.SuperblockLayout) *InodeManager {
 	return &InodeManager{
 		dev:          dev,
 		sb:           sb,
@@ -296,18 +296,18 @@ func (im *InodeManager) inodeLocation(ino uint64) (blockOffset uint64, byteOffse
 }
 
 // ReadInode reads and unmarshals an inode from disk.
-func (im *InodeManager) ReadInode(ino uint64) (*types.Inode, error) {
+func (im *InodeManager) ReadInode(ino uint64) (*briefs.Inode, error) {
 	blk, off := im.inodeLocation(ino)
 	buf, err := im.dev.ReadBlock(blk)
 	if err != nil {
 		return nil, fmt.Errorf("read inode %d block %d: %w", ino, blk, err)
 	}
 	inodeData := buf[off : off+im.sb.InodeSize]
-	return types.UnmarshalInode(inodeData)
+	return briefs.UnmarshalInode(inodeData)
 }
 
 // WriteInode marshals and writes an inode to disk.
-func (im *InodeManager) WriteInode(inode *types.Inode) error {
+func (im *InodeManager) WriteInode(inode *briefs.Inode) error {
 	blk, off := im.inodeLocation(inode.InodeNumber)
 	buf, err := im.dev.ReadBlock(blk)
 	if err != nil {

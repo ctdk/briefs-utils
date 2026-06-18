@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"syscall"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
@@ -14,7 +14,7 @@ import (
 // BrieFS is the top-level filesystem struct.
 type BrieFS struct {
 	dev        *BlockDevice
-	sb         *types.SuperblockLayout
+	sb         *briefs.SuperblockLayout
 	inodes     *InodeManager
 	dataAlloc  *Allocator
 	inodeAlloc *Allocator
@@ -92,8 +92,8 @@ func Mount(imagePath string, opts MountOptions) error {
 
 // readSuperblock reads and parses the superblock from block 0.
 // readSuperblock reads and parses the superblock from block 0.
-func readSuperblock(dev *BlockDevice) (*types.SuperblockLayout, error) {
-	return types.ReadSuperblock(dev, dev.BlockSize())
+func readSuperblock(dev *BlockDevice) (*briefs.SuperblockLayout, error) {
+	return briefs.ReadSuperblock(dev, dev.BlockSize())
 }
 
 // brieFSNode implements the FUSE inode operations for BrieFS.
@@ -113,7 +113,7 @@ var _ = (fs.NodeStatfser)((*brieFSNode)(nil))
 
 // readExtent reads the i-th extent from an inode, walking chain blocks
 // if the extent is beyond the 8 inline slots.
-func (n *brieFSNode) readExtent(diskInode *types.Inode, idx int) (types.Extent, error) {
+func (n *brieFSNode) readExtent(diskInode *briefs.Inode, idx int) (briefs.Extent, error) {
 	if idx < 8 {
 		return diskInode.InlineExtents()[idx], nil
 	}
@@ -123,19 +123,19 @@ func (n *brieFSNode) readExtent(diskInode *types.Inode, idx int) (types.Extent, 
 	for chainBlock != 0 {
 		buf, err := n.bfs.dev.ReadBlock(chainBlock)
 		if err != nil {
-			return types.Extent{}, fmt.Errorf("read chain block %d: %w", chainBlock, err)
+			return briefs.Extent{}, fmt.Errorf("read chain block %d: %w", chainBlock, err)
 		}
-		if err := types.VerifyChainChecksum(buf, n.bfs.blockSize); err != nil {
-			return types.Extent{}, fmt.Errorf("chain block %d: checksum mismatch", chainBlock)
+		if err := briefs.VerifyChainChecksum(buf, n.bfs.blockSize); err != nil {
+			return briefs.Extent{}, fmt.Errorf("chain block %d: checksum mismatch", chainBlock)
 		}
-		hdr := types.UnmarshalExtentChainHeader(buf)
+		hdr := briefs.UnmarshalExtentChainHeader(buf)
 		if chainIdx < int(hdr.NumExtentsInBlock) {
-			return types.ReadChainExtent(buf, chainIdx), nil
+			return briefs.ReadChainExtent(buf, chainIdx), nil
 		}
 		chainIdx -= int(hdr.NumExtentsInBlock)
 		chainBlock = hdr.NextOverflowBlock
 	}
-	return types.Extent{}, fmt.Errorf("extent index %d out of range (total=%d)", idx, diskInode.NumExtentsTotal)
+	return briefs.Extent{}, fmt.Errorf("extent index %d out of range (total=%d)", idx, diskInode.NumExtentsTotal)
 }
 
 func (n *brieFSNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -212,7 +212,7 @@ func (n *brieFSNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 	var childMode uint32
 	switch ftype {
 	case trieNodeTypeDir:
-		childMode = uint32(types.ModeDir)
+		childMode = uint32(briefs.ModeDir)
 	default:
 		childMode = childInode.Filemode
 	}
@@ -253,9 +253,9 @@ func (n *brieFSNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 		var mode uint32
 		switch ftype {
 		case trieNodeTypeDir:
-			mode = uint32(types.ModeDir)
+			mode = uint32(briefs.ModeDir)
 		default:
-			mode = uint32(types.ModeFile)
+			mode = uint32(briefs.ModeFile)
 		}
 		entries = append(entries, fuse.DirEntry{
 			Mode: mode,
@@ -297,7 +297,7 @@ func (n *brieFSNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off
 	readPos := int64(0)
 
 	// Inline data is stored directly inside the inode.
-	if diskInode.Flags&types.InodeFlagInlineData != 0 {
+	if diskInode.Flags&briefs.InodeFlagInlineData != 0 {
 		start := off
 		if start < 0 {
 			start = 0
@@ -368,6 +368,6 @@ func (n *brieFSNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Er
 	out.Files = n.bfs.inodeAlloc.TotalBlocks()
 	out.Ffree = n.bfs.inodeAlloc.FreeCount()
 	out.Bsize = uint32(n.bfs.blockSize)
-	out.NameLen = uint32(types.BrieFSMaxNameLen)
+	out.NameLen = uint32(briefs.BrieFSMaxNameLen)
 	return 0
 }

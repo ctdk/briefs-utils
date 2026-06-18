@@ -5,12 +5,12 @@ import (
 	"os"
 	"testing"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 func makeTriePageRoot(buf []byte) {
-	binary.LittleEndian.PutUint32(buf[0:], types.MagicTriePage)
-	binary.LittleEndian.PutUint32(buf[4:], types.TriePageVersion)
+	binary.LittleEndian.PutUint32(buf[0:], briefs.MagicTriePage)
+	binary.LittleEndian.PutUint32(buf[4:], briefs.TriePageVersion)
 	binary.LittleEndian.PutUint16(buf[8:], 1)          // live_count
 	binary.LittleEndian.PutUint16(buf[10:], 0)         // free_name_off
 	binary.LittleEndian.PutUint64(buf[12:], ^uint64(1)) // free_slots: slot 0 allocated
@@ -47,11 +47,11 @@ func TestReadTriePage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadTriePage: %v", err)
 	}
-	if page.Magic != types.MagicTriePage {
-		t.Errorf("Magic: want 0x%X, got 0x%X", types.MagicTriePage, page.Magic)
+	if page.Magic != briefs.MagicTriePage {
+		t.Errorf("Magic: want 0x%X, got 0x%X", briefs.MagicTriePage, page.Magic)
 	}
-	if page.Version != types.TriePageVersion {
-		t.Errorf("Version: want %d, got %d", types.TriePageVersion, page.Version)
+	if page.Version != briefs.TriePageVersion {
+		t.Errorf("Version: want %d, got %d", briefs.TriePageVersion, page.Version)
 	}
 	if page.LiveCount != 1 {
 		t.Errorf("LiveCount: want 1, got %d", page.LiveCount)
@@ -152,7 +152,7 @@ func TestTrieIterator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenFile: %v", err)
 	}
-	sb, _ := types.NewSuperblock(100, 4096, 512, 4, "test", "")
+	sb, _ := briefs.NewSuperblock(100, 4096, 512, 4, "test", "")
 	sb.Lay.DataBlocks = 90
 	sb.Lay.FreeDataBlks = 89
 	sb.Lay.FreeInodes = 99

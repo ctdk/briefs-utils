@@ -4,14 +4,14 @@ import (
 	"os"
 	"testing"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 func TestAllocatorOpen(t *testing.T) {
 	// Build an allocator pool in memory, write it to a temp file, open it
 	path := tempImage(t, 100)
 
-	b := types.NewAllocBuilder(1000)
+	b := briefs.NewAllocBuilder(1000)
 	blocks := b.WriteBlocks()
 
 	raw, err := os.OpenFile(path, os.O_WRONLY, 0)
@@ -47,7 +47,7 @@ func TestAllocatorOpen(t *testing.T) {
 func TestAllocatorAllocFree(t *testing.T) {
 	path := tempImage(t, 100)
 
-	b := types.NewAllocBuilder(100)
+	b := briefs.NewAllocBuilder(100)
 	blocks := b.WriteBlocks()
 
 	raw, err := os.OpenFile(path, os.O_WRONLY, 0)
@@ -94,7 +94,7 @@ func TestAllocatorAllocFree(t *testing.T) {
 func TestAllocatorReserve(t *testing.T) {
 	path := tempImage(t, 100)
 
-	b := types.NewAllocBuilder(100)
+	b := briefs.NewAllocBuilder(100)
 	blocks := b.WriteBlocks()
 
 	raw, err := os.OpenFile(path, os.O_WRONLY, 0)
@@ -135,7 +135,7 @@ func TestAllocatorReserve(t *testing.T) {
 func TestAllocatorExhaustion(t *testing.T) {
 	path := tempImage(t, 100)
 
-	b := types.NewAllocBuilder(10)
+	b := briefs.NewAllocBuilder(10)
 	blocks := b.WriteBlocks()
 
 	raw, err := os.OpenFile(path, os.O_WRONLY, 0)

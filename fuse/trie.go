@@ -5,13 +5,13 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 // Trie page/slot layout constants (must match briefs.h).
 const trieSlotSize = 36
 const triePageHeaderSize = 20
-const trieSlotCount = types.TrieSlotsPerBlock
+const trieSlotCount = briefs.TrieSlotsPerBlock
 
 // Trie page header offsets.
 const (
@@ -80,8 +80,8 @@ func ReadTriePage(buf []byte) (*TriePageData, error) {
 		return nil, fmt.Errorf("buffer too small for trie page header: %d", len(buf))
 	}
 	magic := binary.LittleEndian.Uint32(buf[triePageMagicOff:])
-	if magic != types.MagicTriePage {
-		return nil, fmt.Errorf("bad trie page magic: 0x%08x (expected 0x%08x)", magic, types.MagicTriePage)
+	if magic != briefs.MagicTriePage {
+		return nil, fmt.Errorf("bad trie page magic: 0x%08x (expected 0x%08x)", magic, briefs.MagicTriePage)
 	}
 	return &TriePageData{
 		Magic:       magic,
@@ -130,7 +130,7 @@ func readTrieLeafName(buf []byte, blockSize uint64, node *TrieNodeData) ([]byte,
 		return nil, fmt.Errorf("name start out of range: %d", nameStart)
 	}
 	prefixLen := int(binary.LittleEndian.Uint16(buf[nameStart:]))
-	if prefixLen < 1 || prefixLen > types.BrieFSMaxNameLen || nameStart+2+uint64(prefixLen) > blockSize {
+	if prefixLen < 1 || prefixLen > briefs.BrieFSMaxNameLen || nameStart+2+uint64(prefixLen) > blockSize {
 		return nil, fmt.Errorf("invalid name length %d", prefixLen)
 	}
 	name := make([]byte, prefixLen)
@@ -149,7 +149,7 @@ func readTrieLeafNameStr(buf []byte, blockSize uint64, node *TrieNodeData) (stri
 
 // TrieLookup finds an entry by name in a directory trie.
 func TrieLookup(dev *BlockDevice, dirTrieRoot uint64, name string) (ino uint64, ftype uint8, err error) {
-	if types.TrieRefIsNull(dirTrieRoot) {
+	if briefs.TrieRefIsNull(dirTrieRoot) {
 		return 0, 0, fmt.Errorf("no trie root")
 	}
 
@@ -166,7 +166,7 @@ func TrieLookup(dev *BlockDevice, dirTrieRoot uint64, name string) (ino uint64, 
 			if err != nil {
 				return 0, 0, err
 			}
-			if types.TrieRefIsNull(child) {
+			if briefs.TrieRefIsNull(child) {
 				return 0, 0, fmt.Errorf("not found")
 			}
 
@@ -194,7 +194,7 @@ func TrieLookup(dev *BlockDevice, dirTrieRoot uint64, name string) (ino uint64, 
 		if err != nil {
 			return 0, 0, err
 			}
-		if types.TrieRefIsNull(child) {
+		if briefs.TrieRefIsNull(child) {
 			return 0, 0, fmt.Errorf("not found")
 		}
 
@@ -223,8 +223,8 @@ func TrieLookup(dev *BlockDevice, dirTrieRoot uint64, name string) (ino uint64, 
 // trieReadNode reads the page containing a node reference and returns the
 // raw page buffer plus the parsed slot.
 func trieReadNode(dev *BlockDevice, nodeRef uint64) ([]byte, *TrieNodeData, error) {
-	block := types.TrieRefBlock(nodeRef)
-	slot := types.TrieRefSlot(nodeRef)
+	block := briefs.TrieRefBlock(nodeRef)
+	slot := briefs.TrieRefSlot(nodeRef)
 	buf, err := dev.ReadBlock(block)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read trie page %d: %w", block, err)
@@ -247,7 +247,7 @@ func TrieFindChild(dev *BlockDevice, parentRef uint64, byteVal byte) (uint64, er
 	}
 
 	child := pnode.FirstChild
-	for !types.TrieRefIsNull(child) {
+	for !briefs.TrieRefIsNull(child) {
 		cbuf, cnode, err := trieReadNode(dev, child)
 		if err != nil {
 			return 0, err
@@ -273,7 +273,7 @@ func TrieGetChildren(dev *BlockDevice, parentRef uint64) ([]uint64, error) {
 
 	var children []uint64
 	child := pnode.FirstChild
-	for !types.TrieRefIsNull(child) {
+	for !briefs.TrieRefIsNull(child) {
 		children = append(children, child)
 		cbuf, cnode, err := trieReadNode(dev, child)
 		if err != nil {
@@ -306,7 +306,7 @@ func NewTrieIterator(dev *BlockDevice, dirTrieRoot uint64) *TrieIterator {
 		blockSize:   dev.BlockSize(),
 		dirTrieRoot: dirTrieRoot,
 	}
-	if !types.TrieRefIsNull(dirTrieRoot) {
+	if !briefs.TrieRefIsNull(dirTrieRoot) {
 		ti.stack[0] = dirTrieRoot
 		ti.sp = 1
 		ti.leafEmitted[0] = false
@@ -336,7 +336,7 @@ func (ti *TrieIterator) Next() (uint64, uint8, string, error) {
 		if emitted {
 			child := node.FirstChild
 			var pushed []uint64
-			for !types.TrieRefIsNull(child) {
+			for !briefs.TrieRefIsNull(child) {
 				pushed = append(pushed, child)
 				cbuf, cnode, err := trieReadNode(ti.dev, child)
 				if err != nil {
@@ -363,7 +363,7 @@ func (ti *TrieIterator) Next() (uint64, uint8, string, error) {
 			ino := node.Inode
 			ftype := node.FType
 
-			if !types.TrieRefIsNull(node.FirstChild) && ti.sp < 256 {
+			if !briefs.TrieRefIsNull(node.FirstChild) && ti.sp < 256 {
 				ti.stack[ti.sp] = ref
 				ti.leafEmitted[ti.sp] = true
 				ti.sp++
@@ -375,7 +375,7 @@ func (ti *TrieIterator) Next() (uint64, uint8, string, error) {
 		// Pure INTERM node: push children.
 		child := node.FirstChild
 		var children []uint64
-		for !types.TrieRefIsNull(child) {
+		for !briefs.TrieRefIsNull(child) {
 			children = append(children, child)
 			cbuf, cnode, err := trieReadNode(ti.dev, child)
 			if err != nil {
