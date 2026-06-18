@@ -32,7 +32,7 @@ func main() {
 		Name:     "mkfs.briefs",
 		Usage:    "Create a new BrieFS filesystem",
 		ArgsUsage: "DEVICE",
-		Version:  versionStr,
+		Version:  briefs.VersionStr,
 		Before: func(c *cli.Context) error {
 			if c.Args().Len() < 1 {
 				return fmt.Errorf("missing required argument: DEVICE")
