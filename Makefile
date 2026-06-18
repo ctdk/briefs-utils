@@ -6,7 +6,7 @@ BINDIR = $(PREFIX)/bin
 all: mkfs fsck fuse
 
 generate:
-	go generate ./types
+	go generate ./briefs
 
 mkfs: generate cmd/mkfs/mkfs.go
 	go build -o mkfs.briefs ./cmd/mkfs
