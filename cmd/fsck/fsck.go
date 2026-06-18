@@ -131,7 +131,7 @@ func main() {
 				repair: repair,
 			}
 
-			fmt.Fprintf(os.Stderr, "BrieFS filesystem check, version %s\n", versionStr)
+			fmt.Fprintf(os.Stderr, "BrieFS filesystem check, version %s\n", briefs.VersionStr)
 			fmt.Fprintf(os.Stderr, "Device: %s (%d bytes)\n", path, deviceSize)
 
 			// 1. Superblock
