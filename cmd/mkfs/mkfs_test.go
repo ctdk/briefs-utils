@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 // buildBinary builds a Go binary and returns its path.
@@ -83,12 +83,12 @@ func TestMkfsDefaultGeometry(t *testing.T) {
 	}
 	defer f.Close()
 
-	sb, err := types.ReadSuperblock(f, 4096)
+	sb, err := briefs.ReadSuperblock(f, 4096)
 	if err != nil {
 		t.Fatalf("read superblock: %v", err)
 	}
-	if sb.Magic != types.MagicSuperblock {
-		t.Errorf("Magic: want 0x%X, got 0x%X", types.MagicSuperblock, sb.Magic)
+	if sb.Magic != briefs.MagicSuperblock {
+		t.Errorf("Magic: want 0x%X, got 0x%X", briefs.MagicSuperblock, sb.Magic)
 	}
 	if sb.BlockSize != 4096 {
 		t.Errorf("BlockSize: want 4096, got %d", sb.BlockSize)
@@ -114,7 +114,7 @@ func TestMkfsDefaultGeometry(t *testing.T) {
 	if _, err := f.ReadAt(buf, int64(sb.InodeTableOffset*sb.BlockSize)); err != nil {
 		t.Fatalf("read root inode: %v", err)
 	}
-	root, err := types.UnmarshalInode(buf)
+	root, err := briefs.UnmarshalInode(buf)
 	if err != nil {
 		t.Fatalf("unmarshal root inode: %v", err)
 	}
@@ -136,13 +136,13 @@ func TestMkfsDefaultGeometry(t *testing.T) {
 
 	// Root directory trie page should have the TRNP magic.
 	page := make([]byte, 4096)
-	rootBlock := types.TrieRefBlock(root.DirTrieRoot)
+	rootBlock := briefs.TrieRefBlock(root.DirTrieRoot)
 	if _, err := f.ReadAt(page, int64(rootBlock*sb.BlockSize)); err != nil {
 		t.Fatalf("read root trie page: %v", err)
 	}
 	magic := binary.LittleEndian.Uint32(page[0:])
-	if magic != types.MagicTriePage {
-		t.Errorf("root trie page magic: want 0x%X, got 0x%X", types.MagicTriePage, magic)
+	if magic != briefs.MagicTriePage {
+		t.Errorf("root trie page magic: want 0x%X, got 0x%X", briefs.MagicTriePage, magic)
 	}
 	liveCount := binary.LittleEndian.Uint16(page[8:])
 	if liveCount == 0 {
@@ -267,7 +267,7 @@ func TestMkfsLabel(t *testing.T) {
 	}
 	defer f.Close()
 
-	sb, err := types.ReadSuperblock(f, 4096)
+	sb, err := briefs.ReadSuperblock(f, 4096)
 	if err != nil {
 		t.Fatalf("read superblock: %v", err)
 	}
@@ -295,7 +295,7 @@ func TestMkfsJournalSize(t *testing.T) {
 	}
 	defer f.Close()
 
-	sb, err := types.ReadSuperblock(f, 4096)
+	sb, err := briefs.ReadSuperblock(f, 4096)
 	if err != nil {
 		t.Fatalf("read superblock: %v", err)
 	}
@@ -334,7 +334,7 @@ func TestMkfsInodeRatio(t *testing.T) {
 	}
 	defer f.Close()
 
-	sb, err := types.ReadSuperblock(f, 4096)
+	sb, err := briefs.ReadSuperblock(f, 4096)
 	if err != nil {
 		t.Fatalf("read superblock: %v", err)
 	}

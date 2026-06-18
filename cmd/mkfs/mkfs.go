@@ -7,11 +7,9 @@ import (
 	"os"
 
 	"github.com/ctdk/briefs-utils/device"
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 	"github.com/urfave/cli/v2"
 )
-
-var versionStr = fmt.Sprintf("v%d.%d.%d", types.BrieFSMajorVersion, types.BrieFSMinorVersion, types.BrieFSPatchVersion)
 
 func roundUp(value, alignment uint64) uint64 {
 	return (value + alignment - 1) / alignment * alignment
@@ -20,7 +18,7 @@ func roundUp(value, alignment uint64) uint64 {
 // Calculate on-disk location of an inode.
 // The inode table starts at: inode_table_offset
 // (This matches what the kernel computes in briefs_iget.)
-func calculateInodeLocation(sb *types.Superblock, inodeNum uint64) (blockOffset uint64, byteOffset uint64) {
+func calculateInodeLocation(sb *briefs.Superblock, inodeNum uint64) (blockOffset uint64, byteOffset uint64) {
 	inodesPerBlock := sb.Lay.BlockSize / sb.Lay.InodeSize // 4096 / 512 = 8
 	inodeTableStartBlock := sb.Lay.InodeTableOffset
 	inodeIndex := inodeNum - 1
@@ -145,7 +143,7 @@ func main() {
 			inodeTableBlocks := roundUp(estInodes, inodesPerBlock) / inodesPerBlock
 
 			// Inode bitmap size (3-level bitmap pyramid)
-			inodeAllocBuilder := types.NewAllocBuilder(estInodes)
+			inodeAllocBuilder := briefs.NewAllocBuilder(estInodes)
 			inodeBitmapBlocks := inodeAllocBuilder.NbBlocks()
 			inodeAllocBlocks := inodeBitmapBlocks
 
@@ -161,7 +159,7 @@ func main() {
 			}
 
 			finalDataBlocks := uint64(totalBlocks) - 1 - inodeAllocBlocks - inodeTableBlocks - 1 - journalBlocks
-			builder := types.NewAllocBuilder(finalDataBlocks)
+			builder := briefs.NewAllocBuilder(finalDataBlocks)
 			allocBlocks := builder.NbBlocks()
 			finalDataBlocks = uint64(totalBlocks) - 1 - inodeAllocBlocks - inodeTableBlocks - 1 - allocBlocks - journalBlocks
 			if finalDataBlocks < 1 {
@@ -169,7 +167,7 @@ func main() {
 			}
 
 			// Build final allocator with correct block count
-			finalBuilder := types.NewAllocBuilder(finalDataBlocks)
+			finalBuilder := briefs.NewAllocBuilder(finalDataBlocks)
 			finalBuilder.MarkAllocated(0) // root dir block
 			allocBlocksFinal := finalBuilder.NbBlocks()
 
@@ -215,7 +213,7 @@ func main() {
 			}
 
 			// --- Build superblock ---
-			sb, err := types.NewSuperblock(uint64(totalBlocks), blockSize, inodeSize, journalBlocks, label, uuidStr)
+			sb, err := briefs.NewSuperblock(uint64(totalBlocks), blockSize, inodeSize, journalBlocks, label, uuidStr)
 			if err != nil {
 				return err
 			}
@@ -299,8 +297,8 @@ func main() {
 			rootTrieBlock := dataRegionStart
 			trieBlock := make([]byte, blockSize)
 			// Page header (16 bytes)
-			binary.LittleEndian.PutUint32(trieBlock[0:], types.MagicTriePage) // "TRNP" magic
-			binary.LittleEndian.PutUint32(trieBlock[4:], types.TriePageVersion)
+			binary.LittleEndian.PutUint32(trieBlock[0:], briefs.MagicTriePage) // "TRNP" magic
+			binary.LittleEndian.PutUint32(trieBlock[4:], briefs.TriePageVersion)
 			binary.LittleEndian.PutUint16(trieBlock[8:], 1)   // live_count = 1
 			binary.LittleEndian.PutUint16(trieBlock[10:], 0)  // free_name_off = 0
 			// free_slots: slot 0 allocated, rest free -> bitmap = ~1
@@ -311,7 +309,7 @@ func main() {
 			//   byte_val (1), f_type (1), flags (2), child_count (2)
 			slotOff := uint64(20)
 			trieBlock[slotOff+28] = 0                       // depth = 0
-			trieBlock[slotOff+29] = byte(types.NodeTypeInterm) // node_type
+			trieBlock[slotOff+29] = byte(briefs.NodeTypeInterm) // node_type
 			// first_child, next_sibling, inode, name_len, name_offset,
 			// byte_val, f_type, flags, child_count all default to 0.
 
@@ -320,10 +318,10 @@ func main() {
 			}
 
 			// 4. Root inode (inode 1) at first slot of inode table
-			rootInode := types.NewInode(1, types.ModeDir|0755)
+			rootInode := briefs.NewInode(1, briefs.ModeDir|0755)
 			rootInode.Nlinks = 2
 			rootInode.ParentInode = 1
-			rootInode.DirTrieRoot = types.TrieMakeRef(rootTrieBlock, 0)
+			rootInode.DirTrieRoot = briefs.TrieMakeRef(rootTrieBlock, 0)
 
 			inodeBlock, inodeByteOffset := calculateInodeLocation(sb, 1)
 			fileOffset := int64(inodeBlock*blockSize + inodeByteOffset)
@@ -353,13 +351,13 @@ func main() {
 			binary.LittleEndian.PutUint32(journalBuf[8:], 1)          // record_count
 			// Checkpoint record header at offset 16
 			recOff := uint64(16)
-			binary.LittleEndian.PutUint32(journalBuf[recOff:], uint32(types.JRN_CHECKPOINT))
+			binary.LittleEndian.PutUint32(journalBuf[recOff:], uint32(briefs.JRN_CHECKPOINT))
 			binary.LittleEndian.PutUint32(journalBuf[recOff+4:], 0) // flags
-			binary.LittleEndian.PutUint32(journalBuf[recOff+8:], types.CheckpointSize)
+			binary.LittleEndian.PutUint32(journalBuf[recOff+8:], briefs.CheckpointSize)
 
 			// Checkpoint record data at offset 32 (56 bytes).
 			cpOff := recOff + 16
-			cp := &types.Checkpoint{
+			cp := &briefs.Checkpoint{
 				Seq:            1,
 				RecordCount:    1,
 				LogSequenceEnd: journalOffset,
@@ -375,7 +373,7 @@ func main() {
 
 			// Compute and write the CRC32C checksum over type, flags,
 			// data_len, and the 56-byte checkpoint data.
-			checksum := types.ComputeJournalRecordChecksum(uint32(types.JRN_CHECKPOINT), 0, cpData)
+			checksum := briefs.ComputeJournalRecordChecksum(uint32(briefs.JRN_CHECKPOINT), 0, cpData)
 			binary.LittleEndian.PutUint32(journalBuf[recOff+12:], checksum)
 			if _, err := file.WriteAt(journalBuf, int64(checkpointBlock*blockSize)); err != nil {
 				return fmt.Errorf("write journal checkpoint at block %d: %w", checkpointBlock, err)
