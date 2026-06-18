@@ -6,17 +6,15 @@ import (
 	"os"
 
 	"github.com/ctdk/briefs-utils/fuse"
-	"github.com/ctdk/briefs-utils/types"
+	"github.com/ctdk/briefs-utils/briefs"
 	"github.com/urfave/cli/v2"
 )
-
-var versionStr = fmt.Sprintf("v%d.%d.%d", types.BrieFSMajorVersion, types.BrieFSMinorVersion, types.BrieFSPatchVersion)
 
 func main() {
 	app := &cli.App{
 		Name:  "briefs-fuse",
 		Usage: "Mount a BrieFS filesystem image via FUSE",
-		Version: versionStr,
+		Version: briefs.VersionStr,
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:     "image",
