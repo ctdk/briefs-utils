@@ -1,4 +1,4 @@
-package types
+package briefs
 
 // inode structs and methods
 

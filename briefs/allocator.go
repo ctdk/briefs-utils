@@ -1,5 +1,5 @@
-// Package types defines the BrieFS on-disk format.
-package types
+// Package briefs defines the BrieFS on-disk format.
+package briefs
 
 // AllocBuilder builds a 3-level bitmap pyramid for free block tracking.
 //

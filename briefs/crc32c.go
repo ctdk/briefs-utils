@@ -1,4 +1,4 @@
-package types
+package briefs
 
 import (
 	"encoding/binary"

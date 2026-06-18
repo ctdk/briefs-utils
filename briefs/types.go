@@ -1,5 +1,5 @@
-// Package types defines the BrieFS on-disk format.
-package types
+// Package briefs defines the BrieFS on-disk format.
+package briefs
 
 import (
 	"encoding/binary"
@@ -99,7 +99,7 @@ const (
 	BrieFSPatchVersion = 0
 )
 
-var VersionStr = fmt.Sprintf("v%d.%d.%d", types.BrieFSMajorVersion, types.BrieFSMinorVersion, types.BrieFSPatchVersion)
+var VersionStr = fmt.Sprintf("v%d.%d.%d", BrieFSMajorVersion, BrieFSMinorVersion, BrieFSPatchVersion)
 
 // Block layout constants - defines the order of metadata on disk
 // Block 0: Superblock
@@ -147,7 +147,7 @@ func nextPowerOf2(n uint64) uint64 {
 	return n + 1
 }
 
-// Keeping extents in the main types.go file for the time being, until there's
+// Keeping extents in the main briefs.go file for the time being, until there's
 // more going on.
 
 // Extent represents a file extent (16 bytes).

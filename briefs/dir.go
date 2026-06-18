@@ -1,5 +1,5 @@
-// Package types defines the BrieFS on-disk format.
-package types
+// Package briefs defines the BrieFS on-disk format.
+package briefs
 
 // directory entry related structs and methods
 
