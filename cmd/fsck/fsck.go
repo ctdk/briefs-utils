@@ -94,6 +94,24 @@ func main() {
 				Aliases: []string{"y"},
 				Usage:   "do not ask for confirmation before modifying the volume",
 			},
+			// fsck(8)-style flags, for xfstests interoperability and direct
+			// invocation parity with other fsck.<fstyp> tools:
+			&cli.BoolFlag{
+				Name:    "no",
+				Aliases: []string{"n"},
+				Usage:   "read-only check; do not attempt repairs (default mode, made explicit for fsck(8) -n)",
+			},
+			&cli.BoolFlag{
+				Name:    "preen",
+				Aliases: []string{"p"},
+				Usage:   "non-interactive repair; alias for --repair --assume-yes",
+			},
+			&cli.StringFlag{
+				Name:    "type",
+				Aliases: []string{"t"},
+				Usage:   "filesystem type (accepted for fsck(8) compatibility; ignored)",
+				Value:   "",
+			},
 		},
 		Action: func(c *cli.Context) error {
 			path := c.Args().First()
@@ -101,12 +119,28 @@ func main() {
 			repairOnly := c.String("repair-only")
 			optimize := c.Bool("optimize")
 			assumeYes := c.Bool("assume-yes")
+			preen := c.Bool("preen")
+			noMode := c.Bool("no")
 
 			if optimize && repairOnly != "" {
 				return fmt.Errorf("--optimize and --repair-only cannot be used together")
 			}
 			if optimize {
 				repairOnly = "trie,extents"
+			}
+			// --preen is an alias for --repair --assume-yes: automatic,
+			// non-interactive repair (the fsck(8) -p convention).
+			if preen {
+				repair = true
+				assumeYes = true
+			}
+			// -n forces a read-only check and overrides any repair/preen/optimize
+			// request, so `fsck -n` (from xfstests' _check_generic_filesystem and
+			// the fsck(8) -n convention) never mutates the volume.
+			if noMode {
+				repair = false
+				repairOnly = ""
+				optimize = false
 			}
 			repairRequested := repair || repairOnly != ""
 
