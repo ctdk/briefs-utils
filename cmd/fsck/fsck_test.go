@@ -214,8 +214,7 @@ func TestFsckTreeBackedFile(t *testing.T) {
 	binary.LittleEndian.PutUint32(leafBuf[4:], briefs.BtreeFlagLeaf) // flags: leaf
 	binary.LittleEndian.PutUint16(leafBuf[8:], 0)  // level 0 = leaf
 	binary.LittleEndian.PutUint16(leafBuf[10:], 9) // num_keys
-	binary.LittleEndian.PutUint64(leafBuf[12:], 0) // prev_leaf
-	binary.LittleEndian.PutUint64(leafBuf[20:], 0) // next_leaf
+	binary.LittleEndian.PutUint64(leafBuf[16:], 0) // next_leaf (offset 16; 0 = no next leaf; bytes 12-15 are header padding)
 	for i := 0; i < 9; i++ {
 		off := briefs.BtreeHeaderSize + i*32
 		binary.LittleEndian.PutUint64(leafBuf[off:], uint64(i))          // offset
@@ -417,8 +416,7 @@ func TestFsckRepairRefusesCorruptBtree(t *testing.T) {
 	binary.LittleEndian.PutUint32(leafBuf[4:], briefs.BtreeFlagLeaf)
 	binary.LittleEndian.PutUint16(leafBuf[8:], 0)  // level 0 = leaf
 	binary.LittleEndian.PutUint16(leafBuf[10:], 9) // num_keys
-	binary.LittleEndian.PutUint64(leafBuf[12:], 0) // prev_leaf
-	binary.LittleEndian.PutUint64(leafBuf[20:], 0) // next_leaf
+	binary.LittleEndian.PutUint64(leafBuf[16:], 0) // next_leaf (offset 16; 0 = no next leaf; bytes 12-15 are header padding)
 	for i := 0; i < 9; i++ {
 		off := briefs.BtreeHeaderSize + i*32
 		binary.LittleEndian.PutUint64(leafBuf[off:], uint64(i))
@@ -1073,8 +1071,7 @@ func writeCombinedFixture(t *testing.T, mkfsPath, imgPath string, corruptNlinks 
 	binary.LittleEndian.PutUint32(leafBuf[4:], briefs.BtreeFlagLeaf)
 	binary.LittleEndian.PutUint16(leafBuf[8:], 0)  // level 0
 	binary.LittleEndian.PutUint16(leafBuf[10:], 9) // num_keys
-	binary.LittleEndian.PutUint64(leafBuf[12:], 0) // prev_leaf
-	binary.LittleEndian.PutUint64(leafBuf[20:], 0) // next_leaf
+	binary.LittleEndian.PutUint64(leafBuf[16:], 0) // next_leaf (offset 16; 0 = no next leaf; bytes 12-15 are header padding)
 	for i := 0; i < 9; i++ {
 		off := briefs.BtreeHeaderSize + i*32
 		binary.LittleEndian.PutUint64(leafBuf[off:], uint64(i))
@@ -1489,4 +1486,325 @@ func TestFsckRepairOnlyInvalid(t *testing.T) {
 	if !contains(string(out), "unknown repair phase") {
 		t.Fatalf("fsck did not report unknown repair phase:\n%s", out)
 	}
+}
+
+// --- Phase 2: B+ tree structural-detection tests ----------------------------
+//
+// These build a hand-rolled 2-level B+ tree (3 leaves of 30 extents each under
+// one idx root) for inode 2, then inject structurally-bad-but-checksum-valid
+// faults and assert verifyBtreeStructures catches them. "Checksum-valid" is the
+// key: btreeWalk (the basic walk) only checks magic/checksum/fanout/within-leaf
+// order, so to reach the deeper checks in verifyBtreeStructures the corrupted
+// node must still pass btreeWalk — hence each fault recomputes the node checksum
+// after mutation.
+//
+// Layout (5000-block image, superblock fields dumped empirically):
+//   TrieNodePoolStart=86, TrieNodePoolSize=4 -> data region starts at abs 90
+//   data allocator: header@86, L0@87, L1@88, L2@89  (data-rel N -> blk 89 word N/64 bit N%64)
+//   inode allocator: header@1, L0@2, L1@3, L2@4      (inode 2 -> blk 4 word 0 bit 1)
+//   inode table @ block 5; inode 2 at byte 5*4096+512
+//   extents: logical 0..89, phys abs 120..209 (data-rel 30..119)
+//   leaves:  data-rel 120/121/122 -> abs 210/211/212 (offsets 0..29 / 30..59 / 60..89)
+//   idx root: data-rel 123 -> abs 213 (level 1; children=[210,211] high_keys=[30,60] trailing=212)
+
+const (
+	btree2DataRegionAbs = uint64(90)
+	btree2DataL2Block   = uint64(89)
+	btree2InodeL2Block  = uint64(4)
+	btree2InodeByteOff  = int64(5*4096 + 512)
+	btree2RootAbs       = uint64(213)
+)
+
+// buildBtree2Leaf serializes a leaf with numKeys single-block extents starting
+// at logical startOffset and physical physBase, threading nextLeaf. The caller
+// supplies a zeroed 4096-byte buffer.
+func buildBtree2Leaf(buf []byte, numKeys uint16, startOffset, physBase, nextLeaf uint64) {
+	binary.LittleEndian.PutUint32(buf[0:], briefs.BtreeMagic)
+	binary.LittleEndian.PutUint32(buf[4:], briefs.BtreeFlagLeaf)
+	binary.LittleEndian.PutUint16(buf[8:], 0) // level 0
+	binary.LittleEndian.PutUint16(buf[10:], numKeys)
+	binary.LittleEndian.PutUint64(buf[16:], nextLeaf)
+	for i := uint16(0); i < numKeys; i++ {
+		off := briefs.BtreeHeaderSize + int(i)*32
+		binary.LittleEndian.PutUint64(buf[off:], startOffset+uint64(i))
+		binary.LittleEndian.PutUint64(buf[off+8:], physBase+uint64(i))
+		binary.LittleEndian.PutUint64(buf[off+16:], 1) // len 1
+		binary.LittleEndian.PutUint64(buf[off+24:], 0) // flags+pad
+	}
+	binary.LittleEndian.PutUint64(buf[briefs.BtreeChecksumOffset:], briefs.ComputeChainChecksum(buf, 4096))
+}
+
+// buildBtree2Idx serializes an internal node: children[i] is the subtree left of
+// separator i (high_keys[i]); trailing is the rightmost child.
+func buildBtree2Idx(buf []byte, level uint16, children, highKeys []uint64, trailing uint64) {
+	binary.LittleEndian.PutUint32(buf[0:], briefs.BtreeMagic)
+	binary.LittleEndian.PutUint32(buf[4:], 0) // internal (no leaf flag)
+	binary.LittleEndian.PutUint16(buf[8:], level)
+	binary.LittleEndian.PutUint16(buf[10:], uint16(len(children)))
+	binary.LittleEndian.PutUint64(buf[16:], 0) // next_leaf 0 for internal
+	for i := range children {
+		off := briefs.BtreeHeaderSize + i*16
+		binary.LittleEndian.PutUint64(buf[off:], children[i])
+		binary.LittleEndian.PutUint64(buf[off+8:], highKeys[i])
+	}
+	binary.LittleEndian.PutUint64(buf[briefs.BtreeTrailingChildOffset:], trailing)
+	binary.LittleEndian.PutUint64(buf[briefs.BtreeChecksumOffset:], briefs.ComputeChainChecksum(buf, 4096))
+}
+
+// markDataAllocated clears bits [relStart, relEnd] (data-relative block numbers)
+// in the data L2 bitmap at block dataL2Block, marking them allocated (a cleared
+// bit = allocated). Handles multiple 64-bit words.
+func markDataAllocated(f *os.File, dataL2Block, relStart, relEnd uint64) error {
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, int64(dataL2Block*4096)); err != nil {
+		return err
+	}
+	for b := relStart; b <= relEnd; b++ {
+		wordIdx := b / 64
+		bit := b % 64
+		off := int(wordIdx) * 8
+		w := binary.LittleEndian.Uint64(buf[off:])
+		w &^= 1 << bit
+		binary.LittleEndian.PutUint64(buf[off:], w)
+	}
+	_, err := f.WriteAt(buf, int64(dataL2Block*4096))
+	return err
+}
+
+// prepareBtree2Fixture mkfs's a 5000-block image and writes a correct 3-leaf
+// B+ tree for inode 2 with all data/node blocks and inode 2 marked allocated.
+// Returns the image path. Each subtest calls this fresh (corruption is destructive).
+func prepareBtree2Fixture(t *testing.T) string {
+	t.Helper()
+	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
+	imgPath := filepath.Join(t.TempDir(), "btree2.briefs")
+	if out, err := exec.Command(mkfsPath, "-s", "5000", imgPath).CombinedOutput(); err != nil {
+		t.Fatalf("mkfs: %v\n%s", err, out)
+	}
+
+	leaf0 := make([]byte, 4096)
+	buildBtree2Leaf(leaf0, 30, 0, 120, 211)  // offsets 0..29, phys 120..149, next=leaf1
+	leaf1 := make([]byte, 4096)
+	buildBtree2Leaf(leaf1, 30, 30, 150, 212) // offsets 30..59, phys 150..179, next=leaf2
+	leaf2 := make([]byte, 4096)
+	buildBtree2Leaf(leaf2, 30, 60, 180, 0)   // offsets 60..89, phys 180..209, next=0
+	idx := make([]byte, 4096)
+	buildBtree2Idx(idx, 1, []uint64{210, 211}, []uint64{30, 60}, 212)
+
+	inode := &briefs.Inode{
+		InodeNumber:      2,
+		Magic:            briefs.MagicInode,
+		Filemode:         briefs.ModeFile | 0644,
+		FileSize:         90 * 4096,
+		Nlinks:           0, // orphan; we only care about the tree walk
+		NumExtentsInline: 0,
+		NumExtentsTotal:  90,
+		ExtentInlineBase: btree2RootAbs,
+		Flags:            briefs.InodeFlagIndexed,
+	}
+	inode.SetInlineExtents([8]briefs.Extent{})
+
+	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open image: %v", err)
+	}
+	for _, w := range []struct {
+		buf []byte
+		abs uint64
+	}{{leaf0, 210}, {leaf1, 211}, {leaf2, 212}, {idx, 213}} {
+		if _, err := f.WriteAt(w.buf, int64(w.abs*4096)); err != nil {
+			t.Fatalf("write node %d: %v", w.abs, err)
+		}
+	}
+	if err := inode.WriteAt(f, btree2InodeByteOff); err != nil {
+		t.Fatalf("write inode: %v", err)
+	}
+
+	// Mark inode 2 allocated in the inode L2 bitmap (block 4, word 0, bit 1).
+	inodeL2 := make([]byte, 4096)
+	if _, err := f.ReadAt(inodeL2, int64(btree2InodeL2Block*4096)); err != nil {
+		t.Fatalf("read inode L2: %v", err)
+	}
+	w := binary.LittleEndian.Uint64(inodeL2[0:])
+	w &^= 1 << 1
+	binary.LittleEndian.PutUint64(inodeL2[0:], w)
+	if _, err := f.WriteAt(inodeL2, int64(btree2InodeL2Block*4096)); err != nil {
+		t.Fatalf("write inode L2: %v", err)
+	}
+
+	// Mark data-rel 30..123 allocated (90 data blocks + 3 leaves + 1 idx root).
+	if err := markDataAllocated(f, btree2DataL2Block, 30, 123); err != nil {
+		t.Fatalf("mark data: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close image: %v", err)
+	}
+	return imgPath
+}
+
+// rewriteBtree2Node reads block @abs, applies mutate, recomputes the B-tree
+// checksum, and writes it back — producing a structurally-bad-but-checksum-valid
+// node so btreeWalk passes and verifyBtreeStructures catches the structural fault.
+func rewriteBtree2Node(t *testing.T, imgPath string, abs uint64, mutate func(buf []byte)) {
+	t.Helper()
+	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, int64(abs*4096)); err != nil {
+		t.Fatalf("read node %d: %v", abs, err)
+	}
+	mutate(buf)
+	binary.LittleEndian.PutUint64(buf[briefs.BtreeChecksumOffset:], briefs.ComputeChainChecksum(buf, 4096))
+	if _, err := f.WriteAt(buf, int64(abs*4096)); err != nil {
+		t.Fatalf("write node %d: %v", abs, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// runBtree2Fsck runs read-only fsck and returns its combined output.
+func runBtree2Fsck(t *testing.T, imgPath string) string {
+	t.Helper()
+	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
+	out, err := exec.Command(fsckPath, imgPath).CombinedOutput()
+	if err != nil {
+		// read-only fsck exits non-zero when it finds errors; that's expected
+		// for the fault cases. Only fail on execution errors, not exit codes.
+		_ = err
+	}
+	return string(out)
+}
+
+func TestFsckBtreeStructuralChecks(t *testing.T) {
+	// Each fault is (name, inject, wantSubstrings). wantSubstrings must all be
+	// present in the read-only fsck output, and "unrecoverable B-tree
+	// extent-index errors" + "ino 2" must confirm failedBtreeInos was set.
+	//
+	// Byte offsets within the idx root (block 213):
+	//   idx[0].child    @ BtreeHeaderSize+0*16   = 24
+	//   idx[0].high_key @ BtreeHeaderSize+0*16+8 = 32
+	//   idx[1].child    @ BtreeHeaderSize+1*16   = 40
+	//   idx[1].high_key @ BtreeHeaderSize+1*16+8 = 48
+	// Leaf1 first extent offset @ BtreeHeaderSize+0*32 = 24.
+	// Leaf level field @ 8 (uint16).
+	type fault struct {
+		name    string
+		inject  func(t *testing.T, imgPath string)
+		want    []string
+	}
+	faults := []fault{
+		{
+			name: "unsorted_high_key",
+			inject: func(t *testing.T, p string) {
+				rewriteBtree2Node(t, p, btree2RootAbs, func(buf []byte) {
+					binary.LittleEndian.PutUint64(buf[48:], 25) // idx[1].high_key 60 -> 25 (< 30)
+				})
+			},
+			want: []string{"separator high_key not strictly ascending"},
+		},
+		{
+			name: "zero_high_key",
+			inject: func(t *testing.T, p string) {
+				rewriteBtree2Node(t, p, btree2RootAbs, func(buf []byte) {
+					binary.LittleEndian.PutUint64(buf[32:], 0) // idx[0].high_key 30 -> 0
+				})
+			},
+			want: []string{"separator high_key not strictly ascending", "high_key=0"},
+		},
+		{
+			name: "null_child",
+			inject: func(t *testing.T, p string) {
+				rewriteBtree2Node(t, p, btree2RootAbs, func(buf []byte) {
+					binary.LittleEndian.PutUint64(buf[24:], 0) // idx[0].child 210 -> 0
+				})
+			},
+			want: []string{"bad child pointer", "null child pointer"},
+		},
+		{
+			name: "wrong_leaf_level",
+			inject: func(t *testing.T, p string) {
+				rewriteBtree2Node(t, p, 211, func(buf []byte) {
+					binary.LittleEndian.PutUint16(buf[8:], 2) // leaf1 level 0 -> 2
+				})
+			},
+			want: []string{"bad child pointer", "leaf with level"},
+		},
+		{
+			name: "cross_leaf_overlap",
+			inject: func(t *testing.T, p string) {
+				rewriteBtree2Node(t, p, 211, func(buf []byte) {
+					// leaf1 first offset 30 -> 29 (== leaf0 max 29): within-leaf
+					// order still holds (29 < 31), so btreeWalk passes, but the
+					// cross-leaf check (29 <= prevLeafMax 29) fires.
+					binary.LittleEndian.PutUint64(buf[24:], 29)
+				})
+			},
+			want: []string{"cross-leaf extents unsorted"},
+		},
+		{
+			name: "count_mismatch",
+			inject: func(t *testing.T, p string) {
+				// Rewrite the inode with a wrong num_extents_total (tree untouched).
+				f, err := os.OpenFile(p, os.O_RDWR, 0)
+				if err != nil {
+					t.Fatalf("open: %v", err)
+				}
+				buf := make([]byte, 512)
+				if _, err := f.ReadAt(buf, btree2InodeByteOff); err != nil {
+					t.Fatalf("read inode: %v", err)
+				}
+				in, err := briefs.UnmarshalInode(buf)
+				if err != nil {
+					t.Fatalf("unmarshal inode: %v", err)
+				}
+				in.NumExtentsTotal = 89 // actual walked count is 90
+				if err := in.WriteAt(f, btree2InodeByteOff); err != nil {
+					t.Fatalf("write inode: %v", err)
+				}
+				if err := f.Close(); err != nil {
+					t.Fatalf("close: %v", err)
+				}
+			},
+			want: []string{"extent count != num_extents_total"},
+		},
+	}
+
+	for _, ft := range faults {
+		t.Run(ft.name, func(t *testing.T) {
+			imgPath := prepareBtree2Fixture(t)
+			ft.inject(t, imgPath)
+			out := runBtree2Fsck(t, imgPath)
+			for _, s := range ft.want {
+				if !contains(out, s) {
+					t.Errorf("expected output to contain %q\n---- output ----\n%s", s, out)
+				}
+			}
+			if !contains(out, "unrecoverable B-tree extent-index errors") || !contains(out, "ino 2") {
+				t.Errorf("expected failedBtreeInos WARNING for ino 2\n---- output ----\n%s", out)
+			}
+		})
+	}
+
+	// The correct tree must produce NO structural errors and must NOT populate
+	// failedBtreeInos (no "unrecoverable B-tree extent-index errors" warning).
+	t.Run("correct_tree_clean", func(t *testing.T) {
+		imgPath := prepareBtree2Fixture(t)
+		out := runBtree2Fsck(t, imgPath)
+		for _, bad := range []string{
+			"separator high_key",
+			"bad child pointer",
+			"cross-leaf extents unsorted",
+			"extent count != num_extents_total",
+			"leaf with level",
+			"unrecoverable B-tree extent-index errors",
+			"btree node",
+		} {
+			if contains(out, bad) {
+				t.Errorf("correct tree produced B-tree marker %q\n---- output ----\n%s", bad, out)
+			}
+		}
+	})
 }

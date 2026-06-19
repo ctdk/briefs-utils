@@ -52,22 +52,30 @@ const BtreeMaxDepth = 16
 // Errors returned by the B-tree walk. fsck formats these with the offending
 // inode/block number.
 var (
-	ErrBtreeBadMagic    = errors.New("bad magic")
-	ErrBtreeChecksum    = errors.New("checksum mismatch")
-	ErrBtreeDepth       = errors.New("depth exceeded")
-	ErrBtreeCycle       = errors.New("cycle detected")
-	ErrBtreeUnsorted    = errors.New("extents unsorted")
-	ErrBtreeCountOverflow = errors.New("count exceeds fanout")
+	ErrBtreeBadMagic       = errors.New("bad magic")
+	ErrBtreeChecksum       = errors.New("checksum mismatch")
+	ErrBtreeDepth          = errors.New("depth exceeded")
+	ErrBtreeCycle          = errors.New("cycle detected")
+	ErrBtreeUnsorted        = errors.New("extents unsorted")
+	ErrBtreeCountOverflow  = errors.New("count exceeds fanout")
+	ErrBtreeBadHighKey      = errors.New("separator high_key not strictly ascending")
+	ErrBtreeBadChild        = errors.New("bad child pointer")
+	ErrBtreeCrossLeafUnsorted = errors.New("cross-leaf extents unsorted")
+	ErrBtreeCountMismatch  = errors.New("extent count != num_extents_total")
 )
 
-// BtreeNodeHeader is the 24-byte on-disk header of a B+ tree node.
+// BtreeNodeHeader is the 24-byte on-disk header of a B+ tree node, matching
+// struct briefs_btree_header in the kernel (briefs.h). The kernel layout is:
+// magic@0, flags@4, level@8, num_keys@10, 4 bytes padding@12, next_leaf@16.
+// There is NO prev_leaf — the kernel comment (briefs.h) states no path iterates
+// backward. next_leaf threads leaves left-to-right and is 0 for the last leaf
+// (and for all internal nodes, which set it to 0 on split).
 type BtreeNodeHeader struct {
 	Magic    uint32
 	Flags    uint32
 	Level    uint16
 	NumKeys  uint16
-	PrevLeaf uint64
-	NextLeaf uint64
+	NextLeaf uint64 // offset 16; 0 if none (leaf only); internal nodes always 0
 }
 
 // UnmarshalBtreeHeader reads the node header from a block buffer.
@@ -77,8 +85,7 @@ func UnmarshalBtreeHeader(buf []byte) BtreeNodeHeader {
 		Flags:    binary.LittleEndian.Uint32(buf[4:]),
 		Level:    binary.LittleEndian.Uint16(buf[8:]),
 		NumKeys:  binary.LittleEndian.Uint16(buf[10:]),
-		PrevLeaf: binary.LittleEndian.Uint64(buf[12:]),
-		NextLeaf: binary.LittleEndian.Uint64(buf[20:]),
+		NextLeaf: binary.LittleEndian.Uint64(buf[16:]),
 	}
 }
 

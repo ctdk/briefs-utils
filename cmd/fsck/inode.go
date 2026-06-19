@@ -139,6 +139,12 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 				// Collect extents for block cross-reference
 				collectInodeExtents(fs, ino, in, blockSize)
 
+				// Deep structural checks the basic walk skips (separator
+				// ordering, child range/level, cross-leaf ordering, extent
+				// count). Runs only for tree-backed inodes whose basic walk
+				// succeeded; populates failedBtreeInos on structural faults.
+				verifyBtreeStructures(fs, ino, in, blockSize)
+
 				// Collect trie root for directory trie walking
 				if in.IsDir() {
 					if in.DirTrieRoot == 0 {
