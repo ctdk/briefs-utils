@@ -37,6 +37,8 @@ func parseRepairOptions(list string) (*repairOptions, error) {
 			opts.RepairBtreeCRC = true
 		case "btree-rebuild":
 			opts.RebuildBtree = true
+		case "btree-orphan":
+			opts.ReclaimOrphanBtree = true
 		case "extents":
 			opts.CompactExtents = true
 		case "trie":
@@ -46,7 +48,7 @@ func parseRepairOptions(list string) (*repairOptions, error) {
 		case "":
 			// ignore empty tokens
 		default:
-			return nil, fmt.Errorf("unknown repair phase %q (expected allocator, btrees, btree-rebuild, extents, trie, or links)", tok)
+			return nil, fmt.Errorf("unknown repair phase %q (expected allocator, btrees, btree-rebuild, btree-orphan, extents, trie, or links)", tok)
 		}
 	}
 	return opts, nil
@@ -81,7 +83,7 @@ func main() {
 			},
 			&cli.StringFlag{
 				Name:  "repair-only",
-				Usage: "run only selected repair phases (comma-separated: allocator,btrees,btree-rebuild,extents,trie,links; default all)",
+				Usage: "run only selected repair phases (comma-separated: allocator,btrees,btree-rebuild,btree-orphan,extents,trie,links; default all)",
 			},
 			&cli.BoolFlag{
 				Name:  "optimize",

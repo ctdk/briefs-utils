@@ -2386,3 +2386,160 @@ func seqOffsets(start uint64, n int) []uint64 {
 	}
 	return out
 }
+
+// writeOrphanBtreeLeaf writes a structurally valid B-tree leaf node (BtreeMagic +
+// leaf flag + one extent + correct checksum) at absolute block @absBlk. Nothing
+// references it: it simulates a node allocated and written during a split that
+// crashed before being linked into any tree.
+func writeOrphanBtreeLeaf(t *testing.T, imgPath string, absBlk uint64) {
+	t.Helper()
+	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	buf := make([]byte, 4096)
+	buildBtree2Leaf(buf, 1, 9999, 9999, 0) // offsets/phys are irrelevant; nothing walks it
+	if _, err := f.WriteAt(buf, int64(absBlk*4096)); err != nil {
+		t.Fatalf("write orphan leaf %d: %v", absBlk, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// markSingleDataBlockAllocated clears the bit for @relBlk in the data L2 bitmap,
+// marking that one data-relative block allocated.
+func markSingleDataBlockAllocated(t *testing.T, imgPath string, relBlk uint64) {
+	t.Helper()
+	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := markDataAllocated(f, btree2DataL2Block, relBlk, relBlk); err != nil {
+		t.Fatalf("mark data: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// dataBlockIsFree reads the data L2 bitmap and reports whether @relBlk is free
+// (bit set = free, bit clear = allocated).
+func dataBlockIsFree(t *testing.T, imgPath string, relBlk uint64) bool {
+	t.Helper()
+	f, err := os.Open(imgPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, int64(btree2DataL2Block*4096)); err != nil {
+		t.Fatalf("read data L2: %v", err)
+	}
+	wordIdx := relBlk / 64
+	bit := relBlk % 64
+	w := binary.LittleEndian.Uint64(buf[int(wordIdx)*8:])
+	return w&(1<<bit) != 0
+}
+
+// runFsckRepair runs fsck with the given --repair-only token list and -y.
+func runFsckRepair(t *testing.T, imgPath, token string) string {
+	t.Helper()
+	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
+	out, err := exec.Command(fsckPath, "--repair-only="+token, "-y", imgPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("fsck repair: %v\n%s", err, out)
+	}
+	return string(out)
+}
+
+func TestFsckReclaimOrphanBtree(t *testing.T) {
+	// reclaim: a valid 300-extent tree for ino 2 plus an orphan B-tree leaf at an
+	// allocated-but-unreferenced data block. --repair-only=btree-orphan frees the
+	// orphan and leaves the valid tree untouched.
+	t.Run("reclaim", func(t *testing.T) {
+		imgPath, _, _ := prepareIndexedBtreeFixture(t, 300)
+		orphanRel := uint64(400) // data-rel 400 (abs 490): free in the fixture, outside the 30..333 used range
+		orphanAbs := btree2DataRegionAbs + orphanRel
+		writeOrphanBtreeLeaf(t, imgPath, orphanAbs)
+		markSingleDataBlockAllocated(t, imgPath, orphanRel)
+
+		if dataBlockIsFree(t, imgPath, orphanRel) {
+			t.Fatalf("orphan rel %d should be allocated before repair", orphanRel)
+		}
+
+		out := runFsckRepair(t, imgPath, "btree-orphan")
+		if !contains(out, "Repair complete") {
+			t.Fatalf("repair did not complete:\n%s", out)
+		}
+		if !contains(out, "orphan B-tree node block") {
+			t.Errorf("expected an orphan B-tree warning:\n%s", out)
+		}
+		if !contains(out, "freed 1 block") {
+			t.Errorf("expected a reclamation notice:\n%s", out)
+		}
+
+		// The orphan block must now be free.
+		if !dataBlockIsFree(t, imgPath, orphanRel) {
+			t.Errorf("orphan rel %d should be free after reclamation", orphanRel)
+		}
+
+		// Re-verify must be clean of the orphan (no leaked-block error) and of any
+		// B-tree structural fault.
+		post := postRepairSection(out)
+		if contains(post, "marked allocated in bitmap but NOT referenced") {
+			t.Errorf("post-repair still reports a leaked block:\n%s", post)
+		}
+		assertNoBtreeMarkers(t, post)
+
+		// The valid tree for ino 2 must be untouched: still indexed, 300 extents.
+		in := readInode2(t, imgPath)
+		if in.Flags&briefs.InodeFlagIndexed == 0 {
+			t.Errorf("expected tree-backed inode, got flags=0x%X", in.Flags)
+		}
+		if in.NumExtentsTotal != 300 {
+			t.Errorf("NumExtentsTotal: want 300, got %d", in.NumExtentsTotal)
+		}
+		exts := readInode2Extents(t, imgPath, in)
+		if len(exts) != 300 {
+			t.Fatalf("valid tree extents: want 300, got %d", len(exts))
+		}
+		for i, e := range exts {
+			if e.Offset != uint64(i) || e.Phys != 120+uint64(i) {
+				t.Errorf("extent %d: want offset=%d phys=%d, got offset=%d phys=%d", i, i, 120+i, e.Offset, e.Phys)
+			}
+		}
+	})
+
+	// no_reclaim_without_token: the same orphan fixture repaired with --repair-only=links
+	// (no btree-orphan token) must warn about the orphan (the scan runs unconditionally)
+	// but must NOT free it — the block stays allocated and the re-verify still reports it
+	// as leaked. This confirms reclamation is opt-in.
+	t.Run("no_reclaim_without_token", func(t *testing.T) {
+		imgPath, _, _ := prepareIndexedBtreeFixture(t, 300)
+		orphanRel := uint64(400)
+		orphanAbs := btree2DataRegionAbs + orphanRel
+		writeOrphanBtreeLeaf(t, imgPath, orphanAbs)
+		markSingleDataBlockAllocated(t, imgPath, orphanRel)
+
+		out := runFsckRepair(t, imgPath, "links")
+		if !contains(out, "Repair complete") {
+			t.Fatalf("repair did not complete:\n%s", out)
+		}
+		// The scan warns regardless, but freeing is gated by the token.
+		if !contains(out, "orphan B-tree node block") {
+			t.Errorf("expected an orphan warning even without the token:\n%s", out)
+		}
+		if contains(out, "freed 1 block") {
+			t.Errorf("orphan must NOT be freed without the btree-orphan token:\n%s", out)
+		}
+		if dataBlockIsFree(t, imgPath, orphanRel) {
+			t.Errorf("orphan rel %d should still be allocated without the token", orphanRel)
+		}
+		// Re-verify still flags the unreferenced allocated block as leaked.
+		post := postRepairSection(out)
+		if !contains(post, "marked allocated in bitmap but NOT referenced") {
+			t.Errorf("expected the leaked-block error to persist without reclamation:\n%s", post)
+		}
+	})
+}

@@ -178,6 +178,19 @@ func (b *AllocBuilder) MarkFree(relBlock uint64) {
 	}
 }
 
+// IsAllocated reports whether a block (data-relative, 0-based) is currently
+// marked allocated. A set L2 bit means "free"; a cleared bit means "allocated",
+// so the block is allocated when the bit is zero. Out-of-range blocks are
+// reported as not allocated.
+func (b *AllocBuilder) IsAllocated(relBlock uint64) bool {
+	if relBlock >= b.BlockCount {
+		return false
+	}
+	w2 := relBlock / 64
+	b2 := relBlock % 64
+	return b.L2[w2]&(1<<b2) == 0
+}
+
 // AllocateBlock finds a single free data-relative block and marks it allocated.
 // It returns the relative block number, or an error if no blocks are free.
 func (b *AllocBuilder) AllocateBlock() (uint64, error) {

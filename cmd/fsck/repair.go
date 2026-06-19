@@ -87,6 +87,18 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int, opts *repairOpt
 		}
 	}
 
+	// 2d. Reclaim orphan B-tree node blocks (Phase 5). Runs after the rebuild
+	// (so a rebuilt tree's fresh node blocks are already in fs.usedBlocks via the
+	// rebuilt inodes' extents... note: usedBlocks was populated during the verify
+	// pass before runRepair; rebuilt nodes are tracked via plan.dataAlloc
+	// MarkAllocated, not usedBlocks). It scans for allocated, unreferenced blocks
+	// carrying BtreeMagic and frees them when opts.ReclaimOrphanBtree is set.
+	// Always runs (to surface orphans) but only frees when opted in; skipped when
+	// any tree walk failed so unreached-but-live node blocks are not freed.
+	if err := reclaimOrphanBtree(fs, plan, opts, blockSize, dataRegionStart, dataBlockCount); err != nil {
+		return fmt.Errorf("reclaim orphan btree blocks: %w", err)
+	}
+
 	// 3. Compact file extents.
 	if opts.CompactExtents {
 		if err := compactFileExtents(fs, plan, blockSize); err != nil {
