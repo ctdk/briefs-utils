@@ -67,6 +67,15 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int, opts *repairOpt
 		}
 	}
 
+	// 2b. Rewrite torn B-tree node checksums (Phase 3). Runs after the data
+	// allocator is set up (it MarkAllocates rewritten leaf blocks in
+	// plan.dataAlloc) and before any compaction/rewrite that might move blocks.
+	if opts.RepairBtreeCRC {
+		if err := repairBtreeChecksums(fs, plan, blockSize, dataRegionStart); err != nil {
+			return fmt.Errorf("repair btree checksums: %w", err)
+		}
+	}
+
 	// 3. Compact file extents.
 	if opts.CompactExtents {
 		if err := compactFileExtents(fs, plan, blockSize); err != nil {

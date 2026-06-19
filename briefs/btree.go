@@ -127,6 +127,56 @@ func BtreeTrailingChild(buf []byte) uint64 {
 	return binary.LittleEndian.Uint64(buf[BtreeTrailingChildOffset:])
 }
 
+// MarshalBtreeHeader writes a BtreeNodeHeader into a node buffer. Bytes 12-15
+// (kernel padding) are zeroed so the checksummed region is deterministic. It is
+// the inverse of UnmarshalBtreeHeader.
+func MarshalBtreeHeader(buf []byte, hdr BtreeNodeHeader) {
+	binary.LittleEndian.PutUint32(buf[0:], hdr.Magic)
+	binary.LittleEndian.PutUint32(buf[4:], hdr.Flags)
+	binary.LittleEndian.PutUint16(buf[8:], hdr.Level)
+	binary.LittleEndian.PutUint16(buf[10:], hdr.NumKeys)
+	binary.LittleEndian.PutUint32(buf[12:], 0) // 4 bytes padding@12
+	binary.LittleEndian.PutUint64(buf[16:], hdr.NextLeaf)
+}
+
+// PutBtreeLeafExtent writes the i-th extent into a B-tree leaf node buffer. It is
+// the inverse of ReadBtreeLeafExtent. Does NOT recompute the checksum.
+func PutBtreeLeafExtent(buf []byte, i int, ext Extent) {
+	offset := BtreeHeaderSize + i*32
+	binary.LittleEndian.PutUint64(buf[offset:], ext.Offset)
+	binary.LittleEndian.PutUint64(buf[offset+8:], ext.Phys)
+	binary.LittleEndian.PutUint64(buf[offset+16:], ext.Len)
+	binary.LittleEndian.PutUint32(buf[offset+24:], ext.Flags)
+	binary.LittleEndian.PutUint32(buf[offset+28:], ext.Pad)
+}
+
+// PutBtreeIdxEntry writes the i-th internal idx entry into a node buffer. It is
+// the inverse of ReadBtreeIdxEntry. Does NOT recompute the checksum.
+func PutBtreeIdxEntry(buf []byte, i int, e BtreeIdxEntry) {
+	offset := BtreeHeaderSize + i*16
+	binary.LittleEndian.PutUint64(buf[offset:], e.Child)
+	binary.LittleEndian.PutUint64(buf[offset+8:], e.HighKey)
+}
+
+// SetBtreeTrailingChild writes the trailing_child pointer of an internal node.
+// It is the inverse of BtreeTrailingChild. Does NOT recompute the checksum.
+func SetBtreeTrailingChild(buf []byte, child uint64) {
+	binary.LittleEndian.PutUint64(buf[BtreeTrailingChildOffset:], child)
+}
+
+// SetBtreeNodeChecksum recomputes the node checksum over [0, BtreeChecksumOffset)
+// and writes it into the checksum field. Call after any mutation to the
+// checksummed region (header, extents, idx entries, trailing child).
+func SetBtreeNodeChecksum(buf []byte, blockSize uint64) {
+	binary.LittleEndian.PutUint64(buf[BtreeChecksumOffset:], ComputeChainChecksum(buf, blockSize))
+}
+
+// WriteBtreeNode writes a node buffer to its block on disk.
+func WriteBtreeNode(file *os.File, block, blockSize uint64, buf []byte) error {
+	_, err := file.WriteAt(buf, int64(block*blockSize))
+	return err
+}
+
 // VerifyBtreeNodeChecksum checks a B-tree node's checksum (no legacy zero
 // exemption: a B-tree node always carries a real checksum). Returns nil if OK.
 func VerifyBtreeNodeChecksum(buf []byte, blockSize uint64) error {

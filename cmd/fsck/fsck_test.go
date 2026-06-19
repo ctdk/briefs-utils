@@ -1808,3 +1808,146 @@ func TestFsckBtreeStructuralChecks(t *testing.T) {
 		}
 	})
 }
+
+// --- Phase 3: B+ tree CRC-only repair tests ---------------------------------
+//
+// repairBtreeChecksums rewrites a leaf node's torn checksum when the leaf is
+// structurally self-consistent (magic/fanout/within-leaf order all valid). It
+// defers internal-node checksum failures and structurally-invalid leaves to
+// Phase 4. These tests use the 3-leaf fixture (prepareBtree2Fixture): leaf0 at
+// abs 210, root idx at abs 213.
+
+func TestFsckRepairBtreeChecksums(t *testing.T) {
+	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
+
+	// Positive: a torn leaf checksum (structure intact) is rewritten and the
+	// tree re-verifies clean.
+	t.Run("torn_leaf_checksum_fixed", func(t *testing.T) {
+		imgPath := prepareBtree2Fixture(t)
+
+		// Zero leaf0's checksum field -> torn CRC, structure intact. btreeWalk
+		// fails on the bad checksum -> failedBtreeInos{2}. --repair-only=btrees
+		// (RebuildAllocator=false) bypasses the Phase 1 guard and runs the CRC
+		// repair.
+		f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		buf := make([]byte, 4096)
+		if _, err := f.ReadAt(buf, int64(210*4096)); err != nil {
+			t.Fatalf("read leaf0: %v", err)
+		}
+		binary.LittleEndian.PutUint64(buf[briefs.BtreeChecksumOffset:], 0)
+		if _, err := f.WriteAt(buf, int64(210*4096)); err != nil {
+			t.Fatalf("write leaf0: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+
+		out, err := exec.Command(fsckPath, "--repair-only=btrees", "-y", imgPath).CombinedOutput()
+		if err != nil {
+			t.Fatalf("fsck repair: %v\n%s", err, out)
+		}
+		output := string(out)
+		if !contains(output, "Repair complete") {
+			t.Fatalf("repair did not complete:\n%s", output)
+		}
+		if !contains(output, "rewrote torn checksum") {
+			t.Errorf("expected a 'rewrote torn checksum' notice:\n%s", output)
+		}
+
+		// The re-verify pass (after "Re-running verification pass") must show no
+		// checksum mismatch and no failed B-tree inode. The first pass legitimately
+		// reports the torn checksum, so only inspect the post-repair section.
+		lines := splitLines(output)
+		postRepair := false
+		for _, line := range lines {
+			if contains(line, "Re-running verification pass") {
+				postRepair = true
+			}
+			if postRepair && contains(line, "checksum mismatch") {
+				t.Errorf("checksum mismatch still reported after repair:\n%s", output)
+			}
+			if postRepair && contains(line, "unrecoverable B-tree extent-index errors") {
+				t.Errorf("failedBtreeInos still set after repair:\n%s", output)
+			}
+		}
+
+		// The leaf on disk must now carry a valid checksum, and its extents intact.
+		f, err = os.Open(imgPath)
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer f.Close()
+		leaf := make([]byte, 4096)
+		if _, err := f.ReadAt(leaf, int64(210*4096)); err != nil {
+			t.Fatalf("read leaf0: %v", err)
+		}
+		if err := briefs.VerifyBtreeNodeChecksum(leaf, 4096); err != nil {
+			t.Errorf("leaf checksum not restored: %v", err)
+		}
+		if got := binary.LittleEndian.Uint16(leaf[10:]); got != 30 {
+			t.Errorf("leaf0 num_keys changed: want 30, got %d", got)
+		}
+	})
+
+	// Negative: a structurally-invalid leaf (unsorted extents) is NOT rewritten,
+	// even though its checksum is also torn. repairBtreeChecksums checks
+	// within-leaf order before touching the checksum, so it defers to Phase 4.
+	t.Run("structural_fault_not_fixed", func(t *testing.T) {
+		imgPath := prepareBtree2Fixture(t)
+
+		// Corrupt leaf0's first extent offset 0 -> 100 (makes [100,1,2,...,29]
+		// unsorted) WITHOUT recomputing the checksum, so both structure and CRC
+		// are bad.
+		f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		buf := make([]byte, 4096)
+		if _, err := f.ReadAt(buf, int64(210*4096)); err != nil {
+			t.Fatalf("read leaf0: %v", err)
+		}
+		binary.LittleEndian.PutUint64(buf[briefs.BtreeHeaderSize:], 100) // offset[0] 0 -> 100
+		if _, err := f.WriteAt(buf, int64(210*4096)); err != nil {
+			t.Fatalf("write leaf0: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+
+		// Snapshot the leaf checksum field before repair.
+		before, err := os.ReadFile(imgPath)
+		if err != nil {
+			t.Fatalf("read image: %v", err)
+		}
+		beforeCS := binary.LittleEndian.Uint64(before[210*4096+briefs.BtreeChecksumOffset:])
+
+		out, err := exec.Command(fsckPath, "--repair-only=btrees", "-y", imgPath).CombinedOutput()
+		if err != nil {
+			t.Fatalf("fsck repair: %v\n%s", err, out)
+		}
+		output := string(out)
+		if !contains(output, "Repair complete") {
+			t.Fatalf("repair did not complete:\n%s", output)
+		}
+		if contains(output, "rewrote torn checksum") {
+			t.Errorf("repair rewrote a structurally-invalid leaf (must defer to Phase 4):\n%s", output)
+		}
+		// The fault must still be flagged after repair (re-verify still fails).
+		if !contains(output, "checksum mismatch") && !contains(output, "extents unsorted") {
+			t.Errorf("expected persistent B-tree error after repair:\n%s", output)
+		}
+
+		// The leaf checksum must be unchanged: repair must not have rewritten it.
+		after, err := os.ReadFile(imgPath)
+		if err != nil {
+			t.Fatalf("read image: %v", err)
+		}
+		afterCS := binary.LittleEndian.Uint64(after[210*4096+briefs.BtreeChecksumOffset:])
+		if beforeCS != afterCS {
+			t.Errorf("leaf checksum changed (must defer to Phase 4): was 0x%X now 0x%X", beforeCS, afterCS)
+		}
+	})
+}

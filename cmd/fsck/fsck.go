@@ -19,6 +19,7 @@ func parseRepairOptions(list string) (*repairOptions, error) {
 	if list == "" || strings.ToLower(list) == "all" {
 		return &repairOptions{
 			RebuildAllocator: true,
+			RepairBtreeCRC:   true,
 			CompactExtents:   true,
 			CompactTries:     true,
 			RepairLinks:      true,
@@ -31,6 +32,8 @@ func parseRepairOptions(list string) (*repairOptions, error) {
 		switch tok {
 		case "allocator":
 			opts.RebuildAllocator = true
+		case "btrees":
+			opts.RepairBtreeCRC = true
 		case "extents":
 			opts.CompactExtents = true
 		case "trie":
@@ -40,7 +43,7 @@ func parseRepairOptions(list string) (*repairOptions, error) {
 		case "":
 			// ignore empty tokens
 		default:
-			return nil, fmt.Errorf("unknown repair phase %q (expected allocator, extents, trie, or links)", tok)
+			return nil, fmt.Errorf("unknown repair phase %q (expected allocator, btrees, extents, trie, or links)", tok)
 		}
 	}
 	return opts, nil
@@ -75,7 +78,7 @@ func main() {
 			},
 			&cli.StringFlag{
 				Name:  "repair-only",
-				Usage: "run only selected repair phases (comma-separated: allocator,extents,trie,links; default all)",
+				Usage: "run only selected repair phases (comma-separated: allocator,btrees,extents,trie,links; default all)",
 			},
 			&cli.BoolFlag{
 				Name:  "optimize",
