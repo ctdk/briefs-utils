@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ctdk/briefs-utils/briefs"
@@ -1950,4 +1951,438 @@ func TestFsckRepairBtreeChecksums(t *testing.T) {
 			t.Errorf("leaf checksum changed (must defer to Phase 4): was 0x%X now 0x%X", beforeCS, afterCS)
 		}
 	})
+}
+
+// --- Phase 4: B+ tree rebuild-from-extents tests ------------------------------
+//
+// rebuildBtreeIndex tolerantly re-collects surviving extents from a damaged
+// tree and either drops to an inline array (<=8 extents) or builds a fresh
+// B+ tree. These tests build a reader-valid tree-backed inode 2 with the
+// briefs builders, inject a fault that lands the inode in failedBtreeInos, run
+// --repair-only=btree-rebuild, and assert the rebuilt inode/tree.
+
+// prepareIndexedBtreeFixtureExtents mkfs's a 5000-block image and writes a
+// correct tree-backed inode 2 holding the given (already sorted) extents,
+// marking all non-hole data blocks, node blocks, and inode 2 allocated. Hole
+// extents (ExtentFlagHole, Phys=0) consume no data block. Non-hole extents must
+// carry contiguous Phys starting at abs 120 (data-rel 30) so the data+node
+// blocks form one contiguous allocated range. Returns the image path and the
+// tree root absolute block. Uses the briefs builders so the tree is
+// reader-valid by construction.
+func prepareIndexedBtreeFixtureExtents(t *testing.T, extents []briefs.Extent) (imgPath string, rootAbs uint64, leafBlocks []uint64) {
+	t.Helper()
+	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
+	imgPath = filepath.Join(t.TempDir(), "idxbtree.briefs")
+	if out, err := exec.Command(mkfsPath, "-s", "5000", imgPath).CombinedOutput(); err != nil {
+		t.Fatalf("mkfs: %v\n%s", err, out)
+	}
+	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	// Non-hole extents' Phys are abs 120.. (data-rel 30..); node blocks follow.
+	nNonHole := 0
+	for _, e := range extents {
+		if e.Flags&briefs.ExtentFlagHole == 0 && e.Len > 0 && e.Phys > 0 {
+			nNonHole++
+		}
+	}
+	nextRel := uint64(30 + nNonHole)
+	allocBlock := func() (uint64, error) { abs := 90 + nextRel; nextRel++; return abs, nil }
+
+	leafBlocks, leafFirst, leafBufs, err := briefs.BuildBtreeLeaves(extents, 4096, allocBlock)
+	if err != nil {
+		t.Fatalf("BuildBtreeLeaves: %v", err)
+	}
+	rootBlock, _, idxBlocks, idxBufs, err := briefs.BuildBtreeIndex(leafBlocks, leafFirst, 4096, 1, allocBlock)
+	if err != nil {
+		t.Fatalf("BuildBtreeIndex: %v", err)
+	}
+	rootAbs = rootBlock
+	allBlocks := append(append([]uint64{}, leafBlocks...), idxBlocks...)
+	allBufs := append(append([][]byte{}, leafBufs...), idxBufs...)
+	for i, b := range allBlocks {
+		if _, err := f.WriteAt(allBufs[i], int64(b*4096)); err != nil {
+			t.Fatalf("write node %d: %v", b, err)
+		}
+	}
+
+	inode := &briefs.Inode{
+		InodeNumber:      2,
+		Magic:            briefs.MagicInode,
+		Filemode:         briefs.ModeFile | 0644,
+		FileSize:         uint64(len(extents)) * 4096,
+		Nlinks:           0, // orphan; only the tree walk matters here
+		NumExtentsInline: 0,
+		NumExtentsTotal:  uint64(len(extents)),
+		ExtentInlineBase: rootBlock,
+		Flags:            briefs.InodeFlagIndexed,
+	}
+	inode.SetInlineExtents([8]briefs.Extent{})
+	if err := inode.WriteAt(f, btree2InodeByteOff); err != nil {
+		t.Fatalf("write inode: %v", err)
+	}
+
+	// Mark inode 2 allocated in the inode L2 bitmap (block 4, word 0, bit 1).
+	inodeL2 := make([]byte, 4096)
+	if _, err := f.ReadAt(inodeL2, int64(btree2InodeL2Block*4096)); err != nil {
+		t.Fatalf("read inode L2: %v", err)
+	}
+	w := binary.LittleEndian.Uint64(inodeL2[0:])
+	w &^= 1 << 1
+	binary.LittleEndian.PutUint64(inodeL2[0:], w)
+	if _, err := f.WriteAt(inodeL2, int64(btree2InodeL2Block*4096)); err != nil {
+		t.Fatalf("write inode L2: %v", err)
+	}
+
+	// Data blocks (data-rel 30..30+nNonHole-1) + node blocks (..nextRel-1) are
+	// contiguous; mark the whole range allocated.
+	if err := markDataAllocated(f, btree2DataL2Block, 30, nextRel-1); err != nil {
+		t.Fatalf("mark data: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	return imgPath, rootAbs, leafBlocks
+}
+
+// prepareIndexedBtreeFixture builds a tree-backed inode 2 with nExtents
+// single-block, non-hole extents at offsets 0..nExtents-1 (phys abs 120..). For
+// nExtents > BtreeLeafFanout (126) the tree has multiple leaves plus an idx root.
+func prepareIndexedBtreeFixture(t *testing.T, nExtents int) (string, uint64, []uint64) {
+	ext := make([]briefs.Extent, nExtents)
+	for i := 0; i < nExtents; i++ {
+		ext[i] = briefs.Extent{Offset: uint64(i), Phys: 120 + uint64(i), Len: 1}
+	}
+	return prepareIndexedBtreeFixtureExtents(t, ext)
+}
+
+// corruptInode2NumExtentsTotal rewrites inode 2's NumExtentsTotal to @wrong,
+// producing a count-mismatch fault (tree valid, count wrong) that lands the
+// inode in failedBtreeInos without making any node unreadable.
+func corruptInode2NumExtentsTotal(t *testing.T, imgPath string, wrong uint64) {
+	t.Helper()
+	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	buf := make([]byte, 512)
+	if _, err := f.ReadAt(buf, btree2InodeByteOff); err != nil {
+		t.Fatalf("read inode: %v", err)
+	}
+	in, err := briefs.UnmarshalInode(buf)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	in.NumExtentsTotal = wrong
+	if err := in.WriteAt(f, btree2InodeByteOff); err != nil {
+		t.Fatalf("write inode: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// corruptBtreeNodeMagic overwrites the magic field of block @abs with a bad
+// value (and leaves the rest of the node, so the node is unreadable as a
+// B-tree node — its extents are "lost" to the tolerant collector).
+func corruptBtreeNodeMagic(t *testing.T, imgPath string, abs uint64) {
+	t.Helper()
+	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, int64(abs*4096)); err != nil {
+		t.Fatalf("read node %d: %v", abs, err)
+	}
+	binary.LittleEndian.PutUint32(buf[0:], 0xDEADBEEF)
+	if _, err := f.WriteAt(buf, int64(abs*4096)); err != nil {
+		t.Fatalf("write node %d: %v", abs, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// runBtreeRebuild runs --repair-only=btree-rebuild -y and returns the output.
+func runBtreeRebuild(t *testing.T, imgPath string) string {
+	t.Helper()
+	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
+	out, err := exec.Command(fsckPath, "--repair-only=btree-rebuild", "-y", imgPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("fsck repair: %v\n%s", err, out)
+	}
+	return string(out)
+}
+
+// postRepairSection returns the portion of fsck output after the
+// "Re-running verification pass" marker (the post-repair re-verify).
+func postRepairSection(output string) string {
+	var sb strings.Builder
+	post := false
+	for _, l := range splitLines(output) {
+		if contains(l, "Re-running verification pass") {
+			post = true
+		}
+		if post {
+			sb.WriteString(l)
+			sb.WriteByte('\n')
+		}
+	}
+	return sb.String()
+}
+
+// readInode2 reads inode 2 from the image.
+func readInode2(t *testing.T, imgPath string) *briefs.Inode {
+	t.Helper()
+	f, err := os.Open(imgPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	buf := make([]byte, 512)
+	if _, err := f.ReadAt(buf, btree2InodeByteOff); err != nil {
+		t.Fatalf("read inode: %v", err)
+	}
+	in, err := briefs.UnmarshalInode(buf)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return in
+}
+
+// readInode2Extents reads all of inode 2's extents via the production walker.
+func readInode2Extents(t *testing.T, imgPath string, in *briefs.Inode) []briefs.Extent {
+	t.Helper()
+	f, err := os.Open(imgPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	var exts []briefs.Extent
+	if err := briefs.IterateInodeExtents(f, in, 4096, briefs.InodeExtentVisitor{
+		VisitExtent: func(e briefs.Extent) error { exts = append(exts, e); return nil },
+	}); err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	return exts
+}
+
+// assertNoBtreeMarkers fails if the post-repair section contains any B-tree
+// structural/CRC/count marker (the rebuilt tree must verify clean).
+func assertNoBtreeMarkers(t *testing.T, postRepair string) {
+	t.Helper()
+	for _, bad := range []string{
+		"btree node",
+		"unrecoverable B-tree extent-index errors",
+		"checksum mismatch",
+		"extents unsorted",
+		"extent count != num_extents_total",
+		"separator high_key",
+		"bad child pointer",
+		"cross-leaf extents unsorted",
+		"fanout overflow",
+	} {
+		if contains(postRepair, bad) {
+			t.Errorf("post-repair section contains B-tree marker %q:\n%s", bad, postRepair)
+		}
+	}
+}
+
+func TestFsckRebuildBtreeIndex(t *testing.T) {
+	// rebuild_gt8: a 300-extent (3-leaf + idx-root) tree with a count mismatch
+	// is rebuilt into a fresh tree, the count is corrected, and the re-verify is
+	// clean (old node blocks freed, no leaked blocks).
+	t.Run("rebuild_gt8", func(t *testing.T) {
+		imgPath, _, _ := prepareIndexedBtreeFixture(t, 300)
+		corruptInode2NumExtentsTotal(t, imgPath, 299) // actual 300
+
+		out := runBtreeRebuild(t, imgPath)
+		if !contains(out, "Repair complete") {
+			t.Fatalf("repair did not complete:\n%s", out)
+		}
+		if !contains(out, "rebuilt extent index") {
+			t.Errorf("expected a rebuild notice:\n%s", out)
+		}
+		post := postRepairSection(out)
+		assertNoBtreeMarkers(t, post)
+
+		in := readInode2(t, imgPath)
+		if in.Flags&briefs.InodeFlagIndexed == 0 {
+			t.Errorf("expected tree-backed inode, got flags=0x%X", in.Flags)
+		}
+		if in.NumExtentsTotal != 300 {
+			t.Errorf("NumExtentsTotal: want 300, got %d", in.NumExtentsTotal)
+		}
+		if in.ExtentInlineBase == 0 {
+			t.Errorf("ExtentInlineBase still 0")
+		}
+		exts := readInode2Extents(t, imgPath, in)
+		if len(exts) != 300 {
+			t.Fatalf("rebuilt tree extents: want 300, got %d", len(exts))
+		}
+		for i, e := range exts {
+			if e.Offset != uint64(i) || e.Phys != 120+uint64(i) {
+				t.Errorf("extent %d: want offset=%d phys=%d, got offset=%d phys=%d", i, i, 120+i, e.Offset, e.Phys)
+			}
+		}
+	})
+
+	// rebuild_lost_extents: the middle leaf (offsets 126..251) of a 300-extent
+	// 3-leaf tree gets a bad magic, so its 126 extents are lost. The rebuild
+	// recovers the surviving 174 (leaf0 offsets 0..125 + leaf2 offsets 252..299),
+	// builds a fresh 2-leaf + idx tree, and warnfs the loss. The corrupt middle
+	// node is left allocated (safe policy) -> re-verify reports it as a leaked
+	// block (an ERROR, not a B-tree error); Phase 5 reclaims it.
+	t.Run("rebuild_lost_extents", func(t *testing.T) {
+		imgPath, _, leafBlocks := prepareIndexedBtreeFixture(t, 300)
+		if len(leafBlocks) != 3 {
+			t.Fatalf("expected 3 leaves, got %d", len(leafBlocks))
+		}
+		corruptBtreeNodeMagic(t, imgPath, leafBlocks[1]) // middle leaf -> bad magic
+
+		out := runBtreeRebuild(t, imgPath)
+		if !contains(out, "Repair complete") {
+			t.Fatalf("repair did not complete:\n%s", out)
+		}
+		if !contains(out, "rebuilt extent index") {
+			t.Errorf("expected a rebuild notice:\n%s", out)
+		}
+		if !contains(out, "lost") {
+			t.Errorf("expected a lost-extent warning:\n%s", out)
+		}
+		post := postRepairSection(out)
+		assertNoBtreeMarkers(t, post)
+
+		in := readInode2(t, imgPath)
+		if in.Flags&briefs.InodeFlagIndexed == 0 {
+			t.Errorf("expected tree-backed inode, got flags=0x%X", in.Flags)
+		}
+		if in.NumExtentsTotal != 174 {
+			t.Errorf("NumExtentsTotal: want 174, got %d", in.NumExtentsTotal)
+		}
+		exts := readInode2Extents(t, imgPath, in)
+		if len(exts) != 174 {
+			t.Fatalf("rebuilt tree extents: want 174, got %d", len(exts))
+		}
+		// Offsets must be 0..125 then 252..299 (middle leaf's 126..251 lost).
+		wantOff := append(append([]uint64{}, seqOffsets(0, 126)...), seqOffsets(252, 48)...)
+		for i, e := range exts {
+			if e.Offset != wantOff[i] {
+				t.Errorf("extent %d offset: want %d, got %d", i, wantOff[i], e.Offset)
+			}
+		}
+		// The corrupt middle-leaf node is left allocated and unreferenced -> leaked.
+		if !contains(post, "marked allocated in bitmap but NOT referenced") {
+			t.Errorf("expected a leaked-block notice for the corrupt middle leaf:\n%s", post)
+		}
+	})
+
+	// rebuild_drop_to_inline: a 5-extent tree-backed inode (count mismatch) is
+	// rebuilt to inline-only: InodeFlagIndexed cleared, ExtentInlineBase=0,
+	// NumExtentsInline=5, 5 inline extents. Old leaf block freed.
+	t.Run("rebuild_drop_to_inline", func(t *testing.T) {
+		imgPath, _, _ := prepareIndexedBtreeFixture(t, 5)
+		corruptInode2NumExtentsTotal(t, imgPath, 99) // actual 5
+
+		out := runBtreeRebuild(t, imgPath)
+		if !contains(out, "Repair complete") {
+			t.Fatalf("repair did not complete:\n%s", out)
+		}
+		if !contains(out, "rebuilt extent index") {
+			t.Errorf("expected a rebuild notice:\n%s", out)
+		}
+		if !contains(out, "inline") {
+			t.Errorf("expected an inline-drop notice:\n%s", out)
+		}
+		post := postRepairSection(out)
+		assertNoBtreeMarkers(t, post)
+
+		in := readInode2(t, imgPath)
+		if in.Flags&briefs.InodeFlagIndexed != 0 {
+			t.Errorf("expected InodeFlagIndexed cleared, got flags=0x%X", in.Flags)
+		}
+		if in.ExtentInlineBase != 0 {
+			t.Errorf("ExtentInlineBase: want 0, got %d", in.ExtentInlineBase)
+		}
+		if in.NumExtentsInline != 5 {
+			t.Errorf("NumExtentsInline: want 5, got %d", in.NumExtentsInline)
+		}
+		if in.NumExtentsTotal != 5 {
+			t.Errorf("NumExtentsTotal: want 5, got %d", in.NumExtentsTotal)
+		}
+		exts := readInode2Extents(t, imgPath, in)
+		if len(exts) != 5 {
+			t.Fatalf("inline extents: want 5, got %d", len(exts))
+		}
+		for i, e := range exts {
+			if e.Offset != uint64(i) || e.Phys != 120+uint64(i) {
+				t.Errorf("inline extent %d: want offset=%d phys=%d, got offset=%d phys=%d", i, i, 120+i, e.Offset, e.Phys)
+			}
+		}
+	})
+
+	// rebuild_hole_preservation: a 10-extent tree with holes at offsets 3 and 7
+	// (ExtentFlagHole, Phys=0) is rebuilt (count mismatch) and the holes survive
+	// verbatim in the fresh tree.
+	t.Run("rebuild_hole_preservation", func(t *testing.T) {
+		extents := make([]briefs.Extent, 10)
+		phys := uint64(120)
+		for i := 0; i < 10; i++ {
+			if i == 3 || i == 7 {
+				extents[i] = briefs.Extent{Offset: uint64(i), Phys: 0, Len: 1, Flags: briefs.ExtentFlagHole}
+			} else {
+				extents[i] = briefs.Extent{Offset: uint64(i), Phys: phys, Len: 1}
+				phys++
+			}
+		}
+		imgPath, _, _ := prepareIndexedBtreeFixtureExtents(t, extents)
+		corruptInode2NumExtentsTotal(t, imgPath, 42) // actual 10
+
+		out := runBtreeRebuild(t, imgPath)
+		if !contains(out, "Repair complete") {
+			t.Fatalf("repair did not complete:\n%s", out)
+		}
+		post := postRepairSection(out)
+		assertNoBtreeMarkers(t, post)
+
+		in := readInode2(t, imgPath)
+		if in.Flags&briefs.InodeFlagIndexed == 0 {
+			t.Errorf("expected tree-backed inode (10 > 8), got flags=0x%X", in.Flags)
+		}
+		if in.NumExtentsTotal != 10 {
+			t.Errorf("NumExtentsTotal: want 10, got %d", in.NumExtentsTotal)
+		}
+		exts := readInode2Extents(t, imgPath, in)
+		if len(exts) != 10 {
+			t.Fatalf("rebuilt tree extents: want 10, got %d", len(exts))
+		}
+		for i, e := range exts {
+			if e.Offset != uint64(i) {
+				t.Errorf("extent %d offset: want %d, got %d", i, i, e.Offset)
+				continue
+			}
+			isHole := i == 3 || i == 7
+			if isHole {
+				if e.Flags&briefs.ExtentFlagHole == 0 || e.Phys != 0 {
+					t.Errorf("extent %d: expected hole (Phys=0, Hole flag), got phys=%d flags=0x%X", i, e.Phys, e.Flags)
+				}
+			} else {
+				if e.Flags&briefs.ExtentFlagHole != 0 || e.Phys == 0 {
+					t.Errorf("extent %d: expected non-hole, got phys=%d flags=0x%X", i, e.Phys, e.Flags)
+				}
+			}
+		}
+	})
+}
+
+// seqOffsets returns start, start+1, ..., start+n-1.
+func seqOffsets(start uint64, n int) []uint64 {
+	out := make([]uint64, n)
+	for i := 0; i < n; i++ {
+		out[i] = start + uint64(i)
+	}
+	return out
 }

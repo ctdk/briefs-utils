@@ -58,7 +58,7 @@ func verifyBtreeStructures(fs *fsckState, ino uint64, in *briefs.Inode, blockSiz
 		return
 	}
 	if uint64(count) != in.NumExtentsTotal {
-		fs.errorf("ino %d: %w (walked %d, num_extents_total %d)",
+		fs.errorf("ino %d: %v (walked %d, num_extents_total %d)",
 			ino, briefs.ErrBtreeCountMismatch, count, in.NumExtentsTotal)
 		fs.failedBtreeInos[ino] = true
 	}

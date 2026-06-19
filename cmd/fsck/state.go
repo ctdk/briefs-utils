@@ -51,6 +51,7 @@ type repairPlan struct {
 type repairOptions struct {
 	RebuildAllocator bool // rebuild allocator bitmaps from the scan (phase 2)
 	RepairBtreeCRC   bool // rewrite torn B-tree node checksums (phase 3)
+	RebuildBtree     bool // rebuild corrupt B+ tree extent indexes from recovered extents (phase 4)
 	CompactExtents   bool // merge adjacent file extents (phase 4)
 	CompactTries     bool // rebuild directory tries (phase 3)
 	RepairLinks      bool // recompute inode nlink values (phase 5)

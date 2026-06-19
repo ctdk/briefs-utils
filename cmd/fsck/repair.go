@@ -76,6 +76,17 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int, opts *repairOpt
 		}
 	}
 
+	// 2c. Rebuild corrupt B+ tree extent indexes from recovered extents
+	// (Phase 4). Runs after Phase 3 (so torn-but-valid leaf checksums are already
+	// rewritten) and before compaction. It allocates new node blocks and frees
+	// old ones directly in plan.dataAlloc, and stages rebuilt inodes in
+	// plan.inodes — both flushed later by writeModifiedInodes / writeAllocator.
+	if opts.RebuildBtree {
+		if err := rebuildBtreeIndex(fs, plan, blockSize, dataRegionStart); err != nil {
+			return fmt.Errorf("rebuild btree indexes: %w", err)
+		}
+	}
+
 	// 3. Compact file extents.
 	if opts.CompactExtents {
 		if err := compactFileExtents(fs, plan, blockSize); err != nil {
