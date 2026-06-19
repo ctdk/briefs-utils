@@ -91,6 +91,12 @@ func runVerificationPass(fs *fsckState, blockSize, inodeSize uint64) int {
 			fmt.Fprintf(os.Stderr, "    ino %d\n", ino)
 		}
 	}
+	if len(fs.failedBtreeInos) > 0 {
+		fmt.Fprintf(os.Stderr, "  WARNING: %d inode(s) had unrecoverable B-tree extent-index errors:\n", len(fs.failedBtreeInos))
+		for ino := range fs.failedBtreeInos {
+			fmt.Fprintf(os.Stderr, "    ino %d\n", ino)
+		}
+	}
 
 	// 6. Cross-referencing checks
 	fmt.Fprintf(os.Stderr, "\nCross-referencing:\n")

@@ -19,6 +19,14 @@ type fsckState struct {
 	entryCounts map[uint64]int          // ino -> number of directory entries referencing it
 	// Tracks directories where trie walk had structural errors (bad magic, etc.)
 	failedTrieDirs map[uint64]bool // ino -> true if trie walk had unrecoverable errors
+	// Tracks tree-backed inodes whose B+ tree extent index walk had structural
+	// errors (bad magic, bad CRC, cycle, unsorted keys, fanout overflow, etc.).
+	// Such an inode's extents and B-tree node blocks are NOT recorded in
+	// usedBlocks (the walk failed before reaching them), so an allocator
+	// rebuild from usedBlocks would mark them free — permanent data loss.
+	// The repair gate refuses --repair when this set is non-empty and the
+	// allocator rebuild phase is active (repairOpts.RebuildAllocator).
+	failedBtreeInos map[uint64]bool // ino -> true if B-tree extent index walk had unrecoverable errors
 	// Set when the caller requested repair/optimization.
 	repair bool
 }

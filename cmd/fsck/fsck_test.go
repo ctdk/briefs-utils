@@ -382,6 +382,185 @@ func TestFsckTreeBackedFile(t *testing.T) {
 	}
 }
 
+// TestFsckRepairRefusesCorruptBtree verifies the failedBtreeInos safety guard:
+// when a tree-backed inode's B+ tree walk fails, default --repair (which rebuilds
+// the allocator from fs.usedBlocks) must REFUSE rather than free the inode's
+// unreached data/node blocks. A non-allocator phase (--repair-only=links) must
+// still proceed, since it loads the on-disk allocator instead of rebuilding it.
+//
+// We reuse the TestFsckTreeBackedFile fixture (9-extent single-leaf tree for
+// inode 2) and corrupt the root leaf's magic so btreeWalk returns ErrBtreeBadMagic
+// during collectInodeExtents. Because btreeWalk calls VisitNode (recording the
+// root node block into usedBlocks) before the magic check, but only calls
+// VisitExtent (recording the data blocks) after passing magic+checksum+ordering,
+// the 9 data blocks (abs 100..108) never enter usedBlocks — exactly the
+// data-loss vector the guard must prevent.
+func TestFsckRepairRefusesCorruptBtree(t *testing.T) {
+	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
+	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
+
+	imgPath := filepath.Join(t.TempDir(), "corrupt-btree.briefs")
+	cmd := exec.Command(mkfsPath, "-s", "5000", imgPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("mkfs failed: %v\n%s", err, out)
+	}
+
+	// Same layout as TestFsckTreeBackedFile (see that test for the rationale).
+	const (
+		rootLeafAbs   = uint64(110)
+		dataStartAbs   = uint64(100)
+		rootLeafRelBit = uint64(20)
+	)
+
+	leafBuf := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(leafBuf[0:], briefs.BtreeMagic)
+	binary.LittleEndian.PutUint32(leafBuf[4:], briefs.BtreeFlagLeaf)
+	binary.LittleEndian.PutUint16(leafBuf[8:], 0)  // level 0 = leaf
+	binary.LittleEndian.PutUint16(leafBuf[10:], 9) // num_keys
+	binary.LittleEndian.PutUint64(leafBuf[12:], 0) // prev_leaf
+	binary.LittleEndian.PutUint64(leafBuf[20:], 0) // next_leaf
+	for i := 0; i < 9; i++ {
+		off := briefs.BtreeHeaderSize + i*32
+		binary.LittleEndian.PutUint64(leafBuf[off:], uint64(i))
+		binary.LittleEndian.PutUint64(leafBuf[off+8:], dataStartAbs+uint64(i))
+		binary.LittleEndian.PutUint64(leafBuf[off+16:], 1)
+		binary.LittleEndian.PutUint32(leafBuf[off+24:], 0)
+		binary.LittleEndian.PutUint32(leafBuf[off+28:], 0)
+	}
+	leafChecksum := briefs.ComputeChainChecksum(leafBuf, 4096)
+	binary.LittleEndian.PutUint64(leafBuf[briefs.BtreeChecksumOffset:], leafChecksum)
+
+	inode := &briefs.Inode{
+		InodeNumber:      2,
+		Magic:            briefs.MagicInode,
+		Filemode:         briefs.ModeFile | 0644,
+		FileSize:         9 * 4096,
+		Nlinks:           0, // orphan; we only care about the tree walk
+		NumExtentsInline: 0,
+		NumExtentsTotal:  9,
+		ExtentInlineBase: rootLeafAbs,
+		Flags:            briefs.InodeFlagIndexed,
+	}
+	inode.SetInlineExtents([8]briefs.Extent{})
+
+	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open image: %v", err)
+	}
+	if _, err := f.WriteAt(leafBuf, int64(rootLeafAbs*4096)); err != nil {
+		t.Fatalf("write btree root leaf: %v", err)
+	}
+	if err := inode.WriteAt(f, 5*4096+512); err != nil {
+		t.Fatalf("write tree-backed inode: %v", err)
+	}
+
+	// Mark inode 2 allocated in the inode bitmap (block 1, bit 1).
+	inodeBM := make([]byte, 4096)
+	if _, err := f.ReadAt(inodeBM, 4096); err != nil {
+		t.Fatalf("read inode bitmap: %v", err)
+	}
+	word := binary.LittleEndian.Uint64(inodeBM[0:])
+	word &^= 1 << 1
+	binary.LittleEndian.PutUint64(inodeBM[0:], word)
+	if _, err := f.WriteAt(inodeBM, 4096); err != nil {
+		t.Fatalf("write inode bitmap: %v", err)
+	}
+
+	// Mark data blocks 100..108 and the root leaf allocated in the data L2 (block 89).
+	dataL2 := make([]byte, 4096)
+	if _, err := f.ReadAt(dataL2, 89*4096); err != nil {
+		t.Fatalf("read data L2 bitmap: %v", err)
+	}
+	l2Word := binary.LittleEndian.Uint64(dataL2[0:])
+	for b := uint64(10); b <= 18; b++ {
+		l2Word &^= 1 << b
+	}
+	l2Word &^= 1 << rootLeafRelBit
+	binary.LittleEndian.PutUint64(dataL2[0:], l2Word)
+	if _, err := f.WriteAt(dataL2, 89*4096); err != nil {
+		t.Fatalf("write data L2 bitmap: %v", err)
+	}
+
+	// Corrupt the root leaf's magic so the B-tree walk fails with
+	// ErrBtreeBadMagic (a structural, non-CRC failure).
+	binary.LittleEndian.PutUint32(leafBuf[0:], 0xDEADBEEF)
+	if _, err := f.WriteAt(leafBuf, int64(rootLeafAbs*4096)); err != nil {
+		t.Fatalf("corrupt root leaf magic: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close image: %v", err)
+	}
+
+	// Snapshot the entire image before repair so we can prove the refusal
+	// touched nothing.
+	before, err := os.ReadFile(imgPath)
+	if err != nil {
+		t.Fatalf("read image before: %v", err)
+	}
+
+	// (1) Default --repair must REFUSE: failedBtreeInos is non-empty and the
+	// allocator rebuild phase (RebuildAllocator) is active.
+	cmd = exec.Command(fsckPath, "--repair", "-y", imgPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fsck --repair failed: %v\n%s", err, out)
+	}
+	output := string(out)
+	if !contains(output, "Refusing repair") || !contains(output, "B-tree extent-index errors") {
+		t.Fatalf("fsck did not refuse repair for corrupt B-tree:\n%s", output)
+	}
+	if contains(output, "Repair complete") {
+		t.Fatalf("fsck proceeded to repair despite corrupt B-tree:\n%s", output)
+	}
+
+	// The refusal must not have modified the image at all.
+	after, err := os.ReadFile(imgPath)
+	if err != nil {
+		t.Fatalf("read image after: %v", err)
+	}
+	if !bytesEqual(before, after) {
+		t.Fatalf("fsck --repair refusal modified the image (%d -> %d bytes)", len(before), len(after))
+	}
+
+	// (2) A read-only fsck must report the failed B-tree inode in its summary
+	// WARNING, confirming failedBtreeInos was populated.
+	cmd = exec.Command(fsckPath, imgPath)
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read-only fsck failed: %v\n%s", err, out)
+	}
+	output = string(out)
+	if !contains(output, "unrecoverable B-tree extent-index errors") || !contains(output, "ino 2") {
+		t.Fatalf("read-only fsck did not report failed B-tree inode:\n%s", output)
+	}
+
+	// (3) A non-allocator phase must proceed past the guard: --repair-only=links
+	// sets RebuildAllocator=false, so the guard does not fire.
+	cmd = exec.Command(fsckPath, "--repair-only=links", "-y", imgPath)
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fsck --repair-only=links failed: %v\n%s", err, out)
+	}
+	output = string(out)
+	if !contains(output, "Repair complete") {
+		t.Fatalf("fsck --repair-only=links did not proceed past the B-tree guard:\n%s", output)
+	}
+}
+
+// bytesEqual reports whether two byte slices are equal (avoiding a dependency on
+// bytes.Equal to keep the test file's import set unchanged).
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // TestFsckRepairCompactDirectoryTrie builds a deliberately fragmented root
 // directory trie that spans two pages for a single entry, then runs
 // fsck --repair and verifies the entry is preserved and the filesystem ends

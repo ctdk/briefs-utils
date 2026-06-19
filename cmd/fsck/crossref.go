@@ -56,23 +56,25 @@ func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 	}
 
 	// Check 2: Blocks marked allocated in bitmap but NOT referenced by any inode/trie.
-	// If any directory trie had structural errors, leaked blocks could be
-	// legitimate blocks from unreadable subtrees, so we downgrade to WARNING.
+	// If any directory trie or B+ tree had structural errors, leaked blocks could be
+	// legitimate blocks from unreadable subtrees (or unreached B-tree node/data
+	// blocks of a torn tree), so we downgrade to WARNING in that case.
 	leaked := 0
 	hasFailedTries := len(fs.failedTrieDirs) > 0
+	hasFailedBtrees := len(fs.failedBtreeInos) > 0
 	for relBlk := range allocAllocated {
 		absBlk := dataRegionStart + relBlk
 		if !fs.usedBlocks[absBlk] {
 			if leaked < 20 {
-				if hasFailedTries {
-					fs.warnf("block %d (data-relative %d): marked allocated but not found during trie walk (may be from failed trie traversal)",
+				if hasFailedTries || hasFailedBtrees {
+					fs.warnf("block %d (data-relative %d): marked allocated but not found during trie/btree walk (may be from a failed traversal)",
 						absBlk, relBlk)
 				} else {
 					fs.errorf("block %d (data-relative %d): marked allocated in bitmap but NOT referenced by any inode/trie",
 						absBlk, relBlk)
 				}
 			} else if leaked == 20 {
-				if hasFailedTries {
+				if hasFailedTries || hasFailedBtrees {
 					fs.warnf("(more unverifiable block warnings suppressed)")
 				} else {
 					fs.errorf("(more leaked block errors suppressed)")
@@ -82,8 +84,8 @@ func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 		}
 	}
 	if leaked > 0 {
-		if hasFailedTries {
-			fmt.Fprintf(os.Stderr, "  block cross-ref: %d block(s) allocated but not verified (trie errors may explain these)\n", leaked)
+		if hasFailedTries || hasFailedBtrees {
+			fmt.Fprintf(os.Stderr, "  block cross-ref: %d block(s) allocated but not verified (trie/btree errors may explain these)\n", leaked)
 		} else {
 			fmt.Fprintf(os.Stderr, "  block cross-ref: %d block(s) allocated but not referenced\n", leaked)
 		}
@@ -216,6 +218,12 @@ func verifyExtentOverlaps(fs *fsckState) {
 
 	for ino, in := range fs.inodes {
 		if in.Flags&briefs.InodeFlagInlineData != 0 {
+			continue
+		}
+		// Skip inodes whose B+ tree walk already failed in collectInodeExtents;
+		// the structural error was already reported there, and re-walking would
+		// just emit a duplicate error (the tree is still torn).
+		if fs.failedBtreeInos[ino] {
 			continue
 		}
 		// Walk every extent (inline array or B+ tree) in ascending offset order.

@@ -206,6 +206,22 @@ func main() {
 					return err
 				}
 
+				// Refuse repair when a tree-backed inode's B+ tree walk failed AND
+				// the allocator rebuild phase is active: that phase rebuilds the
+				// on-disk bitmap from fs.usedBlocks, and a failed walk never
+				// recorded the inode's extents/node blocks, so they would be
+				// marked free — permanent data loss. Non-allocator phases
+				// (--optimize, --repair-only without the allocator token) load the
+				// on-disk allocator instead and are not destructive, so they may
+				// proceed (the user can still run e.g. --repair-only=links to fix
+				// other faults while leaving the torn tree's blocks intact).
+				// This mirrors the failedTrieDirs guard above.
+				if len(fs.failedBtreeInos) > 0 && repairOpts.RebuildAllocator {
+					fmt.Fprintf(os.Stderr, "Refusing repair: %d inode(s) have unrecoverable B-tree extent-index errors; rebuilding the allocator would free their blocks\n", len(fs.failedBtreeInos))
+					fmt.Fprintf(os.Stderr, "FSCK COMPLETE: %d error(s) found, repair skipped\n", fs.errors)
+					return nil
+				}
+
 				if !assumeYes {
 					fmt.Fprintf(os.Stderr, "This will modify %s. Proceed? (y/N) ", path)
 					reader := bufio.NewReader(os.Stdin)
@@ -228,6 +244,7 @@ func main() {
 				fs.usedBlocks = make(map[uint64]bool)
 				fs.entryCounts = make(map[uint64]int)
 				fs.failedTrieDirs = make(map[uint64]bool)
+				fs.failedBtreeInos = make(map[uint64]bool)
 				runVerificationPass(fs, blockSize, sb.InodeSize)
 			}
 

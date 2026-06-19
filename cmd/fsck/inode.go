@@ -106,6 +106,7 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 	fs.usedBlocks = make(map[uint64]bool)
 	fs.entryCounts = make(map[uint64]int)
 	fs.failedTrieDirs = make(map[uint64]bool)
+	fs.failedBtreeInos = make(map[uint64]bool)
 
 	fmt.Fprintf(os.Stderr, "  inodes per block: %d\n", inodesPerBlock)
 
@@ -201,6 +202,14 @@ func collectInodeExtents(fs *fsckState, ino uint64, in *briefs.Inode, blockSize 
 		VisitExtent: addExtentBlocks,
 	}); err != nil {
 		fs.errorf("ino %d: %v", ino, err)
+		// Record tree-backed inodes whose B+ tree walk failed. Their extents
+		// and node blocks were not reached, so they are absent from usedBlocks;
+		// an allocator rebuild would free them. Inline-only walk errors (the
+		// inline-array path) don't carry this destructive risk, so only flag
+		// InodeFlagIndexed inodes here.
+		if in.Flags&briefs.InodeFlagIndexed != 0 {
+			fs.failedBtreeInos[ino] = true
+		}
 	}
 }
 
