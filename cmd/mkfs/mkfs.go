@@ -322,6 +322,10 @@ func main() {
 			rootInode.Nlinks = 2
 			rootInode.ParentInode = 1
 			rootInode.DirTrieRoot = briefs.TrieMakeRef(rootTrieBlock, 0)
+			// Stable nonzero generation for the root inode so NFS export
+			// handles reference it safely. Root is never freed/reallocated,
+			// so a fixed value is fine and stays constant across mounts.
+			rootInode.Generation = 1
 
 			inodeBlock, inodeByteOffset := calculateInodeLocation(sb, 1)
 			fileOffset := int64(inodeBlock*blockSize + inodeByteOffset)

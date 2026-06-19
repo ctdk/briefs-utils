@@ -42,7 +42,8 @@ func (s *Inode) MarshalBinary() ([]byte, error) {
 	binary.LittleEndian.PutUint32(data[pos:], s.Flags); pos += 4
 	binary.LittleEndian.PutUint64(data[pos:], s.DirTrieRoot); pos += 8
 	binary.LittleEndian.PutUint64(data[pos:], s.Rdev); pos += 8
-	copy(data[pos:], s.Reserved[:]); pos += 80
+	binary.LittleEndian.PutUint64(data[pos:], s.Generation); pos += 8
+	copy(data[pos:], s.Reserved[:]); pos += 72
 	return data, nil
 }
 
@@ -79,7 +80,8 @@ func (s *Inode) UnmarshalBinary(data []byte) error {
 	s.Flags = binary.LittleEndian.Uint32(data[pos:]); pos += 4
 	s.DirTrieRoot = binary.LittleEndian.Uint64(data[pos:]); pos += 8
 	s.Rdev = binary.LittleEndian.Uint64(data[pos:]); pos += 8
-	copy(s.Reserved[:], data[pos:pos+80]); pos += 80
+	s.Generation = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	copy(s.Reserved[:], data[pos:pos+72]); pos += 72
 	return nil
 }
 
