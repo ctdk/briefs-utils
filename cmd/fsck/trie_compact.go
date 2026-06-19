@@ -269,7 +269,18 @@ func writeCompactTriePages(file *os.File, pages []*compactTriePage, blockSize ui
 			binary.LittleEndian.PutUint64(buf[off+0:], firstChild)
 			binary.LittleEndian.PutUint64(buf[off+8:], nextSibling)
 			binary.LittleEndian.PutUint64(buf[off+16:], node.Inode)
-			binary.LittleEndian.PutUint16(buf[off+24:], uint16(len(node.Name)))
+			// name_len stores the FULL name-entry size (2-byte length prefix +
+			// name bytes), not just the name byte count. The kernel's reader
+			// derives the actual name length as name_len - 2 (briefs.h:609,
+			// briefs_trie.c: "elen = trie_node_name_len(node) - 2"), so writing
+			// only len(name) made the kernel read len(name)-2 bytes and truncate
+			// every directory entry ("big" -> "b"). Nameless (intermediate) nodes
+			// keep name_len = 0, matching the kernel's "0 if free/no name" rule.
+			var nameLenField uint16
+			if len(node.Name) > 0 {
+				nameLenField = uint16(len(node.Name)) + 2
+			}
+			binary.LittleEndian.PutUint16(buf[off+24:], nameLenField)
 			binary.LittleEndian.PutUint16(buf[off+26:], node.NameOff)
 			buf[off+28] = node.Depth
 			buf[off+29] = node.NodeType

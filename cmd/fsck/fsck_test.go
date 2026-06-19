@@ -689,6 +689,158 @@ func TestFsckRepairCompactDirectoryTrie(t *testing.T) {
 	}
 }
 
+// TestFsckCompactTrieNameLenField is a regression test for the compactDirectoryTries
+// name_len bug. The on-disk trie node's name_len field must store the FULL name
+// entry size (2-byte length prefix + name bytes), i.e. 2 + len(name), because the
+// kernel reader derives the actual name length as name_len - 2 (briefs.h:609,
+// briefs_trie.c: "elen = trie_node_name_len(node) - 2"). fsck's own reader uses the
+// stored 2-byte prefix instead, so it read compacted tries correctly even when the
+// field was wrong — which is why the bug only surfaced against the kernel (every
+// directory entry was truncated by 2 bytes: "big" -> "b"). This test checks the raw
+// field value directly so it cannot regress silently.
+func TestFsckCompactTrieNameLenField(t *testing.T) {
+	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
+	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
+
+	imgPath := filepath.Join(t.TempDir(), "trieNamLen.briefs")
+	if out, err := exec.Command(mkfsPath, "-s", "5000", imgPath).CombinedOutput(); err != nil {
+		t.Fatalf("mkfs: %v\n%s", err, out)
+	}
+
+	const (
+		rootTrieBlock = uint64(90) // data-relative 0
+		targetIno     = uint64(2)
+		name          = "testfile" // 8 bytes -> name_len field must be 10
+	)
+	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	// Inode 2: empty file referenced by the directory entry.
+	inode := &briefs.Inode{
+		InodeNumber: targetIno,
+		Magic:       briefs.MagicInode,
+		Filemode:    briefs.ModeFile | 0644,
+		FileSize:    0,
+		Nlinks:      1,
+	}
+	if err := inode.WriteAt(f, 5*4096+512); err != nil {
+		t.Fatalf("write inode 2: %v", err)
+	}
+
+	// Mark inode 2 allocated (inode L2 at block 4, word 0, bit 1).
+	inodeL2 := make([]byte, 4096)
+	if _, err := f.ReadAt(inodeL2, int64(4*4096)); err != nil {
+		t.Fatalf("read inode L2: %v", err)
+	}
+	w := binary.LittleEndian.Uint64(inodeL2[0:])
+	w &^= 1 << 1
+	binary.LittleEndian.PutUint64(inodeL2[0:], w)
+	if _, err := f.WriteAt(inodeL2, int64(4*4096)); err != nil {
+		t.Fatalf("write inode L2: %v", err)
+	}
+
+	// Build a single-page root directory trie: root (slot 0) -> leaf (slot 1)
+	// carrying the named entry. Point inode 1 (root dir, block 5 offset 0) at it.
+	page := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(page[0:], briefs.MagicTriePage)
+	binary.LittleEndian.PutUint32(page[4:], briefs.TriePageVersion)
+	binary.LittleEndian.PutUint16(page[8:], 2) // live_count
+	nameOff := writeTrieName(page, 4096, name)
+	binary.LittleEndian.PutUint16(page[10:], nameOff) // free_name_off
+	binary.LittleEndian.PutUint64(page[12:], ^(uint64(1<<0)|uint64(1<<1))) // slots 0,1 used
+	leafRef := briefs.TrieMakeRef(rootTrieBlock, 1)
+	writeTrieNode(page, 0, leafRef, 0, 0, 0, 0, 0, briefs.NodeTypeInterm, 0, 0, 0, 1)
+	writeTrieNode(page, 1, 0, 0, targetIno, uint16(len(name)), nameOff,
+		uint8(len(name)), briefs.NodeTypeInterm|briefs.NodeStatusLeaf, name[0], 8, 0, 0)
+	if _, err := f.WriteAt(page, int64(rootTrieBlock*4096)); err != nil {
+		t.Fatalf("write trie page: %v", err)
+	}
+
+	// Point inode 1 at the root trie and mark block 90 (data-rel 0) allocated.
+	rootInodeBuf := make([]byte, 512)
+	if _, err := f.ReadAt(rootInodeBuf, int64(5*4096)); err != nil {
+		t.Fatalf("read inode 1: %v", err)
+	}
+	rootIno, err := briefs.UnmarshalInode(rootInodeBuf)
+	if err != nil {
+		t.Fatalf("unmarshal inode 1: %v", err)
+	}
+	rootIno.DirTrieRoot = briefs.TrieMakeRef(rootTrieBlock, 0)
+	if err := rootIno.WriteAt(f, 5*4096); err != nil {
+		t.Fatalf("write inode 1: %v", err)
+	}
+	dataL2 := make([]byte, 4096)
+	if _, err := f.ReadAt(dataL2, int64(89*4096)); err != nil {
+		t.Fatalf("read data L2: %v", err)
+	}
+	l2w := binary.LittleEndian.Uint64(dataL2[0:])
+	l2w &^= 1 << 0 // data-rel 0 (abs 90) allocated
+	binary.LittleEndian.PutUint64(dataL2[0:], l2w)
+	if _, err := f.WriteAt(dataL2, int64(89*4096)); err != nil {
+		t.Fatalf("write data L2: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Compact the trie.
+	out, err := exec.Command(fsckPath, "--repair-only=trie", "-y", imgPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("fsck --repair-only=trie: %v\n%s", err, out)
+	}
+	if !contains(string(out), "Repair complete") {
+		t.Fatalf("repair did not complete:\n%s", out)
+	}
+
+	// Read inode 1's new DirTrieRoot and scan the compacted trie page for the
+	// named leaf, checking the raw name_len field directly.
+	f, err = os.Open(imgPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.ReadAt(rootInodeBuf, int64(5*4096)); err != nil {
+		t.Fatalf("reread inode 1: %v", err)
+	}
+	rootIno, err = briefs.UnmarshalInode(rootInodeBuf)
+	if err != nil {
+		t.Fatalf("unmarshal inode 1 after repair: %v", err)
+	}
+	rootBlock := briefs.TrieRefBlock(rootIno.DirTrieRoot)
+	compacted := make([]byte, 4096)
+	if _, err := f.ReadAt(compacted, int64(rootBlock*4096)); err != nil {
+		t.Fatalf("read compacted trie page %d: %v", rootBlock, err)
+	}
+
+	found := false
+	for slot := uint(0); slot < briefs.TrieSlotsPerBlock; slot++ {
+		s, perr := parseTrieSlot(compacted, slot)
+		if perr != nil || s.NameOffset == 0 {
+			continue
+		}
+		nm := extractTrieNodeName(compacted, s)
+		if nm == "" {
+			continue
+		}
+		off := uint64(20 + slot*36)
+		rawNameLen := binary.LittleEndian.Uint16(compacted[off+24:])
+		if nm != name {
+			t.Errorf("slot %d name: want %q, got %q", slot, name, nm)
+		}
+		if rawNameLen != uint16(len(name))+2 {
+			t.Errorf("slot %d name %q: raw name_len field=%d, want %d (2 + len); kernel would read %d bytes",
+				slot, name, rawNameLen, len(name)+2, rawNameLen-2)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatalf("no named leaf found in compacted trie page %d (DirTrieRoot=%d)",
+			rootBlock, rootIno.DirTrieRoot)
+	}
+}
+
 // TestFsckRepairLinkCounts builds a tiny directory tree with a file and a
 // subdirectory, corrupts the nlink values, then verifies fsck --repair fixes
 // them without losing entries.
