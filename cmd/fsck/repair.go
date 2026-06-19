@@ -216,14 +216,66 @@ func loadAllocatorFromDisk(file *os.File, poolBlock, blockSize, blockCount uint6
 	return b, nil
 }
 
-// compactFileExtents is currently a no-op. On v0.9 the extent index is a B+ tree
-// (InodeFlagIndexed) for files with >8 extents and a sorted, already-merged
-// inline array for files with <=8 extents; the kernel's insert path merges
-// adjacent extents, so there is nothing to compact on a consistent image. The
-// old chain-block collect/rewrite/compaction logic was removed with the chain
-// format. B-tree leaf compaction (reclaiming half-empty leaves after heavy
-// delete churn) is a separate, deferred concern -- see #7 phase 4.
+// compactFileExtents is the Phase 6 leaf compaction. For each tree-backed inode
+// (InodeFlagIndexed) whose B+ tree walked cleanly (not in failedBtreeInos), it
+// collects the extents, and if the tree carries more leaves than the minimum
+// (ceil(n/126) — the floor imposed by the leaf fanout), it rebuilds a minimal
+// tree via the Phase 4 builders, which naturally packs 126 extents per leaf and
+// drops the underfull leaves left behind by delete churn. Old node blocks are
+// freed; the rebuilt root is staged in plan.inodes. Mutates plan.dataAlloc
+// directly (AllocateBlock for new nodes, MarkFree for old), so it is correct
+// whether RebuildAllocator is true or false.
+//
+// Semantics: "extents" optimizes *healthy* trees; "btree-rebuild" repairs
+// *failed* ones. They are kept separate — compaction never touches an inode in
+// failedBtreeInos (those need repair, not optimization), and a tree that is
+// already minimally packed is left untouched (the fast path) so a healthy
+// image is not rewritten for nothing.
 func compactFileExtents(fs *fsckState, plan *repairPlan, blockSize uint64) error {
+	dataRegionStart := fs.sb.TrieNodePoolStart + fs.sb.TrieNodePoolSize
+	for ino, in := range fs.inodes {
+		if in == nil || in.Flags&briefs.InodeFlagIndexed == 0 {
+			continue
+		}
+		if fs.failedBtreeInos[ino] {
+			continue // torn tree: compaction is for healthy trees, repair handles these
+		}
+		root := in.ExtentInlineBase
+		if root == 0 {
+			continue
+		}
+
+		extents, oldNodeBlocks, leafCount, lost := btreeCollectExtents(fs, ino, root, blockSize)
+		if lost {
+			// A healthy tree should not lose subtrees during collection. If it did,
+			// something is inconsistent — leave it untouched and point the user at
+			// the repair path rather than risking freeing the wrong blocks.
+			fs.warnf("ino %d: extent compaction skipped: unreadable/invalid subtree encountered (use --repair-only=btree-rebuild)", ino)
+			continue
+		}
+		if len(extents) == 0 {
+			continue
+		}
+		extents = sortDedupExtents(extents)
+
+		// Fast path: already minimally packed. ceil(n/126) is the lower bound on
+		// the number of leaves, so if the tree already has that many (or fewer,
+		// which can't happen for a valid tree but is guarded), there is nothing
+		// to compact and we avoid rewriting a healthy tree.
+		minLeaves := (uint64(len(extents)) + briefs.BtreeLeafFanout - 1) / briefs.BtreeLeafFanout
+		if uint64(leafCount) <= minLeaves {
+			continue
+		}
+
+		clone := *in
+		nodeCount, newRoot, err := rebuildBtreeFromExtents(fs, plan, ino, &clone, extents, oldNodeBlocks, blockSize, dataRegionStart)
+		if err != nil {
+			fs.warnf("ino %d: extent compaction skipped: %v (inode left untouched)", ino, err)
+			continue
+		}
+		fs.warnf("ino %d: compacted extent index: %d leaf(ves) → %d node(s), root=%d, %d extent(s)",
+			ino, leafCount, nodeCount, newRoot, len(extents))
+	}
 	return nil
 }
 

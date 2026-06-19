@@ -2543,3 +2543,216 @@ func TestFsckReclaimOrphanBtree(t *testing.T) {
 		}
 	})
 }
+
+// prepareUnderfullBtreeFixture builds a tree-backed inode 2 with @nExtents
+// extents spread one-per-leaf across @nExtents underfull leaves (emulating the
+// half-empty leaves left by delete churn), plus a single idx root above them.
+// Returns the image path and the absolute block numbers of all the old node
+// blocks (leaves + idx root) so a test can assert they are freed by compaction.
+// Layout (5000-block image): data blocks at phys 120+i (data-rel 30+i); leaves
+// at abs 210+i (data-rel 120+i); idx root at abs 210+nExtents (data-rel
+// 120+nExtents).
+func prepareUnderfullBtreeFixture(t *testing.T, nExtents int) (imgPath string, oldNodeAbs []uint64) {
+	t.Helper()
+	if nExtents < 1 {
+		t.Fatalf("nExtents must be >= 1")
+	}
+	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
+	imgPath = filepath.Join(t.TempDir(), "underfull.briefs")
+	if out, err := exec.Command(mkfsPath, "-s", "5000", imgPath).CombinedOutput(); err != nil {
+		t.Fatalf("mkfs: %v\n%s", err, out)
+	}
+	f, err := os.OpenFile(imgPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open image: %v", err)
+	}
+
+	leafAbs := make([]uint64, nExtents)
+	for i := 0; i < nExtents; i++ {
+		leafAbs[i] = 210 + uint64(i)
+	}
+	for i := 0; i < nExtents; i++ {
+		buf := make([]byte, 4096)
+		var next uint64
+		if i+1 < nExtents {
+			next = leafAbs[i+1]
+		}
+		buildBtree2Leaf(buf, 1, uint64(i), 120+uint64(i), next) // 1 extent: offset i, phys 120+i
+		if _, err := f.WriteAt(buf, int64(leafAbs[i]*4096)); err != nil {
+			t.Fatalf("write leaf %d: %v", leafAbs[i], err)
+		}
+	}
+
+	var rootAbs uint64
+	if nExtents == 1 {
+		rootAbs = leafAbs[0]
+	} else {
+		rootAbs = 210 + uint64(nExtents) // idx root just past the last leaf
+		children := leafAbs[:nExtents-1]
+		highKeys := make([]uint64, nExtents-1)
+		for i := range highKeys {
+			highKeys[i] = uint64(i + 1) // first offset of the right sibling leaf
+		}
+		idx := make([]byte, 4096)
+		buildBtree2Idx(idx, 1, children, highKeys, leafAbs[nExtents-1])
+		if _, err := f.WriteAt(idx, int64(rootAbs*4096)); err != nil {
+			t.Fatalf("write idx root %d: %v", rootAbs, err)
+		}
+	}
+
+	inode := &briefs.Inode{
+		InodeNumber:      2,
+		Magic:            briefs.MagicInode,
+		Filemode:         briefs.ModeFile | 0644,
+		FileSize:         uint64(nExtents) * 4096,
+		Nlinks:           0,
+		NumExtentsInline: 0,
+		NumExtentsTotal:  uint64(nExtents),
+		ExtentInlineBase: rootAbs,
+		Flags:            briefs.InodeFlagIndexed,
+	}
+	inode.SetInlineExtents([8]briefs.Extent{})
+	if err := inode.WriteAt(f, btree2InodeByteOff); err != nil {
+		t.Fatalf("write inode: %v", err)
+	}
+
+	// Mark inode 2 allocated in the inode L2 bitmap (block 4, word 0, bit 1).
+	inodeL2 := make([]byte, 4096)
+	if _, err := f.ReadAt(inodeL2, int64(btree2InodeL2Block*4096)); err != nil {
+		t.Fatalf("read inode L2: %v", err)
+	}
+	w := binary.LittleEndian.Uint64(inodeL2[0:])
+	w &^= 1 << 1
+	binary.LittleEndian.PutUint64(inodeL2[0:], w)
+	if _, err := f.WriteAt(inodeL2, int64(btree2InodeL2Block*4096)); err != nil {
+		t.Fatalf("write inode L2: %v", err)
+	}
+
+	// Data blocks: data-rel 30..30+nExtents-1. Node blocks: data-rel 120..120+nExtents.
+	if err := markDataAllocated(f, btree2DataL2Block, 30, uint64(30+nExtents-1)); err != nil {
+		t.Fatalf("mark data: %v", err)
+	}
+	if err := markDataAllocated(f, btree2DataL2Block, 120, uint64(120+nExtents)); err != nil {
+		t.Fatalf("mark nodes: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close image: %v", err)
+	}
+
+	oldNodeAbs = append([]uint64{}, leafAbs...)
+	if nExtents > 1 {
+		oldNodeAbs = append(oldNodeAbs, rootAbs)
+	}
+	return imgPath, oldNodeAbs
+}
+
+// readBtreeNodeHeader reads the B-tree header of abs block @abs and returns it.
+func readBtreeNodeHeader(t *testing.T, imgPath string, abs uint64) briefs.BtreeNodeHeader {
+	t.Helper()
+	f, err := os.Open(imgPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, int64(abs*4096)); err != nil {
+		t.Fatalf("read node %d: %v", abs, err)
+	}
+	return briefs.UnmarshalBtreeHeader(buf)
+}
+
+func TestFsckCompactExtents(t *testing.T) {
+	// compact: 9 extents spread across 9 underfull single-extent leaves (+ 1 idx
+	// root) are compacted into a single 1-leaf tree; the 10 old node blocks are
+	// freed and the 9 extents are preserved verbatim.
+	t.Run("compact", func(t *testing.T) {
+		imgPath, oldNodes := prepareUnderfullBtreeFixture(t, 9)
+		if len(oldNodes) != 10 { // 9 leaves + 1 idx root
+			t.Fatalf("expected 10 old node blocks, got %d", len(oldNodes))
+		}
+		for _, abs := range oldNodes {
+			if dataBlockIsFree(t, imgPath, abs-btree2DataRegionAbs) {
+				t.Fatalf("old node %d should be allocated before compaction", abs)
+			}
+		}
+
+		out := runFsckRepair(t, imgPath, "extents")
+		if !contains(out, "Repair complete") {
+			t.Fatalf("repair did not complete:\n%s", out)
+		}
+		if !contains(out, "compacted extent index") {
+			t.Errorf("expected a compaction notice:\n%s", out)
+		}
+		post := postRepairSection(out)
+		assertNoBtreeMarkers(t, post)
+
+		in := readInode2(t, imgPath)
+		if in.Flags&briefs.InodeFlagIndexed == 0 {
+			t.Errorf("expected tree-backed inode, got flags=0x%X", in.Flags)
+		}
+		if in.NumExtentsTotal != 9 {
+			t.Errorf("NumExtentsTotal: want 9, got %d", in.NumExtentsTotal)
+		}
+		newRoot := in.ExtentInlineBase
+		if newRoot == 0 {
+			t.Fatalf("ExtentInlineBase still 0")
+		}
+		// The new tree is a single leaf (9 <= 126) with no idx level.
+		hdr := readBtreeNodeHeader(t, imgPath, newRoot)
+		if !hdr.IsLeaf() {
+			t.Errorf("expected compacted root to be a leaf, got level=%d flags=0x%X", hdr.Level, hdr.Flags)
+		}
+		if hdr.NumKeys != 9 {
+			t.Errorf("compacted leaf key count: want 9, got %d", hdr.NumKeys)
+		}
+		if dataBlockIsFree(t, imgPath, newRoot-btree2DataRegionAbs) {
+			t.Errorf("new root %d should be allocated", newRoot)
+		}
+
+		exts := readInode2Extents(t, imgPath, in)
+		if len(exts) != 9 {
+			t.Fatalf("compacted tree extents: want 9, got %d", len(exts))
+		}
+		for i, e := range exts {
+			if e.Offset != uint64(i) || e.Phys != 120+uint64(i) {
+				t.Errorf("extent %d: want offset=%d phys=%d, got offset=%d phys=%d", i, i, 120+i, e.Offset, e.Phys)
+			}
+		}
+
+		// All 10 old node blocks (9 leaves + idx root) must be freed.
+		for _, abs := range oldNodes {
+			if !dataBlockIsFree(t, imgPath, abs-btree2DataRegionAbs) {
+				t.Errorf("old node %d (rel %d) should be free after compaction", abs, abs-btree2DataRegionAbs)
+			}
+		}
+		// The 9 data blocks (data-rel 30..38) must remain allocated.
+		for rel := uint64(30); rel < 39; rel++ {
+			if dataBlockIsFree(t, imgPath, rel) {
+				t.Errorf("data block rel %d should still be allocated", rel)
+			}
+		}
+	})
+
+	// already_packed: a healthy 300-extent tree (3 leaves = ceil(300/126), already
+	// minimal) is left untouched by compaction — the fast path skips it, so no
+	// compaction notice and the root is unchanged.
+	t.Run("already_packed", func(t *testing.T) {
+		imgPath, rootAbs, _ := prepareIndexedBtreeFixture(t, 300)
+		// 300 extents -> ceil(300/126) = 3 leaves, already minimal.
+
+		out := runFsckRepair(t, imgPath, "extents")
+		if !contains(out, "Repair complete") {
+			t.Fatalf("repair did not complete:\n%s", out)
+		}
+		if contains(out, "compacted extent index") {
+			t.Errorf("an already-minimal tree must not be compacted:\n%s", out)
+		}
+		in := readInode2(t, imgPath)
+		if in.ExtentInlineBase != rootAbs {
+			t.Errorf("root changed: want %d, got %d (already-minimal tree must be untouched)", rootAbs, in.ExtentInlineBase)
+		}
+		if in.NumExtentsTotal != 300 {
+			t.Errorf("NumExtentsTotal: want 300, got %d", in.NumExtentsTotal)
+		}
+	})
+}

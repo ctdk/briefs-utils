@@ -166,7 +166,7 @@ func rebuildBtreeIndex(fs *fsckState, plan *repairPlan, blockSize, dataRegionSta
 // readable extents) or the rebuild itself failed; in those cases the caller
 // leaves the inode in failedBtreeInos and frees nothing.
 func rebuildOneBtree(fs *fsckState, plan *repairPlan, ino uint64, in *briefs.Inode, root, blockSize, dataRegionStart uint64) error {
-	extents, oldNodeBlocks, lost := btreeCollectExtents(fs, ino, root, blockSize)
+	extents, oldNodeBlocks, _, lost := btreeCollectExtents(fs, ino, root, blockSize)
 	if lost {
 		fs.warnf("ino %d: B-tree rebuild recovered %d extent(s); some unreadable subtrees were lost — their data blocks are left allocated for manual recovery", ino, len(extents))
 	}
@@ -195,10 +195,24 @@ func rebuildOneBtree(fs *fsckState, plan *repairPlan, ino uint64, in *briefs.Ino
 		return nil
 	}
 
-	// Rebuild a fresh tree. Allocate new node blocks first (the old blocks are
-	// still marked allocated, so AllocateBlock will not hand them back), then
-	// free the old blocks after the new tree is written — matches the
-	// trie-compaction template.
+	nodeCount, rootBlock, err := rebuildBtreeFromExtents(fs, plan, ino, &clone, extents, oldNodeBlocks, blockSize, dataRegionStart)
+	if err != nil {
+		return err
+	}
+	fs.warnf("ino %d: rebuilt extent index → %d node(s), root=%d, %d extent(s)", ino, nodeCount, rootBlock, len(extents))
+	return nil
+}
+
+// rebuildBtreeFromExtents writes a fresh minimal B+ tree packing @extents (126
+// per leaf, bottom-up idx), frees the old node blocks, and stages the rebuilt
+// inode (keeping InodeFlagIndexed set) in plan.inodes. It allocates new node
+// blocks first — the old blocks are still marked allocated, so AllocateBlock
+// will not hand them back — then frees the old blocks once the new tree is
+// written. This matches the trie-compaction template and is correct whether
+// RebuildAllocator is true or false. Returns the new node count and root block.
+// Used by both the Phase 4 rebuild (repair of failed trees) and Phase 6
+// compaction (optimization of healthy ones).
+func rebuildBtreeFromExtents(fs *fsckState, plan *repairPlan, ino uint64, clone *briefs.Inode, extents []briefs.Extent, oldNodeBlocks []uint64, blockSize, dataRegionStart uint64) (nodeCount int, rootBlock uint64, err error) {
 	allocBlock := func() (uint64, error) {
 		rel, err := plan.dataAlloc.AllocateBlock()
 		if err != nil {
@@ -209,18 +223,18 @@ func rebuildOneBtree(fs *fsckState, plan *repairPlan, ino uint64, in *briefs.Ino
 	leafBlocks, leafFirstOffsets, leafBufs, err := briefs.BuildBtreeLeaves(extents, blockSize, allocBlock)
 	if err != nil {
 		freeNodeBlocks(plan, leafBlocks, dataRegionStart) // free the partial allocation
-		return fmt.Errorf("build leaves: %w", err)
+		return 0, 0, fmt.Errorf("build leaves: %w", err)
 	}
 	rootBlock, _, idxBlocks, idxBufs, err := briefs.BuildBtreeIndex(leafBlocks, leafFirstOffsets, blockSize, 1, allocBlock)
 	if err != nil {
 		freeNodeBlocks(plan, append(append([]uint64{}, leafBlocks...), idxBlocks...), dataRegionStart)
-		return fmt.Errorf("build index: %w", err)
+		return 0, 0, fmt.Errorf("build index: %w", err)
 	}
 	allBlocks := append(append([]uint64{}, leafBlocks...), idxBlocks...)
 	allBufs := append(append([][]byte{}, leafBufs...), idxBufs...)
 	if err := briefs.WriteBtreeNodes(fs.file, allBlocks, allBufs, blockSize); err != nil {
 		freeNodeBlocks(plan, allBlocks, dataRegionStart)
-		return fmt.Errorf("write nodes: %w", err)
+		return 0, 0, fmt.Errorf("write nodes: %w", err)
 	}
 
 	clone.ExtentInlineBase = rootBlock
@@ -228,10 +242,9 @@ func rebuildOneBtree(fs *fsckState, plan *repairPlan, ino uint64, in *briefs.Ino
 	clone.NumExtentsTotal = uint64(len(extents))
 	clone.SetInlineExtents([8]briefs.Extent{}) // zero the inline array (tree-backed)
 	// InodeFlagIndexed remains set; other flags untouched.
-	plan.inodes[ino] = &clone
+	plan.inodes[ino] = clone
 	freeNodeBlocks(plan, oldNodeBlocks, dataRegionStart)
-	fs.warnf("ino %d: rebuilt extent index → %d node(s), root=%d, %d extent(s)", ino, len(allBlocks), rootBlock, len(extents))
-	return nil
+	return len(allBlocks), rootBlock, nil
 }
 
 // btreeCollectExtents walks the subtree at @root tolerantly, collecting extents
@@ -240,14 +253,14 @@ func rebuildOneBtree(fs *fsckState, plan *repairPlan, ino uint64, in *briefs.Ino
 // blocks to free (valid leaves + descended internal nodes), and whether any
 // subtree was skipped (lost). Lost subtrees warnf and contribute no extents;
 // their node blocks are NOT returned for freeing (left allocated).
-func btreeCollectExtents(fs *fsckState, ino, root, blockSize uint64) (extents []briefs.Extent, oldNodeBlocks []uint64, lost bool) {
+func btreeCollectExtents(fs *fsckState, ino, root, blockSize uint64) (extents []briefs.Extent, oldNodeBlocks []uint64, leafCount int, lost bool) {
 	visited := make(map[uint64]bool)
-	btreeCollectSubtree(fs, ino, root, blockSize, visited, &extents, &oldNodeBlocks, &lost)
+	btreeCollectSubtree(fs, ino, root, blockSize, visited, &extents, &oldNodeBlocks, &leafCount, &lost)
 	return
 }
 
 // btreeCollectSubtree is the recursive worker for btreeCollectExtents.
-func btreeCollectSubtree(fs *fsckState, ino, block, blockSize uint64, visited map[uint64]bool, extents *[]briefs.Extent, oldNodeBlocks *[]uint64, lost *bool) {
+func btreeCollectSubtree(fs *fsckState, ino, block, blockSize uint64, visited map[uint64]bool, extents *[]briefs.Extent, oldNodeBlocks *[]uint64, leafCount *int, lost *bool) {
 	if block == 0 || visited[block] {
 		return
 	}
@@ -291,6 +304,7 @@ func btreeCollectSubtree(fs *fsckState, ino, block, blockSize uint64, visited ma
 			*extents = append(*extents, briefs.ReadBtreeLeafExtent(buf, int(i)))
 		}
 		*oldNodeBlocks = append(*oldNodeBlocks, block)
+		*leafCount++
 		return
 	}
 
@@ -309,10 +323,10 @@ func btreeCollectSubtree(fs *fsckState, ino, block, blockSize uint64, visited ma
 	*oldNodeBlocks = append(*oldNodeBlocks, block)
 	for i := uint16(0); i < hdr.NumKeys; i++ {
 		e := briefs.ReadBtreeIdxEntry(buf, int(i))
-		btreeCollectSubtree(fs, ino, e.Child, blockSize, visited, extents, oldNodeBlocks, lost)
+		btreeCollectSubtree(fs, ino, e.Child, blockSize, visited, extents, oldNodeBlocks, leafCount, lost)
 	}
 	trailing := briefs.BtreeTrailingChild(buf)
-	btreeCollectSubtree(fs, ino, trailing, blockSize, visited, extents, oldNodeBlocks, lost)
+	btreeCollectSubtree(fs, ino, trailing, blockSize, visited, extents, oldNodeBlocks, leafCount, lost)
 }
 
 // sortDedupExtents sorts extents ascending by Offset and drops any duplicate
