@@ -38,7 +38,21 @@ GLOBAL OPTIONS:
 fsck.briefs
 -----------
 
-The idea with `fsck.briefs` is that it will repair broken, mangled, and mutilated BrieFS volumes. It now performs a growing list of consistency checks, including CRC32C verification of journal records and B+ tree extent index nodes, validates the packed directory trie pages used by BrieFS 0.7.0+, and can repair many common problems. Repairs can be run selectively with `--repair-only=allocator,extents,trie,links` or limited to safe compaction with `--optimize` (an alias for `--repair --repair-only=trie,extents`). On v0.9 B-tree images the `extents` phase is a no-op — there is nothing to compact on a consistent image — so `--optimize` effectively compacts directory tries only.
+The idea with `fsck.briefs` is that it will repair broken, mangled, and mutilated BrieFS volumes. It performs a growing list of consistency checks, including CRC32C verification of journal records and B+ tree extent index nodes, structural validation of those B+ trees (high-key monotonicity, child-pointer range/level, leaf prev/next linkage, cross-leaf key ordering, extent-count agreement), and validation of the packed directory trie pages used by BrieFS 0.7.0+.
+
+Repairs are organized into phases, selectable with `--repair-only` (comma-separated):
+
+* `allocator` — rebuild the block/inode allocator bitmaps from the blocks actually in use.
+* `btrees` — recompute and rewrite B+ tree extent-index node checksums (CRC-only; no structural change).
+* `btree-rebuild` — fully rebuild a damaged B+ tree extent index from its surviving extents, dropping to inline extents when ≤8 remain.
+* `btree-orphan` — free orphan B+ tree node blocks left behind by a torn split. Destructive, so it is **opt-in only and not included in `all`**.
+* `extents` — compact and rebalance file extent indexes, merging underfull B+ tree leaves (a no-op on an already-minimal tree).
+* `trie` — compact directory trie pages.
+* `links` — repair inode link counts.
+
+`--repair` with no `--repair-only` runs `all`, which is `allocator,btrees,btree-rebuild,extents,trie,links` (everything except `btree-orphan`). `--optimize` is an alias for `--repair --repair-only=trie,extents` — safe compaction of directory tries and extent indexes with no allocator rewrite and no B-tree rebuild.
+
+As a safety guard, `fsck.briefs` refuses a default `--repair` when any inode has an unrecoverable B+ tree extent index, since rebuilding the allocator would free that inode's blocks and lose data; the non-allocator phases (`--optimize`, or `--repair-only` without the `allocator` token) are not destructive and may still proceed.
 
 ```
 NAME:
@@ -56,7 +70,7 @@ COMMANDS:
 GLOBAL OPTIONS:
    --verbose, -V        verbose output (default: false)
    --repair, -r         attempt to repair found errors (default: false)
-   --repair-only value  run only selected repair phases (comma-separated: allocator,extents,trie,links; default all)
+   --repair-only value  run only selected repair phases (comma-separated: allocator,btrees,btree-rebuild,btree-orphan,extents,trie,links; default all)
    --optimize           safe compaction only (alias for --repair --repair-only=trie,extents) (default: false)
    --assume-yes, -y     do not ask for confirmation before modifying the volume (default: false)
    --help, -h           show help
