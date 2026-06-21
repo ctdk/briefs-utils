@@ -134,10 +134,10 @@ func main() {
 			// pyramid in the trie pool tracks all data blocks.
 
 			estInodes := uint64(totalBlocks) / uint64(inodeRatio)
-			if estInodes < 100 {
-				estInodes = 100
+			if estInodes < briefs.MinInodes {
+				estInodes = briefs.MinInodes
 			}
-			estInodes = roundUp(estInodes, 32)
+			estInodes = roundUp(estInodes, briefs.InodeAlign)
 
 			inodesPerBlock := blockSize / inodeSize // 8
 			inodeTableBlocks := roundUp(estInodes, inodesPerBlock) / inodesPerBlock
@@ -350,7 +350,7 @@ func main() {
 			checkpointBlock := journalOffset + journalBlocks - 1
 			journalBuf := make([]byte, blockSize)
 			// Checkpoint block header (16 bytes)
-			binary.LittleEndian.PutUint32(journalBuf[0:], 0x43485053) // "CHPS" magic
+			binary.LittleEndian.PutUint32(journalBuf[0:], briefs.MagicCheckpoint) // "CHPS" magic
 			binary.LittleEndian.PutUint32(journalBuf[4:], 0)          // block_seq
 			binary.LittleEndian.PutUint32(journalBuf[8:], 1)          // record_count
 			// Checkpoint record header at offset 16
@@ -377,7 +377,7 @@ func main() {
 
 			// Compute and write the CRC32C checksum over type, flags,
 			// data_len, and the 56-byte checkpoint data.
-			checksum := briefs.ComputeJournalRecordChecksum(uint32(briefs.JRN_CHECKPOINT), 0, cpData)
+			checksum := briefs.ComputeJournalRecordChecksum(uint32(briefs.JRN_CHECKPOINT), briefs.JRN_FLAGS_NONE, cpData)
 			binary.LittleEndian.PutUint32(journalBuf[recOff+12:], checksum)
 			if _, err := file.WriteAt(journalBuf, int64(checkpointBlock*blockSize)); err != nil {
 				return fmt.Errorf("write journal checkpoint at block %d: %w", checkpointBlock, err)

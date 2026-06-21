@@ -8,6 +8,13 @@ import (
 	"github.com/ctdk/briefs-utils/briefs"
 )
 
+var bytesPerWord = uint64(binary.Size(uint64(1))) 
+// Recklessly assuming 8 bits per byte. This could cause trouble in case
+// this program (or Go itself) are ever ported to the PDP-10 or
+// something along those lines.
+var bitsPerByte = uint64(8) 
+var wordBits = bytesPerWord * bitsPerByte
+
 // verifyAllocatorPool reads and prints the allocator pool header.
 func verifyAllocatorPool(file *os.File, poolBlock, blockSize uint64, label string) error {
 	hdr, err := briefs.ReadAllocatorHeader(file, poolBlock, blockSize)
@@ -37,12 +44,13 @@ func readAllocatorHeader(file *os.File, poolBlock, blockSize uint64) (l0w, l1w, 
 //   - Trailing bits in the last L0/L1/L2 word are properly masked
 //   - Computed free count from L2 matches the header's free count
 func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize uint64, l0w, l1w, l2w, blockCount, headerFree uint64, label string) {
-	wordsPerBlock := blockSize / 8 // 512 u64 words per 4096-byte block
+	wordsPerBlock := blockSize / bytesPerWord // 512 u64 words per 4096-byte block
+	errorReportLimit := 10
 
 	// Compute expected level sizes
-	expectedL2 := (blockCount + 63) / 64
-	expectedL1 := (expectedL2 + 63) / 64
-	expectedL0 := (expectedL1 + 63) / 64
+	expectedL2 := (blockCount + (wordBits - 1)) / wordBits
+	expectedL1 := (expectedL2 + (wordBits - 1)) / wordBits
+	expectedL0 := (expectedL1 + (wordBits - 1)) / wordBits
 	if expectedL0 < 1 {
 		expectedL0 = 1
 	}
@@ -75,7 +83,7 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize uint64, l0w, l1w,
 		}
 		start := bi * wordsPerBlock
 		for j := uint64(0); j < wordsPerBlock && start+j < l0w; j++ {
-			l0[start+j] = binary.LittleEndian.Uint64(buf[j*8:])
+			l0[start+j] = binary.LittleEndian.Uint64(buf[j*bytesPerWord:])
 		}
 	}
 
@@ -92,7 +100,7 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize uint64, l0w, l1w,
 		}
 		start := bi * wordsPerBlock
 		for j := uint64(0); j < wordsPerBlock && start+j < l1w; j++ {
-			l1[start+j] = binary.LittleEndian.Uint64(buf[j*8:])
+			l1[start+j] = binary.LittleEndian.Uint64(buf[j*bytesPerWord:])
 		}
 	}
 
@@ -109,12 +117,12 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize uint64, l0w, l1w,
 		}
 		start := bi * wordsPerBlock
 		for j := uint64(0); j < wordsPerBlock && start+j < l2w; j++ {
-			l2[start+j] = binary.LittleEndian.Uint64(buf[j*8:])
+			l2[start+j] = binary.LittleEndian.Uint64(buf[j*bytesPerWord:])
 		}
 	}
 
 	// Verify trailing bits in last L2 word are properly masked
-	if tail := blockCount % 64; tail != 0 {
+	if tail := blockCount % wordBits; tail != 0 {
 		lastWord := l2[len(l2)-1]
 		mask := (uint64(1) << tail) - 1
 		if lastWord&^mask != 0 {
@@ -123,7 +131,7 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize uint64, l0w, l1w,
 	}
 
 	// Verify trailing bits in last L1 word
-	if tail := l2w % 64; tail != 0 {
+	if tail := l2w % wordBits; tail != 0 {
 		lastWord := l1[len(l1)-1]
 		mask := (uint64(1) << tail) - 1
 		if lastWord&^mask != 0 {
@@ -132,7 +140,7 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize uint64, l0w, l1w,
 	}
 
 	// Verify trailing bits in last L0 word
-	if tail := l1w % 64; tail != 0 {
+	if tail := l1w % wordBits; tail != 0 {
 		lastWord := l0[len(l0)-1]
 		mask := (uint64(1) << tail) - 1
 		if lastWord&^mask != 0 {
@@ -145,16 +153,16 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize uint64, l0w, l1w,
 	l1Errors := 0
 	for i := uint64(0); i < l1w; i++ {
 		expected := uint64(0)
-		start := i * 64
-		for j := uint64(0); j < 64 && start+j < l2w; j++ {
+		start := i * wordBits
+		for j := uint64(0); j < wordBits && start+j < l2w; j++ {
 			if l2[start+j] != 0 {
 				expected |= 1 << j
 			}
 		}
 		if l1[i] != expected {
-			if l1Errors < 10 {
+			if l1Errors < errorReportLimit {
 				fs.errorf("%s: L1 word %d mismatch: on-disk 0x%016X, computed 0x%016X", label, i, l1[i], expected)
-			} else if l1Errors == 10 {
+			} else if l1Errors == errorReportLimit {
 				fs.errorf("%s: (more L1 errors suppressed)", label)
 			}
 			l1Errors++
@@ -165,16 +173,16 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize uint64, l0w, l1w,
 	l0Errors := 0
 	for i := uint64(0); i < l0w; i++ {
 		expected := uint64(0)
-		start := i * 64
-		for j := uint64(0); j < 64 && start+j < l1w; j++ {
+		start := i * wordBits
+		for j := uint64(0); j < wordBits && start+j < l1w; j++ {
 			if l1[start+j] != 0 {
 				expected |= 1 << j
 			}
 		}
 		if l0[i] != expected {
-			if l0Errors < 10 {
+			if l0Errors < errorReportLimit {
 				fs.errorf("%s: L0 word %d mismatch: on-disk 0x%016X, computed 0x%016X", label, i, l0[i], expected)
-			} else if l0Errors == 10 {
+			} else if l0Errors == errorReportLimit {
 				fs.errorf("%s: (more L0 errors suppressed)", label)
 			}
 			l0Errors++
@@ -234,6 +242,7 @@ func verifyInodeBitmapCrossReference(fs *fsckState, blockSize, inodeSize uint64)
 	badAllocated := 0 // bitmap says allocated, but no valid inode magic
 	badFree := 0      // bitmap says free, but has valid inode magic
 	ino := uint64(1)
+	errorReportLimit := 20
 
 	for bi := uint64(0); bi < (blockCount+inodesPerBlock-1)/inodesPerBlock; bi++ {
 		absBlock := inodeTableStart + bi
@@ -246,26 +255,26 @@ func verifyInodeBitmapCrossReference(fs *fsckState, blockSize, inodeSize uint64)
 
 		for j := uint64(0); j < inodesPerBlock && ino <= blockCount; j++ {
 			offset := j * inodeSize
-			magic := binary.LittleEndian.Uint64(buf[offset+8:])
+			magic := binary.LittleEndian.Uint64(buf[offset+bytesPerWord:])
 
-			w := (ino - 1) / 64
-			b := (ino - 1) % 64
+			w := (ino - 1) / wordBits
+			b := (ino - 1) % wordBits
 			allocated := w < uint64(len(l2)) && (l2[w]&(1<<b)) == 0
 
 			hasMagic := magic == briefs.MagicInode
 
 			if allocated && !hasMagic {
-				if badAllocated < 20 {
+				if badAllocated < errorReportLimit {
 					fs.errorf("ino %d: bitmap says allocated but inode has no valid magic (0x%016X)", ino, magic)
-				} else if badAllocated == 20 {
+				} else if badAllocated == errorReportLimit {
 					fs.errorf("(more inode bitmap/table mismatch errors suppressed)")
 				}
 				badAllocated++
 			}
 			if !allocated && hasMagic {
-				if badFree < 20 {
+				if badFree < errorReportLimit {
 					fs.errorf("ino %d: bitmap says free but inode has valid magic (0x%016X)", ino, magic)
-				} else if badFree == 20 {
+				} else if badFree == errorReportLimit {
 					fs.errorf("(more inode bitmap/table mismatch errors suppressed)")
 				}
 				badFree++

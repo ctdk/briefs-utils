@@ -32,6 +32,9 @@ const (
 	DefaultInodeSize   = 512
 	DefaultJournalSize = 64 // blocks
 
+	// Journal flags. Not much here yet.
+	JRN_FLAGS_NONE = 0
+
 	// Journal record types — mirrors briefs.h enum journal_record_type.
 	// These are used by fsck and mkfs to avoid magic numbers.
 	JRN_NONE = iota
@@ -102,6 +105,12 @@ const (
 	// ReadSuperblock rejects an image whose incompat bits are not all understood.
 	// The v0.9.0 B+ tree extent index is the first one.
 	FeatureIncompatBtree = 0x0000000000000001 // B+ tree extent index (v0.9.0)
+)
+
+// constants for mkfs.briefs
+const (
+	MinInodes = 100
+	InodeAlign = 32
 )
 
 var VersionStr = fmt.Sprintf("v%d.%d.%d", BrieFSMajorVersion, BrieFSMinorVersion, BrieFSPatchVersion)
