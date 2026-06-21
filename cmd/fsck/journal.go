@@ -88,8 +88,29 @@ func verifyJournalRecords(fs *fsckState, journalOffset, journalBlocks, logStart,
 		end = start
 	}
 
+	// Bounds-check the log range against the journal's block span.  A stale
+	// or zeroed superblock JournalLogEnd/LogStart (the kernel can leave these
+	// unpersisted -- see the journal-log-end persistence issue) would otherwise
+	// point `end` outside [journalOffset, journalOffset+journalBlocks), and the
+	// circular walk below would advance forever without `cur == end` ever
+	// holding -- an infinite spin at ~100% CPU during the post-test consistency
+	// check.  Clamp out-of-range endpoints to the checkpoint block and cap the
+	// walk at journalBlocks iterations so a bogus range can never hang fsck.
+	journalLast := journalOffset + journalBlocks - 1
+	if start < journalOffset || start > journalLast {
+		fs.warnf("journal log_start %d out of range [%d,%d]; clamping to checkpoint block",
+			start, journalOffset, journalLast)
+		start = journalLast
+		end = journalLast
+	}
+	if end < journalOffset || end > journalLast {
+		fs.warnf("journal log_end %d out of range [%d,%d]; clamping to checkpoint block",
+			end, journalOffset, journalLast)
+		end = journalLast
+	}
+
 	cur := start
-	for {
+	for iter := uint64(0); iter < journalBlocks; iter++ {
 		buf := make([]byte, blockSize)
 		if _, err := fs.file.ReadAt(buf, int64(cur*blockSize)); err != nil {
 			fs.errorf("journal block %d: read error: %v", cur, err)
