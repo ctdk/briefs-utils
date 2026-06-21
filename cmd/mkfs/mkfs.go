@@ -60,6 +60,7 @@ func main() {
 			},
 			&cli.IntFlag{
 				Name:     "inode-size",
+				Aliases:  []string{"I"},
 				Value:    512,
 				Usage:    "inode size in bytes",
 			},
