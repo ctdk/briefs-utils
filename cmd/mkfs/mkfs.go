@@ -15,6 +15,22 @@ func roundUp(value, alignment uint64) uint64 {
 	return (value + alignment - 1) / alignment * alignment
 }
 
+// stderrIsTerminal reports whether os.Stderr is an interactive terminal
+// (a char device).  mkfs.briefs writes its human-facing progress/report to
+// stderr; this gates that output so it shows up when a human runs mkfs on a
+// terminal but is suppressed when stderr is redirected to a file or pipe.
+// That matters under xfstests, whose `check` runs each test with
+// `_run_seq >$tmp.out 2>&1`, merging the test's stderr into the output that is
+// diffed against the expected .out -- so any mkfs chatter on stderr would leak
+// into the compared result and spuriously fail tests (e.g. generic/732).
+func stderrIsTerminal() bool {
+	fi, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
 // Calculate on-disk location of an inode.
 // The inode table starts at: inode_table_offset
 // (This matches what the kernel computes in briefs_iget.)
@@ -115,8 +131,10 @@ func main() {
 				if err != nil {
 					return err
 				}
-				fmt.Fprintf(os.Stderr, "Probed device %s: %d bytes, %d blocks.\n",
-					path, bd.Bytes(), bd.Blocks())
+				if stderrIsTerminal() {
+					fmt.Fprintf(os.Stderr, "Probed device %s: %d bytes, %d blocks.\n",
+						path, bd.Bytes(), bd.Blocks())
+				}
 				totalBlocks = bd.Blocks()
 			}
 
@@ -398,18 +416,20 @@ func main() {
 			}
 
 			// --- Report ---
-			fmt.Fprintf(os.Stderr, "Created filesystem: %s (%d blocks × %d bytes)\n",
-				path, totalBlocks, blockSize)
-			fmt.Fprintf(os.Stderr, "  inodes:       %d (ratio 1 inode per %d blocks)\n", estInodes, inodeRatio)
-			fmt.Fprintf(os.Stderr, "  journal:      %d blocks at %d\n", journalBlocks, journalOffset)
-			fmt.Fprintf(os.Stderr, "  data blocks:  %d (blocks %d..%d, %d free)\n",
-				finalDataBlocks, dataRegionStart, journalOffset-1, finalDataBlocks-1)
-			fmt.Fprintf(os.Stderr, "  inode bitmap: %d blocks at offset %d (3-level bitmap pyramid)\n", inodeBMBlocks, inodeBMOffset)
-			fmt.Fprintf(os.Stderr, "  inode table:  %d blocks at offset %d\n", inodeTableBlocks, inodeTableOffset)
-			fmt.Fprintf(os.Stderr, "  EAT:          %d block(s) at offset %d\n", eatBlocks, eatOffset)
-			fmt.Fprintf(os.Stderr, "  alloc pool:   %d blocks at offset %d (3-level bitmap)\n",
-				allocPoolSize, allocPoolStart)
-			fmt.Fprintf(os.Stderr, "  root dir:     trie root at block %d\n", rootTrieBlock)
+			if stderrIsTerminal() {
+				fmt.Fprintf(os.Stderr, "Created filesystem: %s (%d blocks × %d bytes)\n",
+					path, totalBlocks, blockSize)
+				fmt.Fprintf(os.Stderr, "  inodes:       %d (ratio 1 inode per %d blocks)\n", estInodes, inodeRatio)
+				fmt.Fprintf(os.Stderr, "  journal:      %d blocks at %d\n", journalBlocks, journalOffset)
+				fmt.Fprintf(os.Stderr, "  data blocks:  %d (blocks %d..%d, %d free)\n",
+					finalDataBlocks, dataRegionStart, journalOffset-1, finalDataBlocks-1)
+				fmt.Fprintf(os.Stderr, "  inode bitmap: %d blocks at offset %d (3-level bitmap pyramid)\n", inodeBMBlocks, inodeBMOffset)
+				fmt.Fprintf(os.Stderr, "  inode table:  %d blocks at offset %d\n", inodeTableBlocks, inodeTableOffset)
+				fmt.Fprintf(os.Stderr, "  EAT:          %d block(s) at offset %d\n", eatBlocks, eatOffset)
+				fmt.Fprintf(os.Stderr, "  alloc pool:   %d blocks at offset %d (3-level bitmap)\n",
+					allocPoolSize, allocPoolStart)
+				fmt.Fprintf(os.Stderr, "  root dir:     trie root at block %d\n", rootTrieBlock)
+			}
 			return nil
 		},
 	}
