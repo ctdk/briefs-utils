@@ -4,6 +4,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/ctdk/briefs-utils/device"
@@ -102,6 +103,11 @@ func main() {
 				Aliases: []string{"U"},
 				Usage: "Specify a UUID for the new volume.",
 			},
+			&cli.BoolFlag{
+				Name:     "force",
+				Aliases:  []string{"f"},
+				Usage:    "force overwrite of an existing filesystem",
+			},
 		},
 		Action: func(c *cli.Context) error {
 			path := c.Args().First()
@@ -112,6 +118,7 @@ func main() {
 			label := c.String("label")
 			inodeRatio := c.Int("inode-ratio")
 			uuidStr := c.String("uuid")
+			force := c.Bool("force")
 
 			// Validate that blockSize and inodeSize are powers of
 			// two.
@@ -270,6 +277,33 @@ func main() {
 			if !(stat.Mode().IsRegular() ||
 				(stat.Mode()&os.ModeDevice != 0 && stat.Mode()&os.ModeCharDevice == 0)) {
 				return fmt.Errorf("not an appropriate file or device type")
+			}
+
+			// --- Refuse to overwrite an existing filesystem unless forced ---
+			// mkfs.briefs must not silently clobber a device that already
+			// holds a filesystem (its own or a foreign one); xfstests
+			// generic/740 checks exactly this.  A fresh device reads back as
+			// all zeros, while every filesystem writes a non-zero superblock
+			// into block 0.  os.Create() truncates regular files (so they
+			// read back zero and are always allowed), but block devices are
+			// not truncated, so an existing filesystem is detected and
+			// refused unless --force/-f was given.
+			if !force {
+				first := make([]byte, blockSize)
+				n, err := file.ReadAt(first, 0)
+				if err != nil && err != io.EOF {
+					return fmt.Errorf("read first block: %w", err)
+				}
+				nonzero := false
+				for i := 0; i < n; i++ {
+					if first[i] != 0 {
+						nonzero = true
+						break
+					}
+				}
+				if nonzero {
+					return fmt.Errorf("%s already contains a filesystem or data; use --force/-f to overwrite", path)
+				}
 			}
 
 			totalSize := sb.Lay.TotalBlocks * sb.Lay.BlockSize
