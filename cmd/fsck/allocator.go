@@ -226,8 +226,14 @@ func readAllocatorL2(file *os.File, poolBlock, blockSize uint64) (l2 []uint64, l
 }
 
 // verifyInodeBitmapCrossReference checks that every allocated inode bitmap slot
-// corresponds to an inode with valid magic on disk, and every unallocated slot
-// truly lacks valid magic.
+// corresponds to an inode with valid magic on disk.  It does NOT check the
+// reverse (a free slot still holding a valid magic): mkfs.briefs no longer
+// pre-zeroes the inode table, so on a reused device an unallocated slot
+// legitimately retains the previous filesystem's stale inode bytes, including a
+// valid magic.  The kernel only consults a slot once it allocates it, so such
+// stale content is harmless at runtime and is not an inconsistency worth
+// flagging.  An allocated slot that lacks a valid magic, however, is a real
+// bitmap/table mismatch and is reported.
 func verifyInodeBitmapCrossReference(fs *fsckState, blockSize, inodeSize uint64) {
 	inodeTableStart := fs.sb.InodeTableOffset
 	inodesPerBlock := blockSize / inodeSize
@@ -240,7 +246,6 @@ func verifyInodeBitmapCrossReference(fs *fsckState, blockSize, inodeSize uint64)
 
 	// Check each inode slot
 	badAllocated := 0 // bitmap says allocated, but no valid inode magic
-	badFree := 0      // bitmap says free, but has valid inode magic
 	ino := uint64(1)
 	errorReportLimit := 20
 
@@ -271,20 +276,12 @@ func verifyInodeBitmapCrossReference(fs *fsckState, blockSize, inodeSize uint64)
 				}
 				badAllocated++
 			}
-			if !allocated && hasMagic {
-				if badFree < errorReportLimit {
-					fs.errorf("ino %d: bitmap says free but inode has valid magic (0x%016X)", ino, magic)
-				} else if badFree == errorReportLimit {
-					fs.errorf("(more inode bitmap/table mismatch errors suppressed)")
-				}
-				badFree++
-			}
 			ino++
 		}
 	}
 
-	if badAllocated == 0 && badFree == 0 {
-		fmt.Fprintf(os.Stderr, "  inode bitmap cross-ref: all bitmap entries match inode table\n")
+	if badAllocated == 0 {
+		fmt.Fprintf(os.Stderr, "  inode bitmap cross-ref: all allocated bitmap entries have valid inode magic\n")
 	}
 }
 

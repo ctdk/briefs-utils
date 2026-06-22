@@ -110,6 +110,24 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 
 	fmt.Fprintf(os.Stderr, "  inodes per block: %d\n", inodesPerBlock)
 
+	// Read the inode allocator L2 bitmap so the scan below validates only the
+	// slots it marks allocated.  mkfs.briefs no longer pre-zeroes the inode
+	// table (it would write a device-proportionally-huge region up front and
+	// EIO on large volumes -- generic/620), so an unallocated slot on a reused
+	// device simply retains the previous filesystem's stale bytes, including a
+	// valid inode magic.  Validating those would flood fsck with phantom
+	// inodes and false "bad magic" reports.  The kernel only ever consults a
+	// slot once it allocates it (writing the inode fresh), so free-slot
+	// content is meaningless at runtime.  The verifyInodeBitmapCrossReference
+	// pass still flags an allocated slot whose magic is missing/invalid.  If
+	// the bitmap read fails, fall back to the legacy behavior of validating
+	// every non-zero-magic slot.
+	l2, _, _, bitmapErr := readAllocatorL2(fs.file, fs.sb.InodeBMOffset, blockSize)
+	haveBitmap := bitmapErr == nil
+	if !haveBitmap {
+		fs.errorf("read inode bitmap for table scan: %v (will scan all slots)", bitmapErr)
+	}
+
 	for bi := uint64(0); bi < inodeTableBlocks; bi++ {
 		buf := make([]byte, blockSize)
 		if _, err := fs.file.ReadAt(buf, int64((inodeTableBlock+bi)*blockSize)); err != nil {
@@ -120,6 +138,18 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 
 		for j := uint64(0); j < inodesPerBlock; j++ {
 			offset := j * inodeSize
+
+			// Skip slots the inode bitmap marks free.  "allocated" mirrors
+			// verifyInodeBitmapCrossReference: bit clear in the L2 word.
+			if haveBitmap {
+				w := (ino - 1) / wordBits
+				b := (ino - 1) % wordBits
+				if w >= uint64(len(l2)) || (l2[w]&(1<<b)) != 0 {
+					ino++
+					continue
+				}
+			}
+
 			magic := binary.LittleEndian.Uint64(buf[offset+8:])
 			if magic == 0 {
 				ino++

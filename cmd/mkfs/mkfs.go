@@ -314,13 +314,19 @@ func main() {
 			}
 
 			// --- Clear metadata regions that mkfs doesn't otherwise write ---
-			// Stale data from a previous filesystem can survive in the rest
-			// of the inode table and in journal blocks before the checkpoint.
-			// Zero those regions explicitly so fsck doesn't see old inodes
-			// or stale journal records.
-			if err := zeroBlocks(file, inodeTableOffset, inodeTableBlocks, blockSize); err != nil {
-				return fmt.Errorf("zero inode table: %w", err)
-			}
+			// Stale journal records before the checkpoint must be zeroed so a
+			// dirty-looking journal can't be misread on mount.  The inode table,
+			// however, is NOT pre-zeroed: on a large volume the table scales
+			// with the device (one inode per inode-ratio blocks), so zeroing it
+			// in full writes a huge contiguous region up front -- enough to fill
+			// a dm-snapshot COW store and EIO before mkfs even writes the root
+			// inode (generic/620, 17TB dm-hugedisk).  The kernel writes each new
+			// inode fresh into its slot on allocation, so unallocated slots are
+			// never consulted at runtime.  fsck.briefs validates only the
+			// bitmap-allocated inode slots, skipping free slots (which on a
+			// reused device simply retain the previous filesystem's stale
+			// bytes); the bitmap/table cross-check still flags an allocated
+			// slot that lacks a valid inode magic.
 			if err := zeroBlocks(file, journalOffset, journalBlocks-1, blockSize); err != nil {
 				return fmt.Errorf("zero journal: %w", err)
 			}
