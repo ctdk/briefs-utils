@@ -449,6 +449,20 @@ func main() {
 				return fmt.Errorf("write updated superblock: %w", err)
 			}
 
+			// Flush the device and check for write errors before reporting
+			// success.  os.File.WriteAt only stages pages in the page cache;
+			// deferred Close does not fsync a block device.  On a thin-
+			// provisioned volume with error_if_no_space (e.g. xfstests
+			// generic/405's 1 TiB volume over a 1 MiB pool), provisioning
+			// fails asynchronously at writeback time, so without an explicit
+			// fsync mkfs returns success while the superblock never lands and
+			// the filesystem is left inconsistent on disk.  fsync propagates
+			// the writeback EIO so mkfs fails non-zero and the test's "mkfs
+			// failed" branch is taken.
+			if err := file.Sync(); err != nil {
+				return fmt.Errorf("fsync after mkfs: %w", err)
+			}
+
 			// --- Report ---
 			if stderrIsTerminal() {
 				fmt.Fprintf(os.Stderr, "Created filesystem: %s (%d blocks × %d bytes)\n",
