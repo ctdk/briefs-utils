@@ -81,13 +81,17 @@ func TestFsckCorruptInode(t *testing.T) {
 		t.Fatalf("mkfs failed: %v\n%s", err, out)
 	}
 
-	// Corrupt the root inode's magic (inode table starts at block 6, inode 0)
+	// Corrupt the root inode's magic.  The inode table starts at block 5 and
+	// holds 8 inodes per 4096-byte block (512-byte inodes); root is inode 1 at
+	// block 5, offset 0, with the magic at byte 8.  fsck only validates slots
+	// the inode bitmap marks allocated -- free slots retain stale bytes from a
+	// reused device (mkfs stopped pre-zeroing the inode table, generic/620), so
+	// the corruption must land on an allocated slot to be detected.
 	f, err := os.OpenFile(imgPath, os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatalf("OpenFile: %v", err)
 	}
-	// Inode magic is at offset 8 within the inode, inode 0 is at block 6, offset 0
-	f.WriteAt([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00}, 6*4096+8)
+	f.WriteAt([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00}, 5*4096+8)
 	f.Close()
 
 	cmd = exec.Command(fsckPath, imgPath)
@@ -257,16 +261,22 @@ func TestFsckTreeBackedFile(t *testing.T) {
 		t.Fatalf("write tree-backed inode: %v", err)
 	}
 
-	// Mark inode 2 allocated in the inode bitmap (block 1, bit 1).
-	inodeBM := make([]byte, 4096)
-	if _, err := f.ReadAt(inodeBM, 4096); err != nil {
-		t.Fatalf("read inode bitmap: %v", err)
+	// Mark inode 2 allocated in the inode allocator L2 bitmap.  The inode
+	// bitmap pool is at block 1; its L0 summary word is block 2, L1 summary
+	// word block 3, and the L2 allocation bits -- the level fsck consults to
+	// decide which inode slots to scan (mkfs no longer pre-zeroes the inode
+	// table, so free slots retain stale bytes from a reused device; fsck skips
+	// them -- generic/620) -- are block 4.  A cleared bit means allocated;
+	// bit 1 is inode 2.
+	inodeL2 := make([]byte, 4096)
+	if _, err := f.ReadAt(inodeL2, 4*4096); err != nil {
+		t.Fatalf("read inode L2 bitmap: %v", err)
 	}
-	word := binary.LittleEndian.Uint64(inodeBM[0:])
+	word := binary.LittleEndian.Uint64(inodeL2[0:])
 	word &^= 1 << 1 // clear bit 1 = mark inode 2 allocated
-	binary.LittleEndian.PutUint64(inodeBM[0:], word)
-	if _, err := f.WriteAt(inodeBM, 4096); err != nil {
-		t.Fatalf("write inode bitmap: %v", err)
+	binary.LittleEndian.PutUint64(inodeL2[0:], word)
+	if _, err := f.WriteAt(inodeL2, 4*4096); err != nil {
+		t.Fatalf("write inode L2 bitmap: %v", err)
 	}
 
 	// Mark data blocks 100..108 (data-relative 10..18) and the root leaf
@@ -453,16 +463,17 @@ func TestFsckRepairRefusesCorruptBtree(t *testing.T) {
 		t.Fatalf("write tree-backed inode: %v", err)
 	}
 
-	// Mark inode 2 allocated in the inode bitmap (block 1, bit 1).
-	inodeBM := make([]byte, 4096)
-	if _, err := f.ReadAt(inodeBM, 4096); err != nil {
-		t.Fatalf("read inode bitmap: %v", err)
+	// Mark inode 2 allocated in the inode allocator L2 bitmap (block 4,
+	// word 0, bit 1 -- see TestFsckTreeBackedFile for the pool layout).
+	inodeL2 := make([]byte, 4096)
+	if _, err := f.ReadAt(inodeL2, 4*4096); err != nil {
+		t.Fatalf("read inode L2 bitmap: %v", err)
 	}
-	word := binary.LittleEndian.Uint64(inodeBM[0:])
-	word &^= 1 << 1
-	binary.LittleEndian.PutUint64(inodeBM[0:], word)
-	if _, err := f.WriteAt(inodeBM, 4096); err != nil {
-		t.Fatalf("write inode bitmap: %v", err)
+	word := binary.LittleEndian.Uint64(inodeL2[0:])
+	word &^= 1 << 1 // clear bit 1 = mark inode 2 allocated
+	binary.LittleEndian.PutUint64(inodeL2[0:], word)
+	if _, err := f.WriteAt(inodeL2, 4*4096); err != nil {
+		t.Fatalf("write inode L2 bitmap: %v", err)
 	}
 
 	// Mark data blocks 100..108 and the root leaf allocated in the data L2 (block 89).
