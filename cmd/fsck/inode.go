@@ -82,14 +82,9 @@ func verifyInode(buf []byte, ino, byteOffset, inodeSize uint64) (*briefs.Inode, 
 		// Not a dir, file, or symlink — could be a special device, which is fine
 	}
 
-	// Validate xattr fields (no BrieFS code writes xattrs yet, so these
-	// should always be zero on a healthy filesystem).
-	if in.XattrOffset != 0 || in.XattrSize != 0 {
-		// Record the xattr offset for later bitmap cross-referencing
-		// (the caller will track used blocks, but we just flag it here)
-		return in, fmt.Errorf("ino %d: unexpected xattr_offset=%d, xattr_size=%d (xattr not yet implemented)",
-			ino, in.XattrOffset, in.XattrSize)
-	}
+	// xattr_offset/xattr_size are validated structurally by verifyXattrBlock
+	// (called from verifyInodeTable after collectInodeExtents), which also
+	// records the block in fs.usedBlocks for the allocator cross-reference.
 
 	return in, nil
 }
@@ -168,6 +163,10 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 
 				// Collect extents for block cross-reference
 				collectInodeExtents(fs, ino, in, blockSize)
+
+				// Validate the external xattr block (if any) and record it
+				// in fs.usedBlocks for the allocator cross-reference.
+				verifyXattrBlock(fs, ino, in, blockSize)
 
 				// Deep structural checks the basic walk skips (separator
 				// ordering, child range/level, cross-leaf ordering, extent

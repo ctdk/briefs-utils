@@ -19,6 +19,7 @@ const (
 	MagicTriePage   = 0x54524E50        // "TRNP"
 	MagicJournal    = 0x4A4E4C5A        // "JNLZ"
 	MagicCheckpoint = 0x43485053        // "CHPS"
+	MagicXattr      = 0x58415454        // "XATT" -- xattr block header magic
 
 	// File mode constants. Not using the normal Go ones from io/fs because
 	// they aren't what we need for something this low level.
