@@ -101,7 +101,7 @@ func TestBtreeBuildRoundTrip(t *testing.T) {
 // TestBtreeBuildSingleLeafAndHoles covers two edge cases:
 //   - A tree with <=126 extents builds to a single leaf that IS the root (no idx
 //     level), and the reader walks it as a root-leaf.
-//   - Hole extents (ExtentFlagHole, Phys=0) are packed and read back verbatim.
+//   - Hole extents (Phys == 0) are packed and read back verbatim.
 func TestBtreeBuildSingleLeafAndHoles(t *testing.T) {
 	const blockSize = uint64(4096)
 	const dataRegionStart = uint64(1000)
@@ -111,11 +111,11 @@ func TestBtreeBuildSingleLeafAndHoles(t *testing.T) {
 		{Offset: 0, Phys: 1, Len: 1},
 		{Offset: 1, Phys: 2, Len: 1},
 		{Offset: 2, Phys: 3, Len: 1},
-		{Offset: 3, Phys: 0, Len: 1, Flags: ExtentFlagHole},
+		{Offset: 3, Phys: 0, Len: 1},
 		{Offset: 4, Phys: 4, Len: 1},
 		{Offset: 5, Phys: 5, Len: 1},
 		{Offset: 6, Phys: 6, Len: 1},
-		{Offset: 7, Phys: 0, Len: 1, Flags: ExtentFlagHole},
+		{Offset: 7, Phys: 0, Len: 1},
 		{Offset: 8, Phys: 7, Len: 1},
 		{Offset: 9, Phys: 8, Len: 1},
 	}

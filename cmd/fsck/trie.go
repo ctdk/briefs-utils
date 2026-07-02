@@ -84,7 +84,9 @@ func parseTrieSlot(buf []byte, slot uint) (trieSlot, error) {
 
 // extractTrieNodeName reads the name from the trailing bytes of a trie page buffer.
 func extractTrieNodeName(buf []byte, node trieSlot) string {
-	if node.NameLen < 2 || node.NameOffset == 0 {
+	// The kernel stores name_len = 2 (length prefix) + actual name length.
+	maxNameLen := uint16(briefs.BrieFSMaxNameLen + 2)
+	if node.NameLen < 2 || node.NameLen > maxNameLen || node.NameOffset == 0 {
 		return ""
 	}
 	if int(node.NameOffset) > len(buf) {
@@ -96,6 +98,10 @@ func extractTrieNodeName(buf []byte, node trieSlot) string {
 	}
 	storedLen := int(binary.LittleEndian.Uint16(buf[nameStart:]))
 	if storedLen < 1 || storedLen > briefs.BrieFSMaxNameLen {
+		return ""
+	}
+	// NameLen in the slot must match the 2-byte prefix + stored name length.
+	if uint16(storedLen)+2 != node.NameLen {
 		return ""
 	}
 	if nameStart+2+storedLen > len(buf) {

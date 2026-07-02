@@ -203,11 +203,12 @@ func verifyExtentOverlaps(fs *fsckState) {
 	var allExtents []extentRef
 
 	addExtent := func(ino uint64, ext briefs.Extent) {
-		// Skip hole extents — no physical backing
-		if ext.Flags&briefs.ExtentFlagHole != 0 {
+		// A hole has no physical backing (Phys == 0). Unwritten extents are
+		// fully allocated and must be counted.
+		if ext.Phys == 0 {
 			return
 		}
-		if ext.Flags&^(uint32(briefs.ExtentFlagHole|briefs.ExtentFlagEof)) != 0 {
+		if ext.Flags&^uint32(briefs.ExtentFlagUnwritten) != 0 {
 			fs.warnf("ino %d: extent with unknown flags 0x%08X (phys=%d, len=%d)",
 				ino, ext.Flags, ext.Phys, ext.Len)
 		}

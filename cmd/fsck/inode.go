@@ -209,12 +209,13 @@ func collectInodeExtents(fs *fsckState, ino uint64, in *briefs.Inode, blockSize 
 		return
 	}
 
-	// Record the blocks from a single extent (skips hole extents).
+	// Record the blocks from a single extent. A hole has no physical backing
+	// (Phys == 0); unwritten extents are fully backed and must be counted.
 	addExtentBlocks := func(ext briefs.Extent) error {
-		if ext.Flags&briefs.ExtentFlagHole != 0 {
+		if ext.Phys == 0 {
 			return nil
 		}
-		if ext.Flags&^(uint32(briefs.ExtentFlagHole|briefs.ExtentFlagEof)) != 0 {
+		if ext.Flags&^uint32(briefs.ExtentFlagUnwritten) != 0 {
 			fs.warnf("ino %d: extent with unknown flags 0x%08X (phys=%d, len=%d)",
 				ino, ext.Flags, ext.Phys, ext.Len)
 		}

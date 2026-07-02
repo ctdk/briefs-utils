@@ -35,9 +35,11 @@ const (
 
 	// Journal flags. Not much here yet.
 	JRN_FLAGS_NONE = 0
+)
 
-	// Journal record types — mirrors briefs.h enum journal_record_type.
-	// These are used by fsck and mkfs to avoid magic numbers.
+// Journal record types — mirrors briefs.h enum journal_record_type.
+// These are used by fsck and mkfs to avoid magic numbers.
+const (
 	JRN_NONE = iota
 	JRN_EXTENT_ALLOC
 	JRN_EXTENT_FREE
@@ -49,7 +51,13 @@ const (
 	JRN_CHECKPOINT
 	JRN_INODE_FULL
 	JRN_SYMLINK_DATA
+	JRN_XATTR_DATA
+	JRN_END
+)
 
+// Trie, inode, extent, superblock and feature bits — mirrors the rest of
+// briefs.h.
+const (
 	// Trie node types — mirrors briefs.h NODE_TYPE_* / NODE_STATUS_*
 	NodeTypeFile     = 0x01
 	NodeTypeDir      = 0x02
@@ -72,9 +80,12 @@ const (
 	InodeFlagIndexed     = 0x00000004
 	InodeFlagInlineData  = 0x00000008
 
-	// Extent flags
-	ExtentFlagHole = 0x00000001
-	ExtentFlagEof  = 0x80000000
+	// Extent flags — mirrors briefs.h BRIEFS_EXT_*.
+	// A hole is indicated by Phys == 0, not by a flag.  BRIEFS_EXT_UNWRITTEN
+	// marks fallocate()-allocated extents that have not yet been written to;
+	// their blocks are zeroed on allocation and convert to ordinary data on the
+	// first write.
+	ExtentFlagUnwritten = 0x00000001
 
 	// Superblock reserved area padding. Matches _BRIEFS_SUPER_RESERVED in
 	// briefs.h in the kernel module.
@@ -90,6 +101,12 @@ const (
 	// from being nearly infinite in length, but POSIX caps the name length
 	// to 255.
 	BrieFSMaxNameLen = 255
+
+	// BrieFS xattr block version. Matches BRIEFS_XATTR_VERSION in the kernel.
+	BrieFSXattrVersion = 2
+
+	// BrieFS xattr block flags. Matches BRIEFS_XATTR_FLAG_CONT in the kernel.
+	BrieFSXattrFlagCont = 0x00000001
 
 	// Volume labels are straight up allocated 64 bytes, though. I don't
 	// know if that's for a reason or what, but I don't care that much. This
@@ -165,7 +182,7 @@ func nextPowerOf2(n uint64) uint64 {
 // Keeping extents in the main briefs.go file for the time being, until there's
 // more going on.
 
-// Extent represents a file extent (16 bytes).
+// Extent represents a file extent (32 bytes).
 type Extent struct {
 	Offset uint64
 	Phys   uint64

@@ -47,8 +47,8 @@ type SuperblockLayout struct {
 	TrieBlocksUsed uint64  // offset 200
 	TrieNodePoolStart uint64  // offset 208
 	TrieNodePoolSize  uint64  // offset 216
-	InodeBMOffset  uint64  // offset 216
-	InodeBMBlocks  uint64  // offset 224
+	InodeBMOffset  uint64  // offset 224
+	InodeBMBlocks  uint64  // offset 232
 	InodeTableOffset uint64  // offset 232 (replaces data_bitmap_offset + data_bitmap_blocks)
 	JournalOffset  uint64  // offset 240
 	JournalBlocks  uint64  // offset 248

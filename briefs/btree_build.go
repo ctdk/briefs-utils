@@ -8,7 +8,7 @@ import (
 // B-tree construction helpers (Phase 4 rebuild-from-extents). They are the
 // inverse of the readers in btree.go: pack extents into leaves (126/leaf), build
 // internal idx levels bottom-up (up to 254 children per node), checksum each
-// node, and write them out. Holes (ExtentFlagHole) are preserved verbatim.
+// node, and write them out. Holes (Phys == 0) are preserved verbatim.
 //
 // alloc is a caller-supplied block allocator returning ABSOLUTE block numbers
 // (the fsck caller wraps plan.dataAlloc.AllocateBlock()+dataRegionStart so the

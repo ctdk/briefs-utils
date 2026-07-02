@@ -646,7 +646,7 @@ func TestFsckRepairCompactDirectoryTrie(t *testing.T) {
 	binary.LittleEndian.PutUint16(leafPage[10:], 0)
 	binary.LittleEndian.PutUint64(leafPage[12:], ^uint64(1)) // slot 0 used
 	nameOff := writeTrieName(leafPage, 4096, "test")
-	writeTrieNode(leafPage, 0, 0, 0, targetIno, uint16(len("test")), nameOff,
+	writeTrieNode(leafPage, 0, 0, 0, targetIno, uint16(len("test")+2), nameOff,
 		uint8(len("test")), briefs.NodeTypeInterm|briefs.NodeStatusLeaf, 't', 8, 0, 0)
 	if _, err := f.WriteAt(leafPage, int64(extraTrieBlock*4096)); err != nil {
 		t.Fatalf("write leaf trie page: %v", err)
@@ -763,7 +763,7 @@ func TestFsckCompactTrieNameLenField(t *testing.T) {
 	binary.LittleEndian.PutUint64(page[12:], ^(uint64(1<<0)|uint64(1<<1))) // slots 0,1 used
 	leafRef := briefs.TrieMakeRef(rootTrieBlock, 1)
 	writeTrieNode(page, 0, leafRef, 0, 0, 0, 0, 0, briefs.NodeTypeInterm, 0, 0, 0, 1)
-	writeTrieNode(page, 1, 0, 0, targetIno, uint16(len(name)), nameOff,
+	writeTrieNode(page, 1, 0, 0, targetIno, uint16(len(name)+2), nameOff,
 		uint8(len(name)), briefs.NodeTypeInterm|briefs.NodeStatusLeaf, name[0], 8, 0, 0)
 	if _, err := f.WriteAt(page, int64(rootTrieBlock*4096)); err != nil {
 		t.Fatalf("write trie page: %v", err)
@@ -960,9 +960,9 @@ func TestFsckRepairLinkCounts(t *testing.T) {
 	leafFileRef := briefs.TrieMakeRef(rootTrieBlock, 1)
 	leafDirRef := briefs.TrieMakeRef(rootTrieBlock, 2)
 	writeTrieNode(rootPage, 0, leafFileRef, 0, 0, 0, 0, 0, briefs.NodeTypeInterm, 0, 0, 0, 2)
-	writeTrieNode(rootPage, 1, 0, leafDirRef, fileIno, uint16(len("file")), nameOffFile,
+	writeTrieNode(rootPage, 1, 0, leafDirRef, fileIno, uint16(len("file")+2), nameOffFile,
 		1, briefs.NodeTypeInterm|briefs.NodeStatusLeaf, 'f', 8, 0, 0)
-	writeTrieNode(rootPage, 2, 0, 0, dirIno, uint16(len("dir")), nameOffDir,
+	writeTrieNode(rootPage, 2, 0, 0, dirIno, uint16(len("dir")+2), nameOffDir,
 		1, briefs.NodeTypeInterm|briefs.NodeStatusLeaf, 'd', 4, 0, 0)
 
 	if _, err := f.WriteAt(rootPage, int64(rootTrieBlock*4096)); err != nil {
@@ -1318,9 +1318,9 @@ func writeCombinedFixture(t *testing.T, mkfsPath, imgPath string, corruptNlinks 
 	leafFileRef := briefs.TrieMakeRef(rootTrieBlock, 1)
 	leafDirRef := briefs.TrieMakeRef(rootTrieBlock, 2)
 	writeTrieNode(rootPage, 0, leafFileRef, 0, 0, 0, 0, 0, briefs.NodeTypeInterm, 0, 0, 0, 2)
-	writeTrieNode(rootPage, 1, 0, leafDirRef, fileIno, uint16(len("file")), nameOffFile,
+	writeTrieNode(rootPage, 1, 0, leafDirRef, fileIno, uint16(len("file")+2), nameOffFile,
 		1, briefs.NodeTypeInterm|briefs.NodeStatusLeaf, 'f', 8, 0, 0)
-	writeTrieNode(rootPage, 2, 0, 0, dirIno, uint16(len("dir")), nameOffDir,
+	writeTrieNode(rootPage, 2, 0, 0, dirIno, uint16(len("dir")+2), nameOffDir,
 		1, briefs.NodeTypeInterm|briefs.NodeStatusLeaf, 'd', 4, 0, 0)
 	if _, err := f.WriteAt(rootPage, int64(rootTrieBlock*4096)); err != nil {
 		t.Fatalf("write root trie page: %v", err)
@@ -2127,11 +2127,11 @@ func TestFsckRepairBtreeChecksums(t *testing.T) {
 // prepareIndexedBtreeFixtureExtents mkfs's a 5000-block image and writes a
 // correct tree-backed inode 2 holding the given (already sorted) extents,
 // marking all non-hole data blocks, node blocks, and inode 2 allocated. Hole
-// extents (ExtentFlagHole, Phys=0) consume no data block. Non-hole extents must
-// carry contiguous Phys starting at abs 120 (data-rel 30) so the data+node
-// blocks form one contiguous allocated range. Returns the image path and the
-// tree root absolute block. Uses the briefs builders so the tree is
-// reader-valid by construction.
+// extents (Phys == 0) consume no data block. Non-hole extents must carry
+// contiguous Phys starting at abs 120 (data-rel 30) so the data+node blocks
+// form one contiguous allocated range. Returns the image path and the tree root
+// absolute block. Uses the briefs builders so the tree is reader-valid by
+// construction.
 func prepareIndexedBtreeFixtureExtents(t *testing.T, extents []briefs.Extent) (imgPath string, rootAbs uint64, leafBlocks []uint64) {
 	t.Helper()
 	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
@@ -2147,7 +2147,7 @@ func prepareIndexedBtreeFixtureExtents(t *testing.T, extents []briefs.Extent) (i
 	// Non-hole extents' Phys are abs 120.. (data-rel 30..); node blocks follow.
 	nNonHole := 0
 	for _, e := range extents {
-		if e.Flags&briefs.ExtentFlagHole == 0 && e.Len > 0 && e.Phys > 0 {
+		if e.Len > 0 && e.Phys > 0 {
 			nNonHole++
 		}
 	}
@@ -2488,14 +2488,14 @@ func TestFsckRebuildBtreeIndex(t *testing.T) {
 	})
 
 	// rebuild_hole_preservation: a 10-extent tree with holes at offsets 3 and 7
-	// (ExtentFlagHole, Phys=0) is rebuilt (count mismatch) and the holes survive
-	// verbatim in the fresh tree.
+	// (Phys == 0) is rebuilt (count mismatch) and the holes survive verbatim in
+	// the fresh tree.
 	t.Run("rebuild_hole_preservation", func(t *testing.T) {
 		extents := make([]briefs.Extent, 10)
 		phys := uint64(120)
 		for i := 0; i < 10; i++ {
 			if i == 3 || i == 7 {
-				extents[i] = briefs.Extent{Offset: uint64(i), Phys: 0, Len: 1, Flags: briefs.ExtentFlagHole}
+				extents[i] = briefs.Extent{Offset: uint64(i), Phys: 0, Len: 1}
 			} else {
 				extents[i] = briefs.Extent{Offset: uint64(i), Phys: phys, Len: 1}
 				phys++
@@ -2529,11 +2529,11 @@ func TestFsckRebuildBtreeIndex(t *testing.T) {
 			}
 			isHole := i == 3 || i == 7
 			if isHole {
-				if e.Flags&briefs.ExtentFlagHole == 0 || e.Phys != 0 {
-					t.Errorf("extent %d: expected hole (Phys=0, Hole flag), got phys=%d flags=0x%X", i, e.Phys, e.Flags)
+				if e.Phys != 0 {
+					t.Errorf("extent %d: expected hole (Phys=0), got phys=%d flags=0x%X", i, e.Phys, e.Flags)
 				}
 			} else {
-				if e.Flags&briefs.ExtentFlagHole != 0 || e.Phys == 0 {
+				if e.Phys == 0 {
 					t.Errorf("extent %d: expected non-hole, got phys=%d flags=0x%X", i, e.Phys, e.Flags)
 				}
 			}

@@ -23,7 +23,9 @@ import (
 // AllocMagic is the magic number for the allocator pool header block.
 const AllocMagic = 0x4249544D // "BITM"
 
-// AllocHeader is the on-disk header for the allocator pool (first block of the pool).
+// AllocHeader is the on-disk header for the allocator pool (first block of the
+// pool). It is exactly 48 bytes, matching the kernel's struct
+// alloc_pool_header.
 type AllocHeader struct {
 	Magic      uint32 // "BITM"
 	Version    uint32 // 1
@@ -32,7 +34,6 @@ type AllocHeader struct {
 	L2Words    uint64 // words in level 2
 	BlockCount uint64 // total data blocks tracked
 	FreeCount  uint64 // total free blocks
-	Reserved   [6]uint64
 }
 
 // AllocBuilder builds the 3-level bitmap allocator.
@@ -253,7 +254,7 @@ func (b *AllocBuilder) WriteBlocks() [][]byte {
 		FreeCount:  b.FreeCount,
 	}
 	hdrBuf := make([]byte, 4096)
-	hdrData := make([]byte, 8+8+8+8+8+8+48) // 96 bytes
+	hdrData := make([]byte, 48) // 8 bytes u64 * 6 + 2 * 4 bytes u32
 	pos := 0
 	binary.LittleEndian.PutUint32(hdrData[pos:], hdr.Magic)
 	pos += 4

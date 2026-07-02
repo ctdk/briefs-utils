@@ -330,8 +330,8 @@ func btreeCollectSubtree(fs *fsckState, ino, block, blockSize uint64, visited ma
 }
 
 // sortDedupExtents sorts extents ascending by Offset and drops any duplicate
-// offsets (keeping the first). Hole extents (ExtentFlagHole) are ordinary
-// extents with a unique offset and are preserved with their Flags/Phys/Len.
+// offsets (keeping the first). Hole extents (Phys == 0) are ordinary extents
+// with a unique offset and are preserved with their Flags/Phys/Len.
 func sortDedupExtents(extents []briefs.Extent) []briefs.Extent {
 	sort.Slice(extents, func(i, j int) bool { return extents[i].Offset < extents[j].Offset })
 	out := make([]briefs.Extent, 0, len(extents))
