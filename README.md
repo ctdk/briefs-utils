@@ -18,7 +18,7 @@ USAGE:
    mkfs.briefs [global options] command [command options] DEVICE
 
 VERSION:
-   v0.9.2
+   v0.9.3
 
 COMMANDS:
    help, h  Shows a list of commands or help for one command
@@ -38,7 +38,7 @@ GLOBAL OPTIONS:
 fsck.briefs
 -----------
 
-The idea with `fsck.briefs` is that it will repair broken, mangled, and mutilated BrieFS volumes. It performs a growing list of consistency checks, including CRC32C verification of journal records and B+ tree extent index nodes, structural validation of those B+ trees (high-key monotonicity, child-pointer range/level, leaf prev/next linkage, cross-leaf key ordering, extent-count agreement), and validation of the packed directory trie pages used by BrieFS 0.7.0+.
+The idea with `fsck.briefs` is that it will repair broken, mangled, and mutilated BrieFS volumes. It performs a growing list of consistency checks, including CRC32C verification of journal records and B+ tree extent index nodes, structural validation of those B+ trees (high-key monotonicity, child-pointer range/level, leaf prev/next linkage, cross-leaf key ordering, extent-count agreement), validation of the packed directory trie pages used by BrieFS 0.7.0+, and validation of inode extended-attribute chains (magic, header version, used_size, CRC32C, entry bounds, continuation blocks, and chain length/loop detection).
 
 Repairs are organized into phases, selectable with `--repair-only` (comma-separated):
 
@@ -62,7 +62,7 @@ USAGE:
    fsck.briefs [global options] command [command options] DEVICE
 
 VERSION:
-   v0.9.2
+   v0.9.3
 
 COMMANDS:
    help, h  Shows a list of commands or help for one command
@@ -90,7 +90,7 @@ USAGE:
    briefs-fuse [global options] command [command options]
 
 VERSION:
-   v0.9.2
+   v0.9.3
 
 COMMANDS:
    help, h  Shows a list of commands or help for one command

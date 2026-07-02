@@ -3,5 +3,9 @@
 * The codebase is starting to feel a bit hairy. It could stand another round of
   refactoring.
 * The FUSE bridge is read-only right now. It should be read-write.
-* Make mkfs.briefs and fsck.briefs' command line flags match the usual standards
-  more to support xfstests better (and for better general interoperability).
+* [Done for xfstests] mkfs.briefs and fsck.briefs command line flags are
+  sufficiently xfstests-compatible (force flag `-f`, check-only default,
+  `-r -y` repair shape). Further standards alignment may be useful.
+* [Done] fsck.briefs validates inode extended-attribute chains (magic, header
+  version, used_size, CRC32C, entry bounds, continuation blocks, chain length
+  and loop detection) and records xattr blocks in the allocator cross-reference.
