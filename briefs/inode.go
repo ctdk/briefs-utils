@@ -43,7 +43,8 @@ type Inode struct {
 	DirTrieRoot       uint64
 	Rdev              uint64
 	Generation        uint64 // inode generation for stable NFS file handles
-	Reserved          [72]byte
+	UserFlags         uint32
+	Reserved          [68]byte
 }
 
 // InlineData returns the 256-byte raw inline data region of the inode.
