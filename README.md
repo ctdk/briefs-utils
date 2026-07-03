@@ -8,7 +8,11 @@ The filesystem utils for BrieFS (`mkfs.briefs`, `fsck.briefs`, `fuse.briefs`).
 mkfs.briefs
 -----------
 
-Creates new BrieFS volumes. It formats new filesystems with the on-disk v0.9.0 format: the packed directory trie layout plus a B+ tree extent index for files with more than eight extents.
+Creates new BrieFS volumes. It formats new filesystems with the on-disk v0.9.0
+format: the packed directory trie layout plus a B+ tree extent index for files
+with more than eight extents. Inodes include a `user_flags` field that stores
+chattr/lsattr-visible flags (sync, dirsync, immutable, append-only, nodump,
+noatime).
 
 ```
 NAME:
@@ -38,7 +42,7 @@ GLOBAL OPTIONS:
 fsck.briefs
 -----------
 
-The idea with `fsck.briefs` is that it will repair broken, mangled, and mutilated BrieFS volumes. It performs a growing list of consistency checks, including CRC32C verification of journal records and B+ tree extent index nodes, structural validation of those B+ trees (high-key monotonicity, child-pointer range/level, leaf prev/next linkage, cross-leaf key ordering, extent-count agreement), validation of the packed directory trie pages used by BrieFS 0.7.0+, and validation of inode extended-attribute chains (magic, header version, used_size, CRC32C, entry bounds, continuation blocks, and chain length/loop detection).
+The idea with `fsck.briefs` is that it will repair broken, mangled, and mutilated BrieFS volumes. It performs a growing list of consistency checks, including CRC32C verification of journal records and B+ tree extent index nodes, structural validation of those B+ trees (high-key monotonicity, child-pointer range/level, leaf prev/next linkage, cross-leaf key ordering, extent-count agreement), validation of the packed directory trie pages used by BrieFS 0.7.0+, validation of inode extended-attribute chains (magic, header version, used_size, CRC32C, entry bounds, continuation blocks, and chain length/loop detection), and preservation of the inode `user_flags` field used for chattr/lsattr flags.
 
 Repairs are organized into phases, selectable with `--repair-only` (comma-separated):
 

@@ -9,3 +9,7 @@
 * [Done] fsck.briefs validates inode extended-attribute chains (magic, header
   version, used_size, CRC32C, entry bounds, continuation blocks, chain length
   and loop detection) and records xattr blocks in the allocator cross-reference.
+* [Done] Keep the Go `Inode` struct in sync with the kernel on-disk inode
+  layout. The `user_flags` field (carved from reserved padding) is now mirrored
+  in `briefs/inode.go` and `gen_disk.go` so mkfs/fsck agree with the driver on
+  inode size and field placement.
