@@ -240,11 +240,18 @@ func (n *brieFSNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 		if ino == 0 {
 			break
 		}
+		// ftype is S_IFMT >> 12 (4=dir, 8=reg, 10=symlink, etc.)
+		// Map to FUSE mode bits
 		var mode uint32
 		switch ftype {
-		case trieNodeTypeDir:
+		case 4: // S_IFDIR
 			mode = uint32(briefs.ModeDir)
+		case 8: // S_IFREG
+			mode = uint32(briefs.ModeFile)
+		case 10: // S_IFLNK
+			mode = uint32(briefs.ModeSymlink)
 		default:
+			// Unknown type, default to regular file
 			mode = uint32(briefs.ModeFile)
 		}
 		entries = append(entries, fuse.DirEntry{
@@ -307,6 +314,33 @@ func (n *brieFSNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off
 		return nil, syscall.EIO
 	}
 	for _, ext := range exts {
+		// Holes have Phys == 0. Return zeros for hole regions.
+		if ext.Phys == 0 {
+			holeStart := int64(ext.Offset) * blkSize
+			holeEnd := holeStart + int64(ext.Len)*blkSize
+			if off >= holeEnd || endOff <= holeStart {
+				continue
+			}
+			// Zero the overlapping region
+			zeroStart := off
+			if zeroStart < holeStart {
+				zeroStart = holeStart
+			}
+			zeroEnd := endOff
+			if zeroEnd > holeEnd {
+				zeroEnd = holeEnd
+			}
+			// Zero the corresponding portion of the buffer
+			bufPos := zeroStart - off
+			bufLen := zeroEnd - zeroStart
+			if bufPos >= 0 && bufLen > 0 && bufPos < int64(len(readBuf)) {
+				for i := bufPos; i < bufPos+bufLen && i < int64(len(readBuf)); i++ {
+					readBuf[i] = 0
+				}
+			}
+			continue
+		}
+
 		extStart := int64(ext.Offset) * blkSize
 		extEnd := extStart + int64(ext.Len)*blkSize
 

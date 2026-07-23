@@ -2,6 +2,7 @@
 package fuse
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 )
@@ -29,7 +30,14 @@ func OpenBlockDevice(path string) (*BlockDevice, uint64, error) {
 		return nil, 0, fmt.Errorf("read superblock probe: %w", err)
 	}
 
-	blockSize := uint64(4096) // default, matches DefaultBlockSize
+	// Extract block size from superblock at offset 48 (8 bytes, little-endian).
+	// This matches the BlockSize field in SuperblockLayout.
+	blockSize := binary.LittleEndian.Uint64(probe[48:56])
+	if blockSize == 0 || blockSize > 4096 || (blockSize&(blockSize-1)) != 0 {
+		// Invalid or non-power-of-2 block size; fall back to default 4096.
+		// This handles older images or corrupted superblocks gracefully.
+		blockSize = 4096
+	}
 
 	bd := &BlockDevice{
 		file:      f,

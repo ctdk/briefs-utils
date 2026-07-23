@@ -218,7 +218,13 @@ func IterateInodeExtents(file *os.File, in *Inode, blockSize uint64, v InodeExte
 	// Inline-only: walk the inline array (already sorted).
 	if in.Flags&InodeFlagIndexed == 0 {
 		inlineExtents := in.InlineExtents()
-		for ei := uint32(0); ei < in.NumExtentsInline; ei++ {
+		// Cap NumExtentsInline to 8 (the fixed inline extent array size).
+		// Malformed inodes could have a larger value, which would panic.
+		maxExtents := in.NumExtentsInline
+		if maxExtents > 8 {
+			maxExtents = 8
+		}
+		for ei := uint32(0); ei < maxExtents; ei++ {
 			if v.VisitExtent != nil {
 				if err := v.VisitExtent(inlineExtents[ei]); err != nil {
 					return err

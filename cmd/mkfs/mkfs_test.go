@@ -152,31 +152,44 @@ func TestMkfsDefaultGeometry(t *testing.T) {
 
 // TestMkfsCustomBlockSize checks that valid non-default block sizes are accepted.
 // The packed directory trie format requires at least a 4096-byte block, so only
-// 4096 and 8192 are exercised here.
+// Block size validation: only 4096 is actually supported by the kernel.
+// This test verifies 4096 works and other sizes are rejected.
 func TestMkfsCustomBlockSize(t *testing.T) {
 	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
 	fsckPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
 
-	for _, bs := range []string{"4096", "8192"} {
+	// 4096 is the only fully supported block size
+	imgPath := filepath.Join(t.TempDir(), "bs-4096.briefs")
+	cmd := exec.Command(mkfsPath, "-s", "5000", "-b", "4096", imgPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("mkfs with block-size 4096 failed: %v\n%s", err, out)
+	}
+
+	cmd = exec.Command(fsckPath, imgPath)
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fsck with block-size 4096 failed: %v\n%s", err, out)
+	}
+	if !contains(string(out), "FSCK COMPLETE: no errors found") {
+		t.Errorf("fsck with block-size 4096 did not report clean:\n%s", out)
+	}
+
+	// Verify non-4096 sizes are rejected
+	for _, bs := range []string{"1024", "2048", "8192"} {
 		imgPath := filepath.Join(t.TempDir(), "bs-"+bs+".briefs")
 		cmd := exec.Command(mkfsPath, "-s", "5000", "-b", bs, imgPath)
 		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("mkfs with block-size %s failed: %v\n%s", bs, err, out)
+		if err == nil {
+			t.Fatalf("mkfs with block-size %s should have failed", bs)
 		}
-
-		cmd = exec.Command(fsckPath, imgPath)
-		out, err = cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("fsck with block-size %s failed: %v\n%s", bs, err, out)
-		}
-		if !contains(string(out), "FSCK COMPLETE: no errors found") {
-			t.Errorf("fsck with block-size %s did not report clean:\n%s", bs, out)
+		if !contains(string(out), "must be 4096") {
+			t.Errorf("mkfs did not report 4096 block-size requirement for %s:\n%s", bs, out)
 		}
 	}
 }
 
-// TestMkfsInvalidBlockSize verifies rejection of non-power-of-two block sizes.
+// TestMkfsInvalidBlockSize verifies rejection of non-4096 block sizes.
 func TestMkfsInvalidBlockSize(t *testing.T) {
 	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
 
@@ -184,25 +197,38 @@ func TestMkfsInvalidBlockSize(t *testing.T) {
 	cmd := exec.Command(mkfsPath, "-s", "5000", "-b", "3000", imgPath)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		t.Fatal("mkfs should have failed with non-power-of-two block size")
+		t.Fatal("mkfs should have failed with block-size 3000")
 	}
-	if !contains(string(out), "power of two") {
-		t.Errorf("mkfs did not report power-of-two error:\n%s", out)
+	if !contains(string(out), "must be 4096") {
+		t.Errorf("mkfs did not report 4096 requirement:\n%s", out)
 	}
 }
 
-// TestMkfsInvalidInodeSize verifies rejection of non-power-of-two inode sizes.
+// TestMkfsInvalidInodeSize verifies rejection of invalid inode sizes.
+// Values below 512 are rejected, as are non-power-of-two values >= 512.
 func TestMkfsInvalidInodeSize(t *testing.T) {
 	mkfsPath := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/mkfs", "mkfs.briefs")
 
+	// Test below minimum (300 < 512)
 	imgPath := filepath.Join(t.TempDir(), "invalid.briefs")
 	cmd := exec.Command(mkfsPath, "-s", "5000", "--inode-size", "300", imgPath)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		t.Fatal("mkfs should have failed with non-power-of-two inode size")
+		t.Fatal("mkfs should have failed with inode-size 300 (below 512 minimum)")
 	}
-	if !contains(string(out), "power of two") {
-		t.Errorf("mkfs did not report power-of-two error:\n%s", out)
+	if !contains(string(out), "at least 512") {
+		t.Errorf("mkfs did not report minimum inode-size error:\n%s", out)
+	}
+
+	// Test non-power-of-two >= 512 (e.g., 600)
+	imgPath2 := filepath.Join(t.TempDir(), "invalid2.briefs")
+	cmd2 := exec.Command(mkfsPath, "-s", "5000", "--inode-size", "600", imgPath2)
+	out2, err2 := cmd2.CombinedOutput()
+	if err2 == nil {
+		t.Fatal("mkfs should have failed with non-power-of-two inode-size 600")
+	}
+	if !contains(string(out2), "power of two") {
+		t.Errorf("mkfs did not report power-of-two error for 600:\n%s", out2)
 	}
 }
 
