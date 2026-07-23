@@ -120,14 +120,43 @@ func main() {
 			uuidStr := c.String("uuid")
 			force := c.Bool("force")
 
-			// Validate that blockSize and inodeSize are powers of
-			// two.
+			// Validate size parameters are non-negative
+			if totalBlocks < 0 {
+				return fmt.Errorf("size must be non-negative, got %d", totalBlocks)
+			}
+			if c.Int("block-size") < 0 {
+				return fmt.Errorf("block-size must be non-negative, got %d", c.Int("block-size"))
+			}
+			if c.Int("inode-size") < 0 {
+				return fmt.Errorf("inode-size must be non-negative, got %d", c.Int("inode-size"))
+			}
+			if c.Int("journal-size") < 0 {
+				return fmt.Errorf("journal-size must be non-negative, got %d", c.Int("journal-size"))
+			}
+
+			// Enforce block size = 4096 (kernel hardcodes this value)
+			if blockSize != 4096 {
+				return fmt.Errorf("block-size must be 4096 bytes (kernel requirement), got %d", blockSize)
+			}
+
+			// Enforce minimum inode size (>= 512 bytes)
+			if inodeSize < 512 {
+				return fmt.Errorf("inode-size must be at least 512 bytes, got %d", inodeSize)
+			}
+
+			// Validate that blockSize and inodeSize are powers of two.
 			if !isPowerOfTwo(blockSize) {
 				return fmt.Errorf("block-size must be a power of two, which %d isn't", blockSize)
 			}
 			if !isPowerOfTwo(inodeSize) {
 				return fmt.Errorf("inode-size must be a power of two, which %d isn't", inodeSize)
 			}
+
+			// Enforce minimum journal size (>= 4 blocks for ring buffer to function)
+			if journalBlocks < 4 {
+				return fmt.Errorf("journal-size must be at least 4 blocks, got %d", journalBlocks)
+			}
+
 			if inodeRatio < 1 {
 				return fmt.Errorf("inode-ratio must be at least 1, which %d isn't", inodeRatio)
 			}
@@ -185,16 +214,18 @@ func main() {
 			}
 
 			finalDataBlocks := uint64(totalBlocks) - 1 - inodeAllocBlocks - inodeTableBlocks - 1 - journalBlocks
-			builder := briefs.NewAllocBuilder(finalDataBlocks)
+			builder := briefs.NewDataAllocBuilder(finalDataBlocks)
 			allocBlocks := builder.NbBlocks()
 			finalDataBlocks = uint64(totalBlocks) - 1 - inodeAllocBlocks - inodeTableBlocks - 1 - allocBlocks - journalBlocks
 			if finalDataBlocks < 1 {
 				return fmt.Errorf("filesystem too small")
 			}
 
-			// Build final allocator with correct block count
-			finalBuilder := briefs.NewAllocBuilder(finalDataBlocks)
-			finalBuilder.MarkAllocated(0) // root dir block
+			// Build final data allocator with correct block count.
+			// NewDataAllocBuilder reserves block 0 as the ENOSPC sentinel.
+			// Allocate block 1 for the root directory trie.
+			finalBuilder := briefs.NewDataAllocBuilder(finalDataBlocks)
+			finalBuilder.MarkAllocated(1) // root dir block (block 0 is ENOSPC sentinel)
 			allocBlocksFinal := finalBuilder.NbBlocks()
 
 			// --- Compute actual block offsets ---
@@ -353,7 +384,9 @@ func main() {
 
 			// 3. Root directory trie root
 			// Allocate a block for a packed trie page; slot 0 is the root node.
-			rootTrieBlock := dataRegionStart
+			// Block 0 of the data region is reserved as ENOSPC sentinel, so root dir
+			// goes at data-relative block 1 (absolute: dataRegionStart + 1).
+			rootTrieBlock := dataRegionStart + 1
 			trieBlock := make([]byte, blockSize)
 			// Page header (16 bytes)
 			binary.LittleEndian.PutUint32(trieBlock[0:], briefs.MagicTriePage) // "TRNP" magic
@@ -425,7 +458,8 @@ func main() {
 				RecordCount:    1,
 				LogSequenceEnd: journalOffset,
 				TrieRootNode:   0,
-				FreeDataCount:  finalDataBlocks - 1,
+				// Block 0 is ENOSPC sentinel, block 1 is root dir trie.
+				FreeDataCount:  finalDataBlocks - 2,
 				FreeInodeCount: estInodes - 1,
 			}
 			cpData, err := cp.MarshalBinary()
@@ -442,10 +476,10 @@ func main() {
 				return fmt.Errorf("write journal checkpoint at block %d: %w", checkpointBlock, err)
 			}
 
-			// Update superblock's free counts and checkpoint sequence
-			// (1 data block used, 1 inode used, initial checkpoint seq = %d).
-			sb.Lay.FreeDataBlks = finalDataBlocks - 1
-			sb.Lay.FreeInodes = estInodes - 1
+			// Update superblock's free counts and checkpoint sequence.
+			// Block 0 is reserved as ENOSPC sentinel, block 1 is root dir trie.
+			sb.Lay.FreeDataBlks = finalDataBlocks - 2 // -1 for ENOSPC sentinel, -1 for root dir
+			sb.Lay.FreeInodes = estInodes - 1         // -1 for root inode
 			sb.Lay.CheckpointSeq = cp.Seq
 
 			// Write updated superblock after all metadata is on disk.
@@ -495,7 +529,7 @@ func main() {
 }
 
 func isPowerOfTwo(n uint64) bool {
-	return ((n == 0) || ((n & (n - 1)) == 0))
+	return n != 0 && (n&(n-1)) == 0
 }
 
 // zeroBlocks overwrites a range of blocks with zeros.  start is the first

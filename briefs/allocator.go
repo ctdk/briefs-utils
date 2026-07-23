@@ -45,8 +45,9 @@ type AllocBuilder struct {
 	FreeCount  uint64
 }
 
-// NewAllocBuilder creates a builder for the given number of data blocks.
-// All blocks start free.
+// NewAllocBuilder creates a builder for the given number of blocks.
+// All blocks start free. This is used for inode allocators where no
+// block reservation is needed.
 func NewAllocBuilder(dataBlockCount uint64) *AllocBuilder {
 	l2Words := (dataBlockCount + 63) / 64
 	l1Words := (l2Words + 63) / 64
@@ -95,6 +96,21 @@ func NewAllocBuilder(dataBlockCount uint64) *AllocBuilder {
 	}
 	if tail := l1Words % 64; tail != 0 {
 		b.L0[len(b.L0)-1] = (1 << tail) - 1
+	}
+
+	return b
+}
+
+// NewDataAllocBuilder creates a builder for data blocks with block 0
+// reserved as the ENOSPC sentinel (matching kernel behavior).
+// Block 0 is never allocated for data; AllocateBlock returns >= 1 on success.
+func NewDataAllocBuilder(dataBlockCount uint64) *AllocBuilder {
+	b := NewAllocBuilder(dataBlockCount)
+
+	// Reserve block 0 as the ENOSPC sentinel (matches kernel behavior).
+	// This ensures the allocator never returns 0, which is the failure sentinel.
+	if dataBlockCount > 0 {
+		b.MarkAllocated(0)
 	}
 
 	return b

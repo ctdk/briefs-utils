@@ -59,10 +59,17 @@ func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 	// If any directory trie or B+ tree had structural errors, leaked blocks could be
 	// legitimate blocks from unreadable subtrees (or unreached B-tree node/data
 	// blocks of a torn tree), so we downgrade to WARNING in that case.
+	//
+	// Data-relative block 0 is reserved as the ENOSPC sentinel (matching kernel
+	// behavior), so it's expected to be allocated but unused. Skip it.
 	leaked := 0
 	hasFailedTries := len(fs.failedTrieDirs) > 0
 	hasFailedBtrees := len(fs.failedBtreeInos) > 0
 	for relBlk := range allocAllocated {
+		if relBlk == 0 {
+			// Block 0 is the ENOSPC sentinel; expected to be unused.
+			continue
+		}
 		absBlk := dataRegionStart + relBlk
 		if !fs.usedBlocks[absBlk] {
 			if leaked < 20 {
