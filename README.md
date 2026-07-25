@@ -22,7 +22,7 @@ USAGE:
    mkfs.briefs [global options] command [command options] DEVICE
 
 VERSION:
-   v0.9.3
+   v0.9.4
 
 COMMANDS:
    help, h  Shows a list of commands or help for one command
@@ -66,7 +66,7 @@ USAGE:
    fsck.briefs [global options] command [command options] DEVICE
 
 VERSION:
-   v0.9.3
+   v0.9.4
 
 COMMANDS:
    help, h  Shows a list of commands or help for one command
@@ -94,7 +94,7 @@ USAGE:
    briefs-fuse [global options] command [command options]
 
 VERSION:
-   v0.9.3
+   v0.9.4
 
 COMMANDS:
    help, h  Shows a list of commands or help for one command

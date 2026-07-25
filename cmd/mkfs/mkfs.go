@@ -84,8 +84,8 @@ func main() {
 			&cli.IntFlag{
 				Name:     "journal-size",
 				Aliases:  []string{"j"},
-				Value:    64,
-				Usage:    "journal size in blocks",
+				Value:    0,
+				Usage:    "journal size in blocks (0 = auto: scale with volume size)",
 			},
 			&cli.StringFlag{
 				Name:     "label",
@@ -150,6 +150,11 @@ func main() {
 			}
 			if !isPowerOfTwo(inodeSize) {
 				return fmt.Errorf("inode-size must be a power of two, which %d isn't", inodeSize)
+			}
+
+			// Auto-scale journal size when not explicitly set.
+			if journalBlocks == 0 {
+				journalBlocks = briefs.DefaultJournalBlocks(uint64(totalBlocks))
 			}
 
 			// Enforce minimum journal size (>= 4 blocks for ring buffer to function)

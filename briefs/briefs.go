@@ -31,7 +31,8 @@ const (
 	// Default values.
 	DefaultBlockSize   = 4096
 	DefaultInodeSize   = 512
-	DefaultJournalSize = 64 // blocks
+	DefaultJournalMinBlocks = 64   // minimum journal size in blocks
+	DefaultJournalMaxBlocks = 4096 // cap journal at 16 MiB
 
 	// Journal flags. Not much here yet.
 	JRN_FLAGS_NONE = 0
@@ -177,6 +178,23 @@ func nextPowerOf2(n uint64) uint64 {
 	n |= n >> 16
 	n |= n >> 32
 	return n + 1
+}
+
+// DefaultJournalBlocks returns the default journal size for a volume with
+// totalBlocks blocks.  The journal scales as max(64, totalBlocks / 4096),
+// capped at DefaultJournalMaxBlocks (4096 = 16 MiB).  This keeps the journal
+// at 64 blocks for volumes up to ~256K blocks (1 GiB) and grows it
+// proportionally for larger volumes, so the ring does not fill under
+// metadata-heavy workloads.
+func DefaultJournalBlocks(totalBlocks uint64) uint64 {
+	n := totalBlocks / 4096
+	if n < DefaultJournalMinBlocks {
+		n = DefaultJournalMinBlocks
+	}
+	if n > DefaultJournalMaxBlocks {
+		n = DefaultJournalMaxBlocks
+	}
+	return n
 }
 
 // Keeping extents in the main briefs.go file for the time being, until there's
