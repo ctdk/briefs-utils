@@ -117,7 +117,7 @@ const (
 	// BrieFS version numbers for this version of briefs-utils
 	BrieFSMajorVersion = 0
 	BrieFSMinorVersion = 9
-	BrieFSPatchVersion = 4
+	BrieFSPatchVersion = 5
 
 	// feature_incompat bits (superblock FeatIncompat field). A clean break gates
 	// the on-disk format: mkfs sets the bits for the features it writes;
