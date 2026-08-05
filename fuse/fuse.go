@@ -175,6 +175,10 @@ var _ = (fs.NodeReaddirer)((*brieFSNode)(nil))
 var _ = (fs.NodeOpener)((*brieFSNode)(nil))
 var _ = (fs.NodeReader)((*brieFSNode)(nil))
 var _ = (fs.NodeStatfser)((*brieFSNode)(nil))
+var _ = (fs.NodeCreater)((*brieFSNode)(nil))
+var _ = (fs.NodeMkdirer)((*brieFSNode)(nil))
+var _ = (fs.NodeUnlinker)((*brieFSNode)(nil))
+var _ = (fs.NodeRmdirer)((*brieFSNode)(nil))
 
 // collectExtents returns every extent of an inode in ascending offset order,
 // via briefs.IterateInodeExtents (which dispatches on InodeFlagIndexed: inline
@@ -330,10 +334,10 @@ func (n *brieFSNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 }
 
 func (n *brieFSNode) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
-	// Read-only filesystem — reject anything that requests write access
-	if acc := flags & 3; acc == 1 || acc == 2 || acc == 3 {
-		return nil, 0, syscall.EROFS
-	}
+	// The bridge is now read-write; file data writes land in Phase 5. For
+	// now accept read opens and write opens alike (a write open on a regular
+	// file simply has no Write handler yet, so writes will ENOSYS until Phase
+	// 5 wires them up).
 	return nil, fuse.FOPEN_KEEP_CACHE, 0
 }
 
@@ -458,4 +462,103 @@ func (n *brieFSNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Er
 	out.Bsize = uint32(n.bfs.blockSize)
 	out.NameLen = uint32(briefs.BrieFSMaxNameLen)
 	return 0
+}
+
+// errToErrno maps a Go error to a FUSE errno.  syscall.Errno values pass through
+// unchanged; anything else is treated as an I/O error.
+func errToErrno(err error) syscall.Errno {
+	if err == nil {
+		return 0
+	}
+	if e, ok := err.(syscall.Errno); ok {
+		return e
+	}
+	return syscall.EIO
+}
+
+// callerCreds extracts the invoking process's uid/gid from the FUSE request
+// context.  On failure (no caller attached) it defaults to root.
+func callerCreds(ctx context.Context) (uid, gid uint32) {
+	if c, ok := fuse.FromContext(ctx); ok && c != nil {
+		return c.Uid, c.Gid
+	}
+	return 0, 0
+}
+
+// fillEntryOut populates a FUSE EntryOut from an on-disk inode, including the
+// block count derived from its extents.
+func (n *brieFSNode) fillEntryOut(out *fuse.EntryOut, in *briefs.Inode) {
+	out.Mode = in.Filemode
+	out.Size = in.FileSize
+	out.Uid = in.Uid
+	out.Gid = in.Gid
+	out.Nlink = in.Nlinks
+	out.Atime = in.AtimeSec
+	out.Atimensec = uint32(in.AtimeNsec)
+	out.Mtime = in.MtimeSec
+	out.Mtimensec = uint32(in.MtimeNsec)
+	out.Ctime = in.CtimeSec
+	out.Ctimensec = uint32(in.CtimeNsec)
+
+	var totalBlocks uint64
+	exts, err := n.collectExtents(in)
+	if err == nil {
+		for _, ext := range exts {
+			totalBlocks += ext.Len
+		}
+	}
+	out.Blocks = totalBlocks * (n.bfs.blockSize / 512)
+	out.Blksize = uint32(n.bfs.blockSize)
+}
+
+// newChildNode wraps a freshly created inode in a go-fuse Inode linked to its
+// parent (this node).
+func (n *brieFSNode) newChildNode(ctx context.Context, in *briefs.Inode) *fs.Inode {
+	child := &brieFSNode{bfs: n.bfs, ino: in.InodeNumber}
+	return n.NewInode(ctx, child, fs.StableAttr{
+		Ino:  in.InodeNumber,
+		Mode: in.Filemode,
+	})
+}
+
+// Create handles O_CREAT.  Mirrors briefs_create (dir.c:369).
+func (n *brieFSNode) Create(ctx context.Context, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	n.bfs.mu.Lock()
+	defer n.bfs.mu.Unlock()
+
+	uid, gid := callerCreds(ctx)
+	child, err := n.bfs.createInDir(n.ino, name, briefs.ModeFile|mode, uid, gid, flags&syscall.O_EXCL != 0)
+	if err != nil {
+		return nil, nil, 0, errToErrno(err)
+	}
+	n.fillEntryOut(out, child)
+	return n.newChildNode(ctx, child), nil, fuse.FOPEN_KEEP_CACHE, 0
+}
+
+// Mkdir handles directory creation.  Mirrors briefs_mkdir (dir.c:414).
+func (n *brieFSNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	n.bfs.mu.Lock()
+	defer n.bfs.mu.Unlock()
+
+	uid, gid := callerCreds(ctx)
+	child, err := n.bfs.createInDir(n.ino, name, briefs.ModeDir|mode, uid, gid, false)
+	if err != nil {
+		return nil, errToErrno(err)
+	}
+	n.fillEntryOut(out, child)
+	return n.newChildNode(ctx, child), 0
+}
+
+// Unlink handles file removal.  Mirrors briefs_unlink (dir.c:680).
+func (n *brieFSNode) Unlink(ctx context.Context, name string) syscall.Errno {
+	n.bfs.mu.Lock()
+	defer n.bfs.mu.Unlock()
+	return errToErrno(n.bfs.unlinkInDir(n.ino, name, false))
+}
+
+// Rmdir handles directory removal.  Mirrors briefs_rmdir (dir.c:702).
+func (n *brieFSNode) Rmdir(ctx context.Context, name string) syscall.Errno {
+	n.bfs.mu.Lock()
+	defer n.bfs.mu.Unlock()
+	return errToErrno(n.bfs.unlinkInDir(n.ino, name, true))
 }

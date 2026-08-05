@@ -174,14 +174,16 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 				// succeeded; populates failedBtreeInos on structural faults.
 				verifyBtreeStructures(fs, ino, in, blockSize)
 
-				// Collect trie root for directory trie walking
-				if in.IsDir() {
-					if in.DirTrieRoot == 0 {
-						fs.errorf("ino %d: directory with no trie root", ino)
-					} else {
-						fs.dirs = append(fs.dirs, dirInfo{ino: ino, trieRoot: in.DirTrieRoot})
-						fs.usedBlocks[briefs.TrieRefBlock(in.DirTrieRoot)] = true
-					}
+				// Collect trie root for directory trie walking.  A directory
+				// with DirTrieRoot == 0 is an empty directory whose trie root
+				// was freed by collapse (the kernel's briefs_trie_remove frees
+				// the root to 0 when the last entry is removed) or a directory
+				// that never held entries; both are valid, so skip it rather
+				// than flagging an error.  The link-count cross-reference still
+				// catches a directory that claims subdirs it no longer has.
+				if in.IsDir() && in.DirTrieRoot != 0 {
+					fs.dirs = append(fs.dirs, dirInfo{ino: ino, trieRoot: in.DirTrieRoot})
+					fs.usedBlocks[briefs.TrieRefBlock(in.DirTrieRoot)] = true
 				}
 
 				// File with zero size but extents
