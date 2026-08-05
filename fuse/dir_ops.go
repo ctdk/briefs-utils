@@ -201,6 +201,9 @@ func (b *BrieFS) dirIsEmpty(di *briefs.Inode) bool {
 // and excl is false, or EEXIST when the name is present and excl is true.  The
 // caller must hold b.mu.
 func (b *BrieFS) createInDir(parentIno uint64, name string, mode, uid, gid uint32, excl bool) (*briefs.Inode, error) {
+	if b.readOnly {
+		return nil, syscall.EROFS
+	}
 	// Existence check against the on-disk trie (current as of the last op's
 	// flush; the global mu serializes ops so there is no TOCTOU window).
 	parent0, err := b.inodes.ReadInode(parentIno)
@@ -314,6 +317,9 @@ func (b *BrieFS) createInDir(parentIno uint64, name string, mode, uid, gid uint3
 // tests do not exercise open-unlinked files).  Data-extent freeing for
 // non-empty files is deferred to Phase 5.  The caller must hold b.mu.
 func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error {
+	if b.readOnly {
+		return syscall.EROFS
+	}
 	b.cacheBegin()
 
 	parent, err := b.readInodeCached(parentIno)

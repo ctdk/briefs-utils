@@ -47,6 +47,12 @@ type BrieFS struct {
 	// together.  nil between operations.  Protected by mu.
 	cache     map[uint64][]byte
 	cacheDirty map[uint64]bool
+
+	// readOnly is set after a post-journal (phase-2) write error leaves the
+	// journal with uncommitted records referencing in-flight allocations.
+	// Further mutations are refused (EROFS) so a later Sync cannot commit them
+	// against a partially-applied state. Protected by mu.
+	readOnly bool
 }
 
 // MountOptions configures the FUSE mount.
@@ -179,6 +185,8 @@ var _ = (fs.NodeCreater)((*brieFSNode)(nil))
 var _ = (fs.NodeMkdirer)((*brieFSNode)(nil))
 var _ = (fs.NodeUnlinker)((*brieFSNode)(nil))
 var _ = (fs.NodeRmdirer)((*brieFSNode)(nil))
+var _ = (fs.NodeWriter)((*brieFSNode)(nil))
+var _ = (fs.NodeFsyncer)((*brieFSNode)(nil))
 
 // collectExtents returns every extent of an inode in ascending offset order,
 // via briefs.IterateInodeExtents (which dispatches on InodeFlagIndexed: inline
@@ -342,115 +350,11 @@ func (n *brieFSNode) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, 
 }
 
 func (n *brieFSNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	diskInode, err := n.bfs.inodes.ReadInode(n.ino)
+	data, err := n.bfs.readFileData(n.ino, dest, off)
 	if err != nil {
 		return nil, syscall.EIO
 	}
-
-	if off >= int64(diskInode.FileSize) {
-		return fuse.ReadResultData(nil), 0
-	}
-
-	blockSize := n.bfs.blockSize
-	blkSize := int64(blockSize)
-	endOff := off + int64(len(dest))
-	if endOff > int64(diskInode.FileSize) {
-		endOff = int64(diskInode.FileSize)
-	}
-	toRead := endOff - off
-
-	readBuf := make([]byte, toRead)
-	readPos := int64(0)
-
-	// Inline data is stored directly inside the inode.
-	if diskInode.Flags&briefs.InodeFlagInlineData != 0 {
-		start := off
-		if start < 0 {
-			start = 0
-		}
-		end := endOff
-		if end > int64(diskInode.FileSize) {
-			end = int64(diskInode.FileSize)
-		}
-		inlineData := diskInode.InlineData()
-		nc := copy(readBuf, inlineData[start:end])
-		return fuse.ReadResultData(readBuf[:nc]), 0
-	}
-
-	// Walk all extents (inline array or B+ tree) in ascending offset order.
-	exts, err := n.collectExtents(diskInode)
-	if err != nil {
-		return nil, syscall.EIO
-	}
-	for _, ext := range exts {
-		// Holes have Phys == 0. Return zeros for hole regions.
-		if ext.Phys == 0 {
-			holeStart := int64(ext.Offset) * blkSize
-			holeEnd := holeStart + int64(ext.Len)*blkSize
-			if off >= holeEnd || endOff <= holeStart {
-				continue
-			}
-			// Zero the overlapping region
-			zeroStart := off
-			if zeroStart < holeStart {
-				zeroStart = holeStart
-			}
-			zeroEnd := endOff
-			if zeroEnd > holeEnd {
-				zeroEnd = holeEnd
-			}
-			// Zero the corresponding portion of the buffer
-			bufPos := zeroStart - off
-			bufLen := zeroEnd - zeroStart
-			if bufPos >= 0 && bufLen > 0 && bufPos < int64(len(readBuf)) {
-				for i := bufPos; i < bufPos+bufLen && i < int64(len(readBuf)); i++ {
-					readBuf[i] = 0
-				}
-			}
-			continue
-		}
-
-		extStart := int64(ext.Offset) * blkSize
-		extEnd := extStart + int64(ext.Len)*blkSize
-
-		if off >= extEnd || endOff <= extStart {
-			continue
-		}
-
-		// Clamp to overlapping region
-		readStart := off
-		if readStart < extStart {
-			readStart = extStart
-		}
-		readEnd := endOff
-		if readEnd > extEnd {
-			readEnd = extEnd
-		}
-
-		// Read blocks
-		for blkOff := readStart; blkOff < readEnd; blkOff += blkSize {
-			absBlock := ext.Phys + uint64((blkOff - extStart)/blkSize)
-			buf, err := n.bfs.dev.ReadBlock(absBlock)
-			if err != nil {
-				return nil, syscall.EIO
-			}
-
-			blkEnd := blkOff + blkSize
-			copyStart := readStart
-			if copyStart < blkOff {
-				copyStart = blkOff
-			}
-			copyEnd := readEnd
-			if copyEnd > blkEnd {
-				copyEnd = blkEnd
-			}
-
-			nc := copy(readBuf[readPos:], buf[copyStart-blkOff:copyEnd-blkOff])
-			readPos += int64(nc)
-		}
-	}
-
-	return fuse.ReadResultData(readBuf[:readPos]), 0
+	return fuse.ReadResultData(data), 0
 }
 
 func (n *brieFSNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
@@ -561,4 +465,36 @@ func (n *brieFSNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	n.bfs.mu.Lock()
 	defer n.bfs.mu.Unlock()
 	return errToErrno(n.bfs.unlinkInDir(n.ino, name, true))
+}
+
+// Write handles file data writes.  Mirrors briefs_write_iter (file.c:640):
+// inline-data for small files, extent-backed per-block RMW + hole allocation
+// otherwise, with drain-before-snapshot durability (see file_ops.go).
+func (n *brieFSNode) Write(ctx context.Context, f fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
+	n.bfs.mu.Lock()
+	defer n.bfs.mu.Unlock()
+	nwritten, err := n.bfs.writeFileData(n.ino, data, off)
+	if err != nil {
+		return 0, errToErrno(err)
+	}
+	return uint32(nwritten), 0
+}
+
+// Fsync flushes file data and metadata to disk.  Each Write already drains data
+// and btree nodes, commits the journal, and flushes the inode block, so Fsync
+// is a belt-and-suspenders flush of any pending page-cache writes plus a
+// journal commit of any buffered records.
+func (n *brieFSNode) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) syscall.Errno {
+	n.bfs.mu.Lock()
+	defer n.bfs.mu.Unlock()
+	if n.bfs.readOnly {
+		return syscall.EROFS
+	}
+	if err := n.bfs.dev.Sync(); err != nil {
+		return syscall.EIO
+	}
+	if err := n.bfs.journal.Sync(false); err != nil {
+		return syscall.EIO
+	}
+	return 0
 }
