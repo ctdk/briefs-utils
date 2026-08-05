@@ -324,3 +324,18 @@ func (im *InodeManager) WriteInode(inode *briefs.Inode) error {
 
 	return im.dev.WriteBlock(blk, buf)
 }
+
+// ZeroInode zeroes the on-disk slot for an inode (read-modify-write the
+// inode block), so a freed inode does not retain a valid magic.  Mirrors the
+// kernel's briefs_free_inode_num zero-out of the on-disk inode.
+func (im *InodeManager) ZeroInode(ino uint64) error {
+	blk, off := im.inodeLocation(ino)
+	buf, err := im.dev.ReadBlock(blk)
+	if err != nil {
+		return fmt.Errorf("read inode block %d for zero: %w", blk, err)
+	}
+	for i := uint64(0); i < im.sb.InodeSize; i++ {
+		buf[off+i] = 0
+	}
+	return im.dev.WriteBlock(blk, buf)
+}
