@@ -34,6 +34,19 @@ type BrieFS struct {
 	// the kernel lock order (briefs.h:40-71). Reads stay lockless — the bridge
 	// re-reads from disk on every call and caches nothing — until Phase 6.
 	mu sync.Mutex
+
+	// triePartials is the per-superblock pool of trie pages that still have a
+	// free slot, mirroring the kernel's bsi->trie_pages.partial list
+	// (trie_page.c). It is consulted by trieAllocNode to reuse slots before
+	// allocating fresh pages. Protected by mu.
+	triePartials []uint64
+
+	// cache is the per-operation block cache (see cache.go).  A mutating
+	// handler calls cacheBegin before its first metadata read and flushCache
+	// before journal.Sync so all of the operation's metadata lands on disk
+	// together.  nil between operations.  Protected by mu.
+	cache     map[uint64][]byte
+	cacheDirty map[uint64]bool
 }
 
 // MountOptions configures the FUSE mount.

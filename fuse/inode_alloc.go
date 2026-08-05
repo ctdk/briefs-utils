@@ -56,7 +56,7 @@ func (b *BrieFS) AllocInode(mode, uid, gid uint32, parentIno uint64) (*briefs.In
 	// get_random_u32(); stored in the low 32 bits).
 	inode.Generation = uint64(rand.Uint32())
 
-	if err := b.inodes.WriteInode(inode); err != nil {
+	if err := b.writeInodeCached(inode); err != nil {
 		// Undo: journal a free so replay releases the bit, then return it.
 		freeRec := &briefs.JrnInodeFree{Ino: ino}
 		_ = b.journal.WriteRecord(briefs.JRN_INODE_FREE, freeRec.Marshal())
@@ -77,7 +77,7 @@ func (b *BrieFS) FreeInode(ino uint64) error {
 		return nil
 	}
 	// Zero the on-disk inode slot (read-modify-write the inode block).
-	if err := b.inodes.ZeroInode(ino); err != nil {
+	if err := b.zeroInodeCached(ino); err != nil {
 		return fmt.Errorf("briefs: zero inode %d: %w", ino, err)
 	}
 	// Journal the free before recycling the number.

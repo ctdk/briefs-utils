@@ -78,6 +78,9 @@ func TestInodeAllocFree(t *testing.T) {
 	bfs := openBridge(t, img)
 	freeBefore := bfs.inodeAlloc.FreeCount()
 
+	// Allocations write through the per-operation block cache; flush before
+	// reading back from disk.
+	bfs.cacheBegin()
 	// Root inode is 1; the first allocation must be a fresh inode number > 1.
 	in1, err := bfs.AllocInode(briefs.ModeFile|0o644, 1000, 1000, 1)
 	if err != nil {
@@ -102,6 +105,9 @@ func TestInodeAllocFree(t *testing.T) {
 	if got := bfs.inodeAlloc.FreeCount(); got != freeBefore-2 {
 		t.Fatalf("free count after 2 allocs: want %d, got %d", freeBefore-2, got)
 	}
+	if err := bfs.flushCache(); err != nil {
+		t.Fatalf("flushCache: %v", err)
+	}
 
 	// The on-disk inode must round-trip with the magic and mode we set.
 	rt, err := bfs.inodes.ReadInode(in1.InodeNumber)
@@ -116,6 +122,7 @@ func TestInodeAllocFree(t *testing.T) {
 	}
 
 	// Free both and confirm the bitmap is restored.
+	bfs.cacheBegin()
 	if err := bfs.FreeInode(in1.InodeNumber); err != nil {
 		t.Fatalf("FreeInode 1: %v", err)
 	}
@@ -124,6 +131,9 @@ func TestInodeAllocFree(t *testing.T) {
 	}
 	if got := bfs.inodeAlloc.FreeCount(); got != freeBefore {
 		t.Fatalf("free count after frees: want %d, got %d", freeBefore, got)
+	}
+	if err := bfs.flushCache(); err != nil {
+		t.Fatalf("flushCache: %v", err)
 	}
 	// A freed inode must read back with magic 0 (ZeroInode).
 	rt2, err := bfs.inodes.ReadInode(in1.InodeNumber)
