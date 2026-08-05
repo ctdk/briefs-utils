@@ -237,6 +237,10 @@ var _ = (fs.NodeUnlinker)((*brieFSNode)(nil))
 var _ = (fs.NodeRmdirer)((*brieFSNode)(nil))
 var _ = (fs.NodeWriter)((*brieFSNode)(nil))
 var _ = (fs.NodeFsyncer)((*brieFSNode)(nil))
+var _ = (fs.NodeGetxattrer)((*brieFSNode)(nil))
+var _ = (fs.NodeSetxattrer)((*brieFSNode)(nil))
+var _ = (fs.NodeListxattrer)((*brieFSNode)(nil))
+var _ = (fs.NodeRemovexattrer)((*brieFSNode)(nil))
 
 // collectExtents returns every extent of an inode in ascending offset order,
 // via briefs.IterateInodeExtents (which dispatches on InodeFlagIndexed: inline
@@ -536,4 +540,59 @@ func (n *brieFSNode) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) s
 		return syscall.EIO
 	}
 	return 0
+}
+
+// Getxattr returns an xattr value. With a zero-length dest it reports the size;
+// with a too-small dest it returns ERANGE. Mirrors briefs_xattr_get (xattr.c:320).
+func (n *brieFSNode) Getxattr(ctx context.Context, name string, dest []byte) (uint32, syscall.Errno) {
+	val, err := n.bfs.getXattr(n.ino, name)
+	if err != nil {
+		return 0, errToErrno(err)
+	}
+	if len(dest) == 0 {
+		return uint32(len(val)), 0
+	}
+	if len(dest) < len(val) {
+		return uint32(len(val)), syscall.ERANGE
+	}
+	copy(dest, val)
+	return uint32(len(val)), 0
+}
+
+// Setxattr sets/replaces an xattr (value != nil) or removes it (value == nil).
+// Mirrors briefs_xattr_set (xattr.c:925).
+func (n *brieFSNode) Setxattr(ctx context.Context, name string, data []byte, flags uint32) syscall.Errno {
+	return errToErrno(n.bfs.setXattr(n.ino, name, data, flags))
+}
+
+// Listxattr lists all xattr names (NUL-separated). With a zero-length dest it
+// reports the needed size; with a too-small dest it returns ERANGE + the size.
+func (n *brieFSNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
+	names, err := n.bfs.listXattr(n.ino)
+	if err != nil {
+		return 0, errToErrno(err)
+	}
+	total := 0
+	for _, name := range names {
+		total += len(name) + 1
+	}
+	if len(dest) == 0 {
+		return uint32(total), 0
+	}
+	if len(dest) < total {
+		return uint32(total), syscall.ERANGE
+	}
+	off := 0
+	for _, name := range names {
+		copy(dest[off:], name)
+		off += len(name)
+		dest[off] = 0
+		off++
+	}
+	return uint32(total), 0
+}
+
+// Removexattr removes an xattr. Mirrors briefs_xattr_set with value == nil.
+func (n *brieFSNode) Removexattr(ctx context.Context, name string) syscall.Errno {
+	return errToErrno(n.bfs.removeXattr(n.ino, name))
 }
