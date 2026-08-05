@@ -82,9 +82,15 @@ func TestInodeAllocFree(t *testing.T) {
 	// reading back from disk.
 	bfs.cacheBegin()
 	// Root inode is 1; the first allocation must be a fresh inode number > 1.
+	// AllocInode allocates + builds the inode but does not persist it; the
+	// caller writes it (under the inode-block lock, elided in this single-
+	// threaded unit test).
 	in1, err := bfs.AllocInode(briefs.ModeFile|0o644, 1000, 1000, 1)
 	if err != nil {
 		t.Fatalf("AllocInode 1: %v", err)
+	}
+	if err := bfs.writeInodeCached(in1); err != nil {
+		t.Fatalf("writeInodeCached 1: %v", err)
 	}
 	if in1.InodeNumber <= 1 {
 		t.Fatalf("allocated ino %d should be > 1", in1.InodeNumber)
@@ -92,6 +98,9 @@ func TestInodeAllocFree(t *testing.T) {
 	in2, err := bfs.AllocInode(briefs.ModeDir|0o755, 1000, 1000, 1)
 	if err != nil {
 		t.Fatalf("AllocInode 2: %v", err)
+	}
+	if err := bfs.writeInodeCached(in2); err != nil {
+		t.Fatalf("writeInodeCached 2: %v", err)
 	}
 	if in2.InodeNumber == in1.InodeNumber {
 		t.Fatalf("allocs must be distinct, both %d", in1.InodeNumber)

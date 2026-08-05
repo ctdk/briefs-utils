@@ -171,7 +171,11 @@ func collectInodeExtents(file *os.File, in *briefs.Inode, blockSize uint64) ([]b
 
 // writeFileData writes data at off, mirroring briefs_write_iter. It selects the
 // inline-data path (small files) or the extent-backed path, journals the
-// change, and makes it durable. The caller must hold b.mu.
+// change, and makes it durable. The file-write path takes NO global dir lock:
+// it touches only its own inode-table block (via direct RMW under
+// inodeBlockLock) plus data/btree blocks exclusive to the inode, so writes to
+// files in different inode blocks run concurrently with each other and with
+// dir ops. The caller (go-fuse Write handler) need not lock.
 func (b *BrieFS) writeFileData(ino uint64, data []byte, off int64) (int, error) {
 	if len(data) == 0 {
 		return 0, nil
@@ -179,10 +183,15 @@ func (b *BrieFS) writeFileData(ino uint64, data []byte, off int64) (int, error) 
 	if b.readOnly {
 		return 0, syscall.EROFS
 	}
-	b.cacheBegin()
-	in, err := b.readInodeCached(ino)
+	// Lock the file's inode-table block for the whole op. The direct inode RMW
+	// (writeInodeDirect) and the start-of-op ReadInode both touch this block;
+	// same-block writes (siblings in the same 4K table block) serialize here.
+	lock := b.inodeBlockLock(ino)
+	lock.Lock()
+	defer lock.Unlock()
+
+	in, err := b.inodes.ReadInode(ino)
 	if err != nil {
-		b.cacheAbort()
 		return 0, err
 	}
 	oldSize := int64(in.FileSize)
@@ -192,22 +201,23 @@ func (b *BrieFS) writeFileData(ino uint64, data []byte, off int64) (int, error) 
 	// in the 256-byte inline region.
 	if in.Flags&briefs.InodeFlagInlineData != 0 || oldSize == 0 {
 		if totalSize <= inlineDataMax {
-			if err := b.writeInlineData(in, data, off, totalSize); err != nil {
-				b.cacheAbort()
-				return 0, err
-			}
-			// Inline data lives in the snapshot-trusted inode block: commit then flush.
+			b.writeInlineData(in, data, off, totalSize)
+			// Inline data lives in the snapshot-trusted inode block: commit, then
+			// write the inode block directly (replay overwrites it if a crash
+			// preempts the write).
 			if err := b.journalInodeFull(in); err != nil {
 				b.failWrite()
-				b.cacheAbort()
 				return 0, err
 			}
 			if err := b.journal.Sync(false); err != nil {
 				b.failWrite()
-				b.cacheAbort()
 				return 0, err
 			}
-			if err := b.flushCache(); err != nil {
+			if err := b.writeInodeDirect(in); err != nil {
+				b.failWrite()
+				return 0, err
+			}
+			if err := b.dev.Fdatasync(); err != nil {
 				b.failWrite()
 				return 0, err
 			}
@@ -217,7 +227,6 @@ func (b *BrieFS) writeFileData(ino uint64, data []byte, off int64) (int, error) 
 		var drain, allocated []uint64
 		if err := b.promoteInlineData(in, &drain, &allocated); err != nil {
 			b.rollbackAlloc(allocated)
-			b.cacheAbort()
 			return 0, err
 		}
 		n, err := b.writeExtentData(in, data, off, oldSize, &drain, &allocated)
@@ -236,9 +245,10 @@ func (b *BrieFS) writeFileData(ino uint64, data []byte, off int64) (int, error) 
 }
 
 // writeInlineData copies data into the inode's inline region, sets the inline
-// flag, and advances the file size + mtime/ctime. The caller must hold b.mu and
-// have an active cache; it persists the inode via writeInodeCached.
-func (b *BrieFS) writeInlineData(in *briefs.Inode, data []byte, off, totalSize int64) error {
+// flag, and advances the file size + mtime/ctime on the in-memory inode. It
+// does not persist; the caller (writeFileData) writes the inode once at the end
+// of the op. The caller must hold the inode's inodeBlockLock.
+func (b *BrieFS) writeInlineData(in *briefs.Inode, data []byte, off, totalSize int64) {
 	region := in.InlineData()
 	copy(region[off:], data)
 	in.SetInlineData(region)
@@ -249,7 +259,6 @@ func (b *BrieFS) writeInlineData(in *briefs.Inode, data []byte, off, totalSize i
 	sec, nsec := nowTime()
 	in.MtimeSec, in.MtimeNsec = sec, nsec
 	in.CtimeSec, in.CtimeNsec = sec, nsec
-	return b.writeInodeCached(in)
 }
 
 // promoteInlineData converts an inline-data inode to extent-backed, mirroring
@@ -257,9 +266,13 @@ func (b *BrieFS) writeInlineData(in *briefs.Inode, data []byte, off, totalSize i
 // allocates one data block, copies the old inline content into it, and sets a
 // single inline extent; for an empty file it just clears the flag. The
 // promoted block is written to the page cache and recorded in *drain (drained
-// before the commit by writeExtentData). The caller must hold b.mu.
+// before the commit by writeExtentData). The inode is mutated in memory only;
+// the caller persists it once at the end of the op. The caller must hold the
+// inode's inodeBlockLock.
 func (b *BrieFS) promoteInlineData(in *briefs.Inode, drain, allocated *[]uint64) error {
 	oldSize := in.FileSize
+	// Capture the old inline content BEFORE clearing the region.
+	oldRegion := in.InlineData()
 	in.Flags &^= briefs.InodeFlagInlineData
 	in.Flags &^= briefs.InodeFlagIndexed
 	in.SetInlineData([256]byte{})
@@ -269,7 +282,7 @@ func (b *BrieFS) promoteInlineData(in *briefs.Inode, drain, allocated *[]uint64)
 		in.NumExtentsInline = 0
 		in.NumExtentsTotal = 0
 		in.ExtentInlineBase = 0
-		return b.writeInodeCached(in)
+		return nil
 	}
 
 	rel := b.dataAlloc.AllocBlock()
@@ -279,10 +292,9 @@ func (b *BrieFS) promoteInlineData(in *briefs.Inode, drain, allocated *[]uint64)
 	*allocated = append(*allocated, rel)
 	abs := b.dataRegionStart + rel
 
-	// Copy the old inline content into a zeroed block.
+	// Copy the captured old inline content into a zeroed block.
 	buf := make([]byte, b.blockSize)
-	region := in.InlineData()
-	copy(buf, region[:oldSize])
+	copy(buf, oldRegion[:oldSize])
 	if err := b.dev.WriteBlock(abs, buf); err != nil {
 		return err
 	}
@@ -294,14 +306,17 @@ func (b *BrieFS) promoteInlineData(in *briefs.Inode, drain, allocated *[]uint64)
 	in.NumExtentsInline = 1
 	in.NumExtentsTotal = 1
 	in.ExtentInlineBase = 0
-	return b.writeInodeCached(in)
+	return nil
 }
 
 // writeExtentData performs an extent-backed write: per-block RMW for mapped
-// blocks, allocation for holes, and a full B+ tree rebuild when the extent
-// list changes. It owns the *allocated list for rollback on phase-1 errors and
-// marks the FS read-only on phase-2 (post-journal) errors. The caller must hold
-// b.mu and have an active cache.
+// blocks, allocation for holes, and a full B+ tree rebuild when the extent list
+// changes. It owns the *allocated list for rollback on phase-1 errors and marks
+// the FS read-only on phase-2 (post-journal) errors. It uses no per-op cache
+// (data, btree nodes, and the inode block are all written directly), so it
+// needs only the file's inodeBlockLock, not the global dir lock. The caller
+// must hold the inode's inodeBlockLock and pass the in-memory inode @in (mutated
+// in place; persisted once at the end).
 func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int64, drain, allocated *[]uint64) (int, error) {
 	blockSize := int64(b.blockSize)
 
@@ -309,7 +324,6 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 	exts, oldNodes, err := b.collectExtentsAndNodes(in)
 	if err != nil {
 		b.rollbackAlloc(*allocated)
-		b.cacheAbort()
 		return 0, err
 	}
 
@@ -320,7 +334,6 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 	if off > oldSize && oldSize > 0 && oldSize%blockSize != 0 {
 		if err := b.zeroEofTail(exts, oldSize, drain); err != nil {
 			b.rollbackAlloc(*allocated)
-			b.cacheAbort()
 			return 0, err
 		}
 	}
@@ -353,14 +366,12 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 				buf, err = b.dev.ReadBlock(abs)
 				if err != nil {
 					b.rollbackAlloc(*allocated)
-					b.cacheAbort()
 					return 0, err
 				}
 			}
 			copy(buf[segStart-blockStart:], segData)
 			if err := b.dev.WriteBlock(abs, buf); err != nil {
 				b.rollbackAlloc(*allocated)
-				b.cacheAbort()
 				return 0, err
 			}
 			*drain = append(*drain, abs)
@@ -380,7 +391,6 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 			rel := b.dataAlloc.AllocBlock()
 			if rel == 0 {
 				b.rollbackAlloc(*allocated)
-				b.cacheAbort()
 				return 0, syscall.ENOSPC
 			}
 			*allocated = append(*allocated, rel)
@@ -389,7 +399,6 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 			copy(buf[segStart-blockStart:], segData)
 			if err := b.dev.WriteBlock(abs, buf); err != nil {
 				b.rollbackAlloc(*allocated)
-				b.cacheAbort()
 				return 0, err
 			}
 			*drain = append(*drain, abs)
@@ -403,79 +412,93 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 	if rebuildNeeded {
 		if err := b.rebuildExtentIndex(in, exts, oldNodes, drain, allocated); err != nil {
 			b.rollbackAlloc(*allocated)
-			b.cacheAbort()
 			return 0, err
 		}
 	}
 
-	// Update size + mtime/ctime on the cached inode.
+	// Update size + mtime/ctime on the in-memory inode (persisted once below).
 	if end > oldSize {
 		in.FileSize = uint64(end)
 	}
 	sec, nsec := nowTime()
 	in.MtimeSec, in.MtimeNsec = sec, nsec
 	in.CtimeSec, in.CtimeNsec = sec, nsec
-	if err := b.writeInodeCached(in); err != nil {
-		b.rollbackAlloc(*allocated)
-		b.cacheAbort()
-		return 0, err
-	}
 
-	// --- Phase 2: journal + drain + commit + free old + flush ---
+	// --- Phase 2: journal + drain + commit + free old + write inode ---
 	// Journal JRN_EXTENT_ALLOC for every block allocated this op (data + btree
 	// nodes) so replay reserves them in the bitmap.
 	for _, rel := range *allocated {
 		if err := b.journalExtentAlloc(in.InodeNumber, 0, b.dataRegionStart+rel); err != nil {
 			b.failWrite()
-			b.cacheAbort()
 			return 0, err
-		}
-	}
-	// When the index was rebuilt, the old btree nodes are replaced: journal
-	// JRN_EXTENT_FREE for them (committed in the same Sync as JRN_INODE_FULL so
-	// a crash does not leak them) and free them in memory after the commit.
-	// When the write was a pure RMW (no rebuild) oldNodes is the LIVE tree and
-	// must not be freed.
-	if rebuildNeeded {
-		for _, blk := range oldNodes {
-			if err := b.journalExtentFree(in.InodeNumber, blk); err != nil {
-				b.failWrite()
-				b.cacheAbort()
-				return 0, err
-			}
 		}
 	}
 	// Drain data + btree nodes to disk BEFORE the snapshot commits (the
 	// snapshot trusts the btree root pointer; replay does not re-derive nodes).
 	if err := b.dev.Fdatasync(); err != nil {
 		b.failWrite()
-		b.cacheAbort()
 		return 0, err
 	}
 	if err := b.journalInodeFull(in); err != nil {
 		b.failWrite()
-		b.cacheAbort()
 		return 0, err
+	}
+	// Free replaced btree nodes AFTER the new-root snapshot is journaled. With
+	// concurrent file writes sharing the journal, another op's Sync may commit
+	// these records; ordering EXTENT_FREE after INODE_FULL means a partial commit
+	// can never free old nodes without also committing the new root (which would
+	// leave the on-disk inode referencing freed blocks). When the write was a
+	// pure RMW (no rebuild) oldNodes is the LIVE tree and must not be freed.
+	if rebuildNeeded {
+		for _, blk := range oldNodes {
+			if err := b.journalExtentFree(in.InodeNumber, blk); err != nil {
+				b.failWrite()
+				return 0, err
+			}
+		}
 	}
 	if err := b.journal.Sync(false); err != nil {
 		b.failWrite()
-		b.cacheAbort()
 		return 0, err
 	}
 	// The new root is committed; the replaced old btree nodes are no longer
-	// referenced. Free them in memory (their JRN_EXTENT_FREE is committed above).
+	// referenced. Free them in memory (their JRN_EXTENT_FREE is committed).
 	if rebuildNeeded {
 		for _, blk := range oldNodes {
 			b.dataAlloc.FreeBlock(blk - b.dataRegionStart)
 		}
 	}
-	// Flush the inode block (snapshot-trusted; safe after the commit, since
-	// replay overwrites it from JRN_INODE_FULL if a crash preempts the flush).
-	if err := b.flushCache(); err != nil {
+	// Write the inode block directly (snapshot-trusted; safe after the commit,
+	// since replay overwrites it from JRN_INODE_FULL if a crash preempts the
+	// write). Under the inodeBlockLock, no other op touches this block.
+	if err := b.writeInodeDirect(in); err != nil {
+		b.failWrite()
+		return 0, err
+	}
+	if err := b.dev.Fdatasync(); err != nil {
 		b.failWrite()
 		return 0, err
 	}
 	return len(data), nil
+}
+
+// writeInodeDirect reads the inode-table block, patches the inode's slot with
+// the marshaled inode, and writes the whole 4K block back atomically. The
+// caller must hold the inode's inodeBlockLock so no other op touches the same
+// block concurrently. Used by the file-write path, which bypasses the per-op
+// cache so writes to files in different inode blocks run concurrently.
+func (b *BrieFS) writeInodeDirect(in *briefs.Inode) error {
+	blk, off := b.inodes.inodeLocation(in.InodeNumber)
+	buf, err := b.dev.ReadBlock(blk)
+	if err != nil {
+		return err
+	}
+	data, err := in.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	copy(buf[off:], data)
+	return b.dev.WriteBlock(blk, buf)
 }
 
 // collectExtentsAndNodes returns the inode's current extents (ascending offset)

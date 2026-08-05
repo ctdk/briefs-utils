@@ -29,10 +29,15 @@ type BrieFS struct {
 	// Phase-1 Journal is wired in Mount once the writer is implemented.
 	journal *briefs.Journal
 
-	// mu serializes all mutating FUSE handlers. Phase 0 uses a single global
-	// lock for correctness; Phase 6 replaces it with per-inode locks following
-	// the kernel lock order (briefs.h:40-71). Reads stay lockless — the bridge
-	// re-reads from disk on every call and caches nothing — until Phase 6.
+	// mu serializes directory mutation operations (create/mkdir/unlink/rmdir).
+	// It protects the shared per-op block cache (cache/cacheDirty) and the
+	// partial-trie-page pool (triePartials), which have no concurrency-safe
+	// equivalent of the kernel's buffer cache / partial-pool mutex here, and
+	// it closes the existence-check TOCTOU. File writes do NOT take mu: they
+	// touch only their own inode-table block (via direct RMW under
+	// inodeBlockLocks) plus the data region, so they run concurrently with dir
+	// ops and with each other. The kernel lock order (briefs.h:40-71) is
+	// inode_block_lock -> trie_lock -> ... ; mu stands in for trie_lock.
 	mu sync.Mutex
 
 	// triePartials is the per-superblock pool of trie pages that still have a
@@ -40,6 +45,15 @@ type BrieFS struct {
 	// (trie_page.c). It is consulted by trieAllocNode to reuse slots before
 	// allocating fresh pages. Protected by mu.
 	triePartials []uint64
+
+	// inodeBlockLocks shards per-inode-table-block mutexes. Two ops touching
+	// inodes in the same 4K inode-table block must serialize: a per-op cache
+	// (dir ops) or a direct RMW (file writes) of that block would otherwise
+	// clobber a sibling inode slot. Sharded by absolute table-block number so
+	// ops on different table blocks run concurrently (same-block, and
+	// hash-colliding, blocks serialize). This mirrors the kernel's
+	// inode_block_lock (briefs.h:44), the first lock in the kernel order.
+	inodeBlockLocks [64]sync.Mutex
 
 	// cache is the per-operation block cache (see cache.go).  A mutating
 	// handler calls cacheBegin before its first metadata read and flushCache
@@ -159,6 +173,42 @@ func (b *BrieFS) SyncAllocators() error {
 		return fmt.Errorf("sync data allocator: %w", err)
 	}
 	return b.inodeAlloc.Sync()
+}
+
+// inodeBlockShard returns the shard index and its mutex for the inode-table
+// block holding @ino. Two ops touching inodes whose slots share a shard (the
+// common case: the same 4K table block; also the rare hash-collision of two
+// different table blocks) must hold that shard's mutex so they do not clobber a
+// sibling slot. Sharding by absolute block number lets ops on different shards
+// run concurrently.
+func (b *BrieFS) inodeBlockShard(ino uint64) (uint64, *sync.Mutex) {
+	blk, _ := b.inodes.inodeLocation(ino)
+	shard := blk % uint64(len(b.inodeBlockLocks))
+	return shard, &b.inodeBlockLocks[shard]
+}
+
+// inodeBlockLock returns the mutex guarding the inode-table block holding @ino.
+// Used by file writes, which take a single shard lock for their whole op.
+func (b *BrieFS) inodeBlockLock(ino uint64) *sync.Mutex {
+	_, m := b.inodeBlockShard(ino)
+	return m
+}
+
+// lockOtherInodeBlock locks the shard for childIno unless it is the same shard
+// as parentIno (in which case the caller already holds that shard's mutex and
+// re-locking would self-deadlock). Returns the locked mutex, or nil if no new
+// lock was taken. Used by dir ops, which already hold the parent's shard lock
+// and need to additionally cover the child's block; the global dir lock
+// serializes dir ops, and file writes take only a single shard lock and never
+// wait for a second, so the parent-then-child order cannot deadlock.
+func (b *BrieFS) lockOtherInodeBlock(parentIno, childIno uint64) *sync.Mutex {
+	pShard, _ := b.inodeBlockShard(parentIno)
+	cShard, cLock := b.inodeBlockShard(childIno)
+	if cShard == pShard {
+		return nil
+	}
+	cLock.Lock()
+	return cLock
 }
 
 // readSuperblock reads and parses the superblock from block 0.
@@ -427,9 +477,6 @@ func (n *brieFSNode) newChildNode(ctx context.Context, in *briefs.Inode) *fs.Ino
 
 // Create handles O_CREAT.  Mirrors briefs_create (dir.c:369).
 func (n *brieFSNode) Create(ctx context.Context, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
-	n.bfs.mu.Lock()
-	defer n.bfs.mu.Unlock()
-
 	uid, gid := callerCreds(ctx)
 	child, err := n.bfs.createInDir(n.ino, name, briefs.ModeFile|mode, uid, gid, flags&syscall.O_EXCL != 0)
 	if err != nil {
@@ -441,9 +488,6 @@ func (n *brieFSNode) Create(ctx context.Context, name string, flags, mode uint32
 
 // Mkdir handles directory creation.  Mirrors briefs_mkdir (dir.c:414).
 func (n *brieFSNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	n.bfs.mu.Lock()
-	defer n.bfs.mu.Unlock()
-
 	uid, gid := callerCreds(ctx)
 	child, err := n.bfs.createInDir(n.ino, name, briefs.ModeDir|mode, uid, gid, false)
 	if err != nil {
@@ -455,24 +499,20 @@ func (n *brieFSNode) Mkdir(ctx context.Context, name string, mode uint32, out *f
 
 // Unlink handles file removal.  Mirrors briefs_unlink (dir.c:680).
 func (n *brieFSNode) Unlink(ctx context.Context, name string) syscall.Errno {
-	n.bfs.mu.Lock()
-	defer n.bfs.mu.Unlock()
 	return errToErrno(n.bfs.unlinkInDir(n.ino, name, false))
 }
 
 // Rmdir handles directory removal.  Mirrors briefs_rmdir (dir.c:702).
 func (n *brieFSNode) Rmdir(ctx context.Context, name string) syscall.Errno {
-	n.bfs.mu.Lock()
-	defer n.bfs.mu.Unlock()
 	return errToErrno(n.bfs.unlinkInDir(n.ino, name, true))
 }
 
 // Write handles file data writes.  Mirrors briefs_write_iter (file.c:640):
 // inline-data for small files, extent-backed per-block RMW + hole allocation
 // otherwise, with drain-before-snapshot durability (see file_ops.go).
+// Locking is per inode-table block (inodeBlockLocks), not the global dir lock,
+// so writes to files in different inode blocks run concurrently.
 func (n *brieFSNode) Write(ctx context.Context, f fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
-	n.bfs.mu.Lock()
-	defer n.bfs.mu.Unlock()
 	nwritten, err := n.bfs.writeFileData(n.ino, data, off)
 	if err != nil {
 		return 0, errToErrno(err)
@@ -481,12 +521,11 @@ func (n *brieFSNode) Write(ctx context.Context, f fs.FileHandle, data []byte, of
 }
 
 // Fsync flushes file data and metadata to disk.  Each Write already drains data
-// and btree nodes, commits the journal, and flushes the inode block, so Fsync
-// is a belt-and-suspenders flush of any pending page-cache writes plus a
-// journal commit of any buffered records.
+// and btree nodes, commits the journal, and writes the inode block, so Fsync is
+// a belt-and-suspenders flush of any pending page-cache writes plus a journal
+// commit of any buffered records. It takes no lock: dev.Sync and journal.Sync
+// are internally synchronized and Fsync mutates nothing.
 func (n *brieFSNode) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) syscall.Errno {
-	n.bfs.mu.Lock()
-	defer n.bfs.mu.Unlock()
 	if n.bfs.readOnly {
 		return syscall.EROFS
 	}

@@ -54,6 +54,9 @@ func TestTrieInsertLookupRemove(t *testing.T) {
 		if err != nil {
 			t.Fatalf("AllocInode %q: %v", name, err)
 		}
+		if err := b.writeInodeCached(child); err != nil {
+			t.Fatalf("writeInodeCached %q: %v", name, err)
+		}
 		ftype := uint8(briefs.ModeFile >> 12) // DT_REG
 		if err := b.TrieInsert(root, name, child.InodeNumber, ftype); err != nil {
 			t.Fatalf("TrieInsert %q: %v", name, err)

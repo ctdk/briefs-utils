@@ -19,11 +19,13 @@ import (
 )
 
 // AllocInode allocates a new inode number, journals JRN_INODE_ALLOC, and
-// persists the initialized on-disk inode.  mode is the full file mode
-// (including S_IFMT); uid/gid are the caller's credentials (computed by the
-// handler, including setgid inheritance); parentIno is the parent directory
-// inode number (recorded for directories).  On failure the bitmap bit is
-// returned and JRN_INODE_FREE is journaled so replay does not leak the slot.
+// builds the initialized inode in memory.  It does NOT persist the inode; the
+// caller (createInDir) must writeInodeCached it under the child's inode-block
+// lock so a concurrent file write to a sibling in the same 4K table block cannot
+// clobber the slot.  mode is the full file mode (including S_IFMT); uid/gid are
+// the caller's credentials (computed by the handler, including setgid
+// inheritance); parentIno is the parent directory inode number (recorded for
+// directories).  On journal failure the bitmap bit is returned.
 func (b *BrieFS) AllocInode(mode, uid, gid uint32, parentIno uint64) (*briefs.Inode, error) {
 	rel := b.inodeAlloc.AllocBlock()
 	if rel == 0 {
@@ -55,14 +57,6 @@ func (b *BrieFS) AllocInode(mode, uid, gid uint32, parentIno uint64) (*briefs.In
 	// Random 32-bit generation for stable NFS file handles (kernel uses
 	// get_random_u32(); stored in the low 32 bits).
 	inode.Generation = uint64(rand.Uint32())
-
-	if err := b.writeInodeCached(inode); err != nil {
-		// Undo: journal a free so replay releases the bit, then return it.
-		freeRec := &briefs.JrnInodeFree{Ino: ino}
-		_ = b.journal.WriteRecord(briefs.JRN_INODE_FREE, freeRec.Marshal())
-		b.inodeAlloc.FreeBlock(rel)
-		return nil, fmt.Errorf("briefs: persist new inode %d: %w", ino, err)
-	}
 	return inode, nil
 }
 

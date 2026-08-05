@@ -204,6 +204,12 @@ func (b *BrieFS) createInDir(parentIno uint64, name string, mode, uid, gid uint3
 	if b.readOnly {
 		return nil, syscall.EROFS
 	}
+	// The global dir lock covers the existence check (TOCTOU), the shared
+	// per-op block cache, and the partial-trie-page pool — none of which are
+	// concurrency-safe without a buffer cache. Only one dir op runs at a time.
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	// Existence check against the on-disk trie (current as of the last op's
 	// flush; the global mu serializes ops so there is no TOCTOU window).
 	parent0, err := b.inodes.ReadInode(parentIno)
@@ -220,6 +226,13 @@ func (b *BrieFS) createInDir(parentIno uint64, name string, mode, uid, gid uint3
 	}
 
 	b.cacheBegin()
+
+	// Lock the parent's inode-table block for the cached RMW of the parent
+	// inode (updateParentDir) and the parent's trie pages. This serializes
+	// against a concurrent file write to a sibling inode in the same block.
+	pLock := b.inodeBlockLock(parentIno)
+	pLock.Lock()
+	defer pLock.Unlock()
 
 	parent, err := b.readInodeCached(parentIno)
 	if err != nil {
@@ -238,14 +251,28 @@ func (b *BrieFS) createInDir(parentIno uint64, name string, mode, uid, gid uint3
 		mode |= modeSetGID
 	}
 
-	// AllocInode journals JRN_INODE_ALLOC and persists the inode to the cache.
+	// AllocInode journals JRN_INODE_ALLOC and builds the inode in memory; it does
+	// NOT persist (the caller writes the inode under the child's block lock).
 	child, err := b.AllocInode(mode, uid, gid, parentIno)
 	if err != nil {
 		b.cacheAbort()
 		return nil, err
 	}
 
-	// Rollback helper: free the allocated inode and abort the cache.
+	// Lock the child's inode-table block (now that its number is known) for the
+	// cached write of the child inode. Dedup against the parent lock: if the
+	// child shares the parent's shard (same 4K table block, or a hash collision)
+	// the parent lock already covers it and re-locking would self-deadlock.
+	// Held with the parent lock; the global dir lock serializes dir ops and file
+	// writes take only a single shard lock, so the parent-then-child order cannot
+	// deadlock.
+	if cLock := b.lockOtherInodeBlock(parentIno, child.InodeNumber); cLock != nil {
+		defer cLock.Unlock()
+	}
+
+	// Rollback helper: free the allocated inode and abort the cache. FreeInode
+	// zeroes the slot (a cached write) so the child block lock must be held;
+	// every abort() below runs after that lock is taken.
 	abort := func() {
 		_ = b.FreeInode(child.InodeNumber)
 		b.cacheAbort()
@@ -257,11 +284,11 @@ func (b *BrieFS) createInDir(parentIno uint64, name string, mode, uid, gid uint3
 			abort()
 			return nil, err
 		}
-		// Persist the child inode (now carrying its trie root) to the cache.
-		if err := b.writeInodeCached(child); err != nil {
-			abort()
-			return nil, err
-		}
+	}
+	// Persist the child inode (with its trie root if a dir) under the child lock.
+	if err := b.writeInodeCached(child); err != nil {
+		abort()
+		return nil, err
 	}
 
 	ftype := uint8(mode >> 12) // S_IFMT >> 12 = d_type
@@ -315,12 +342,23 @@ func (b *BrieFS) createInDir(parentIno uint64, name string, mode, uid, gid uint3
 // target's nlink reaches zero its inode is freed immediately (the kernel
 // defers this to evict; the FUSE bridge has no VFS inode cache, and Phase 4
 // tests do not exercise open-unlinked files).  Data-extent freeing for
-// non-empty files is deferred to Phase 5.  The caller must hold b.mu.
+// non-empty files lands in Phase 5.  Locking: the global dir lock + the parent
+// and child inode-block locks (parent then child; the global lock serializes
+// dir ops so the order cannot deadlock).
 func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error {
 	if b.readOnly {
 		return syscall.EROFS
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	b.cacheBegin()
+
+	// Lock the parent's inode-table block for the cached parent-inode RMW
+	// (removeDirEntry + updateParentDir) and trie mutation.
+	pLock := b.inodeBlockLock(parentIno)
+	pLock.Lock()
+	defer pLock.Unlock()
 
 	parent, err := b.readInodeCached(parentIno)
 	if err != nil {
@@ -338,6 +376,13 @@ func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error 
 	if err != nil {
 		b.cacheAbort()
 		return syscall.ENOENT
+	}
+
+	// Lock the child's inode-table block for the cached child-inode RMW
+	// (nlink/ctime, possible trie free, FreeInode zeroing). Dedup against the
+	// parent lock (same shard => already covered; re-locking would self-deadlock).
+	if cLock := b.lockOtherInodeBlock(parentIno, childIno); cLock != nil {
+		defer cLock.Unlock()
 	}
 
 	child, err := b.readInodeCached(childIno)
