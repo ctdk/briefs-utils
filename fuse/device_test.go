@@ -21,17 +21,15 @@ func TestBlockDeviceReadWrite(t *testing.T) {
 		t.Errorf("BlockSize(): want 4096, got %d", bd.BlockSize())
 	}
 
-	// Write a block via raw file I/O (OpenBlockDevice opens read-only)
-	raw, err := os.OpenFile(path, os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatalf("OpenFile: %v", err)
-	}
+	// Write a block via BlockDevice (OpenBlockDevice opens read-write)
 	data := make([]byte, 4096)
 	copy(data, "BRIEFS TEST DATA")
-	if _, err := raw.WriteAt(data, 4096*5); err != nil {
-		t.Fatalf("WriteAt: %v", err)
+	if err := bd.WriteBlock(5, data); err != nil {
+		t.Fatalf("WriteBlock: %v", err)
 	}
-	raw.Close()
+	if err := bd.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
 
 	// Read it back via BlockDevice
 	read, err := bd.ReadBlock(5)

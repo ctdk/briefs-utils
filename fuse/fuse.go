@@ -4,6 +4,7 @@ package fuse
 import (
 	"context"
 	"fmt"
+	"sync"
 	"syscall"
 
 	"github.com/ctdk/briefs-utils/briefs"
@@ -22,6 +23,17 @@ type BrieFS struct {
 
 	// For converting data-relative blocks to absolute block numbers.
 	dataRegionStart uint64
+
+	// journal is the crash-consistency engine (ported from the kernel
+	// journal.c write path). nil while the read-only bridge is in use; a
+	// Phase-1 Journal is wired in Mount once the writer is implemented.
+	journal *briefs.Journal
+
+	// mu serializes all mutating FUSE handlers. Phase 0 uses a single global
+	// lock for correctness; Phase 6 replaces it with per-inode locks following
+	// the kernel lock order (briefs.h:40-71). Reads stay lockless — the bridge
+	// re-reads from disk on every call and caches nothing — until Phase 6.
+	mu sync.Mutex
 }
 
 // MountOptions configures the FUSE mount.
@@ -70,6 +82,17 @@ func Mount(imagePath string, opts MountOptions) error {
 		dataRegionStart: dataRegionStart,
 	}
 
+	// Construct the journal (ported from kernel journal.c).  It mutates sb in
+	// place and writes through dev.  The allocator interface lets it sync the
+	// bitmaps / refresh free counts at checkpoint without an import cycle.
+	journal, err := briefs.NewJournal(sb, dev.File(), blockSize)
+	if err != nil {
+		dev.Close()
+		return fmt.Errorf("init journal: %w", err)
+	}
+	journal.SetAllocatorSyncer(bfs)
+	bfs.journal = journal
+
 	root := &brieFSNode{
 		bfs: bfs,
 		ino: sb.RootIno,
@@ -87,7 +110,36 @@ func Mount(imagePath string, opts MountOptions) error {
 	}
 
 	server.Wait()
+
+	// Unmount: checkpoint (leaves log_start==log_end, nothing to replay on
+	// next mount) then close.  Phase 11 hardens this into a proper
+	// always-checkpoint-at-unmount with full shutdown handling.
+	if bfs.journal != nil {
+		_ = bfs.journal.Checkpoint()
+		_ = bfs.journal.Close()
+	}
+	dev.Close()
 	return nil
+}
+
+// RefreshFreeCounts updates the in-memory superblock free counts from the
+// authoritative allocator free counts.  Implements briefs.AllocatorSyncer;
+// called by the journal before persisting the superblock.  Cheap; no I/O.
+func (b *BrieFS) RefreshFreeCounts() {
+	b.sb.FreeDataBlks = b.dataAlloc.FreeCount()
+	b.sb.FreeInodes = b.inodeAlloc.FreeCount()
+}
+
+// SyncAllocators writes both allocator bitmap pools to disk.  Implements
+// briefs.AllocatorSyncer; called by the journal at checkpoint, mirroring the
+// kernel's briefs_alloc_sync() pair.  Without this a back-pressure checkpoint
+// would advance log_start past allocation records while the on-disk bitmap
+// still failed to mark the blocks allocated (generic/040/041 family).
+func (b *BrieFS) SyncAllocators() error {
+	if err := b.dataAlloc.Sync(); err != nil {
+		return fmt.Errorf("sync data allocator: %w", err)
+	}
+	return b.inodeAlloc.Sync()
 }
 
 // readSuperblock reads and parses the superblock from block 0.

@@ -17,8 +17,12 @@ type BlockDevice struct {
 // The blockSize is determined by reading the superblock from block 0.
 // This function reads the first 4KB to probe the block size, then returns
 // a BlockDevice configured for that size.
+//
+// The device is opened read-write so the FUSE bridge can mutate the volume.
+// Callers that only need read access (none in the read-write bridge) may
+// open the path themselves.
 func OpenBlockDevice(path string) (*BlockDevice, uint64, error) {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return nil, 0, fmt.Errorf("open device: %w", err)
 	}
@@ -91,6 +95,29 @@ func (bd *BlockDevice) WriteBlock(blockNum uint64, data []byte) error {
 // BlockSize returns the device block size in bytes.
 func (bd *BlockDevice) BlockSize() uint64 {
 	return bd.blockSize
+}
+
+// Sync flushes the device file's kernel page cache to durable storage.
+// The FUSE bridge has no buffer cache of its own, but WriteBlock writes go
+// through the host kernel's page cache for the backing file/device. The
+// journal commit and checkpoint paths call Sync before declaring a record
+// committed, mirroring the kernel's sync_blockdev() / drain-before-snapshot
+// discipline: metadata must be on disk before the JRN_INODE_FULL record that
+// references it is itself committed.
+func (bd *BlockDevice) Sync() error {
+	if err := bd.file.Sync(); err != nil {
+		return fmt.Errorf("sync device: %w", err)
+	}
+	return nil
+}
+
+// Fdatasync is like Sync but only flushes data, not metadata. On regular
+// files it falls back to a full Sync when the platform lacks fdatasync.
+func (bd *BlockDevice) Fdatasync() error {
+	if err := bd.file.Sync(); err != nil {
+		return fmt.Errorf("fdatasync device: %w", err)
+	}
+	return nil
 }
 
 // ReadAt implements io.ReaderAt, allowing briefs.ReadSuperblock and
