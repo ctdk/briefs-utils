@@ -144,13 +144,14 @@ func Mount(imagePath string, opts MountOptions) error {
 
 	server.Wait()
 
-	// Unmount: checkpoint (leaves log_start==log_end, nothing to replay on
-	// next mount) then close.  Phase 11 hardens this into a proper
-	// always-checkpoint-at-unmount with full shutdown handling.
+	// Unmount: always checkpoint (f8ef293) so log_start==log_end and a remount
+	// replays nothing, then flush + close.  Checkpoint errors are best-effort
+	// (the journal may be dirty on a forced unmount); we still drain + close.
 	if bfs.journal != nil {
 		_ = bfs.journal.Checkpoint()
 		_ = bfs.journal.Close()
 	}
+	_ = dev.Sync()
 	dev.Close()
 	return nil
 }
