@@ -249,3 +249,165 @@ func (r *JrnXattrData) Marshal() []byte {
 	copy(b[20:], r.Data)
 	return b
 }
+// --- Unmarshal helpers (journal replay) ---
+//
+// These parse on-disk record payloads (little-endian, explicit offsets) back
+// into Go structs. They are the inverse of the Marshal methods above and are
+// used by the FUSE bridge's journal replay at mount.
+
+// UnmarshalExtentAlloc parses an 80-byte JRN_EXTENT_ALLOC payload.
+func UnmarshalExtentAlloc(b []byte) *JrnExtentAlloc {
+	if len(b) < JrnExtentAllocSize {
+		return nil
+	}
+	return &JrnExtentAlloc{
+		Ino:         binary.LittleEndian.Uint64(b[0:]),
+		Offset:      binary.LittleEndian.Uint64(b[8:]),
+		Length:      binary.LittleEndian.Uint64(b[16:]),
+		PhysStart:   binary.LittleEndian.Uint64(b[24:]),
+		ExtentIndex: binary.LittleEndian.Uint32(b[32:]),
+	}
+}
+
+// UnmarshalExtentFree parses an 80-byte JRN_EXTENT_FREE payload.
+func UnmarshalExtentFree(b []byte) *JrnExtentFree {
+	if len(b) < JrnExtentFreeSize {
+		return nil
+	}
+	return &JrnExtentFree{
+		Ino:       binary.LittleEndian.Uint64(b[0:]),
+		Offset:    binary.LittleEndian.Uint64(b[8:]),
+		PhysStart: binary.LittleEndian.Uint64(b[16:]),
+		Length:    binary.LittleEndian.Uint64(b[24:]),
+	}
+}
+
+// UnmarshalInodeUpdate parses an 88-byte JRN_INODE_UPDATE payload.
+func UnmarshalInodeUpdate(b []byte) *JrnInodeUpdate {
+	if len(b) < JrnInodeUpdateSize {
+		return nil
+	}
+	return &JrnInodeUpdate{
+		Ino:       binary.LittleEndian.Uint64(b[0:]),
+		Mode:      binary.LittleEndian.Uint32(b[8:]),
+		Nlink:     binary.LittleEndian.Uint32(b[12:]),
+		Uid:       binary.LittleEndian.Uint32(b[16:]),
+		Gid:       binary.LittleEndian.Uint32(b[20:]),
+		Size:      binary.LittleEndian.Uint64(b[24:]),
+		ATimeSec:  binary.LittleEndian.Uint64(b[32:]),
+		ATimeNsec: binary.LittleEndian.Uint64(b[40:]),
+		MTimeSec:  binary.LittleEndian.Uint64(b[48:]),
+		MTimeNsec: binary.LittleEndian.Uint64(b[56:]),
+		CTimeSec:  binary.LittleEndian.Uint64(b[64:]),
+		CTimeNsec: binary.LittleEndian.Uint64(b[72:]),
+		Flags:     binary.LittleEndian.Uint32(b[80:]),
+	}
+}
+
+// UnmarshalInodeAlloc parses a 40-byte JRN_INODE_ALLOC payload.
+func UnmarshalInodeAlloc(b []byte) *JrnInodeAlloc {
+	if len(b) < JrnInodeAllocSize {
+		return nil
+	}
+	return &JrnInodeAlloc{
+		Ino:   binary.LittleEndian.Uint64(b[0:]),
+		Mode:  binary.LittleEndian.Uint32(b[8:]),
+		Nlink: binary.LittleEndian.Uint32(b[12:]),
+		Uid:   binary.LittleEndian.Uint32(b[16:]),
+		Gid:   binary.LittleEndian.Uint32(b[20:]),
+	}
+}
+
+// UnmarshalInodeFree parses a 32-byte JRN_INODE_FREE payload.
+func UnmarshalInodeFree(b []byte) *JrnInodeFree {
+	if len(b) < JrnInodeFreeSize {
+		return nil
+	}
+	return &JrnInodeFree{
+		Ino: binary.LittleEndian.Uint64(b[0:]),
+	}
+}
+
+// UnmarshalTrieAlloc parses a 16-byte JRN_TRIE_ALLOC payload.
+func UnmarshalTrieAlloc(b []byte) *JrnTrieAlloc {
+	if len(b) < JrnTrieAllocSize {
+		return nil
+	}
+	return &JrnTrieAlloc{
+		Block: binary.LittleEndian.Uint64(b[0:]),
+		Op:    binary.LittleEndian.Uint32(b[8:]),
+	}
+}
+
+// UnmarshalDirUpdate parses a 280-byte JRN_DIR_UPDATE payload.
+func UnmarshalDirUpdate(b []byte) *JrnDirUpdate {
+	if len(b) < JrnDirUpdateSize {
+		return nil
+	}
+	nameLen := binary.LittleEndian.Uint32(b[16:])
+	if nameLen > 255 {
+		nameLen = 255
+	}
+	return &JrnDirUpdate{
+		ParentIno: binary.LittleEndian.Uint64(b[0:]),
+		ChildIno:  binary.LittleEndian.Uint64(b[8:]),
+		Name:      string(b[20 : 20+nameLen]),
+		Op:        b[275],
+		FType:     b[276],
+	}
+}
+
+// UnmarshalInodeFullIno returns the inode number from a JRN_INODE_FULL payload.
+func UnmarshalInodeFullIno(b []byte) uint64 {
+	if len(b) < 8 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(b[0:])
+}
+
+// InodeFullRawData returns the 512-byte raw on-disk inode snapshot from a
+// JRN_INODE_FULL payload (offset 8, 512 bytes). The bytes are written verbatim
+// to the inode-table slot during replay (matching the kernel's memcpy of
+// rec->inode_data), so the snapshot is restored without a marshal round-trip.
+func InodeFullRawData(b []byte) []byte {
+	if len(b) < 8+512 {
+		return nil
+	}
+	return b[8 : 8+512]
+}
+
+// UnmarshalSymlinkData parses a JRN_SYMLINK_DATA payload (20-byte prefix +
+// target bytes).
+func UnmarshalSymlinkData(b []byte) *JrnSymlinkData {
+	if len(b) < JrnSymlinkDataPrefix {
+		return nil
+	}
+	tlen := binary.LittleEndian.Uint32(b[16:])
+	if uint32(len(b)) < JrnSymlinkDataPrefix+tlen {
+		return nil
+	}
+	return &JrnSymlinkData{
+		Ino:       binary.LittleEndian.Uint64(b[0:]),
+		Phys:      binary.LittleEndian.Uint64(b[8:]),
+		TargetLen: tlen,
+		Target:    b[JrnSymlinkDataPrefix : JrnSymlinkDataPrefix+tlen],
+	}
+}
+
+// UnmarshalXattrData parses a JRN_XATTR_DATA payload (20-byte prefix + used
+// bytes of block content).
+func UnmarshalXattrData(b []byte) *JrnXattrData {
+	if len(b) < JrnXattrDataPrefix {
+		return nil
+	}
+	used := binary.LittleEndian.Uint32(b[16:])
+	if uint32(len(b)) < JrnXattrDataPrefix+used {
+		return nil
+	}
+	return &JrnXattrData{
+		Ino:      binary.LittleEndian.Uint64(b[0:]),
+		PhysBlk:  binary.LittleEndian.Uint64(b[8:]),
+		UsedSize: used,
+		Data:     b[JrnXattrDataPrefix : JrnXattrDataPrefix+used],
+	}
+}

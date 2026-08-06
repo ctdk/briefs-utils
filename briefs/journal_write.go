@@ -76,6 +76,14 @@ type Journal struct {
 	dirty        bool
 	inCheckpoint bool
 
+	// inReplay is set during journal replay at mount. While set, WriteRecord
+	// is a no-op: replay re-derives metadata from existing records and must
+	// not append fresh records (e.g. the JRN_TRIE_ALLOC that trie_page_init
+	// would otherwise log), which would advance write_pos into the range
+	// still being replayed and clobber unprocessed records. Mirrors the
+	// kernel's j->in_replay gating in briefs_trie_page_init/trie_free_node.
+	inReplay bool
+
 	allocSyncer AllocatorSyncer
 }
 
@@ -234,6 +242,11 @@ func (j *Journal) writeRecordLocked(typ uint32, data []byte) error {
 func (j *Journal) WriteRecord(typ uint32, data []byte) error {
 	if j == nil {
 		return fmt.Errorf("briefs: write record on nil journal")
+	}
+	// Replay re-derives metadata from existing records; it must not append
+	// new ones (see the inReplay field comment).
+	if j.inReplay {
+		return nil
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()

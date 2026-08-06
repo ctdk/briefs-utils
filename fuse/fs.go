@@ -194,6 +194,30 @@ func (a *Allocator) FreeCount() uint64 {
 	return a.freeCount
 }
 
+// Allocated reports whether the given data-relative block (or inode, for the
+// inode allocator) is marked allocated (bit clear in the L2 bitmap). Used by
+// journal replay's nlink reconciliation to walk only live inodes. Mirrors the
+// kernel's replay_inode_allocated() (journal.c:1092).
+func (a *Allocator) Allocated(rel uint64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.l0 == nil || rel >= a.blockCount {
+		return false
+	}
+	w2 := rel / 64
+	b2 := rel % 64
+	return (a.l2[w2] & (1 << b2)) == 0 // bit clear = allocated
+}
+
+// FreeBlocksRange frees [phys, phys+length) absolute data blocks, converting
+// each to data-relative. Used by journal replay's JRN_EXTENT_FREE / trie-free
+// handlers. Mirrors the kernel's briefs_free_blocks_range().
+func (a *Allocator) FreeBlocksRange(dataRegionStart, phys, length uint64) {
+	for i := uint64(0); i < length; i++ {
+		a.FreeBlock(phys + i - dataRegionStart)
+	}
+}
+
 // TotalBlocks returns the total number of blocks tracked by this allocator.
 func (a *Allocator) TotalBlocks() uint64 {
 	return a.blockCount

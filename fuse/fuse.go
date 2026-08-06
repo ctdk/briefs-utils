@@ -62,6 +62,12 @@ type BrieFS struct {
 	cache     map[uint64][]byte
 	cacheDirty map[uint64]bool
 
+	// Replay-private maps (journal_replay.go). Non-nil only during
+	// replayJournal; nil otherwise.
+	xattrFinal map[uint64]uint64 // ino -> final xattr_offset (last JRN_INODE_FULL wins)
+	xattrNext  map[uint64]uint64 // phys xattr block -> next_block link
+	xattrLive  map[uint64]bool   // phys xattr blocks still referenced by a final chain
+
 	// readOnly is set after a post-journal (phase-2) write error leaves the
 	// journal with uncommitted records referencing in-flight allocations.
 	// Further mutations are refused (EROFS) so a later Sync cannot commit them
@@ -125,6 +131,17 @@ func Mount(imagePath string, opts MountOptions) error {
 	}
 	journal.SetAllocatorSyncer(bfs)
 	bfs.journal = journal
+
+	// Replay the journal before serving: a crash (or dm-flakey simulated power
+	// failure) leaves a live range [log_start, log_end) that re-derives
+	// directory tries, restores inode/symlink/xattr blocks, and reserves
+	// allocator bitmap bits, leaving a consistent on-disk state. Mirrors the
+	// kernel's briefs_journal_replay() at mount. A clean journal (log_start ==
+	// log_end) is a no-op.
+	if err := bfs.replayJournal(); err != nil {
+		dev.Close()
+		return fmt.Errorf("journal replay: %w", err)
+	}
 
 	root := &brieFSNode{
 		bfs: bfs,
