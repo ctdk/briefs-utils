@@ -2,7 +2,16 @@
 * Make man pages.
 * The codebase is starting to feel a bit hairy. It could stand another round of
   refactoring.
-* The FUSE bridge is read-only right now. It should be read-write.
+* [Done] The FUSE bridge is read-write (fuse-rw-work branch): full kernel
+  parity (all dir/file ops, xattrs, fileattr/chattr, renameat2, fallocate/
+  setattr/killpriv), Go journal port, per-inode-block locking. Still
+  experimental — see xfstests-fuse-status.md for the xfstests pass/fail
+  record and known issues.
+* Expand xfstests coverage for BrieFS under FUSE: the replay-sensitive subset
+  (generic/003, 029, 030, 032, 321, 322, 640) passes; generic/547 (fsstress
+  data mismatch) fails; generic/475, 011 not yet run. Broaden to the full
+  generic group, investigate the generic/547 failure, and run dirstress
+  (generic/011) + dm-error (generic/475) under FUSE.
 * [Done for xfstests] mkfs.briefs and fsck.briefs command line flags are
   sufficiently xfstests-compatible (force flag `-f`, check-only default,
   `-r -y` repair shape). Further standards alignment may be useful.

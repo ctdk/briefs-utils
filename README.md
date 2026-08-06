@@ -84,7 +84,7 @@ GLOBAL OPTIONS:
 fuse.briefs
 -----------
 
-A FUSE bridge for BrieFS so you can mount BrieFS volumes without the commitment of loading and/or battling with a kernel module. Currently read-only and basic. Supports the packed directory trie format introduced in BrieFS 0.7.0.
+A FUSE bridge for BrieFS so you can mount BrieFS volumes without the commitment of loading and/or battling with a kernel module. The FUSE bridge is **read-write** (full kernel parity) but **experimental**: it implements all directory and file operations (create, mkdir, unlink, rmdir, link, symlink, mknod, rename with renameat2 EXCHANGE/WHITEOUT), extended attributes (user/trusted/security), fileattr/chattr (FS_IOC_GETFLAGS/SETFLAGS, FS_IOC_FSGETXATTR/FSSETXATTR), fallocate (KEEP_SIZE/PUNCH_HOLE), setattr (chmod/chown/utimes/truncate), and killpriv (suid/sgid + security.capability stripping). It also ports the kernel journal write path to Go, making FUSE-written volumes crash-consistent and kernel-mountable. However, it has not yet been tested across the full xfstests suite — see the `xfstests-fuse-status.md` document for the current pass/fail record and known issues.
 
 ```
 NAME:
