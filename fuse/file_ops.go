@@ -194,6 +194,15 @@ func (b *BrieFS) writeFileData(ino uint64, data []byte, off int64) (int, error) 
 	if err != nil {
 		return 0, err
 	}
+	// chattr enforcement: an immutable file rejects all writes; an append-only
+	// file rejects writes that do not start at EOF. (FUSE bypasses the VFS
+	// generic_write_checks that enforce these for kernel-backed filesystems.)
+	if userFlagsImmutable(in) {
+		return 0, syscall.EPERM
+	}
+	if userFlagsAppendOnly(in) && off != int64(in.FileSize) {
+		return 0, syscall.EPERM
+	}
 	oldSize := int64(in.FileSize)
 	totalSize := off + int64(len(data))
 

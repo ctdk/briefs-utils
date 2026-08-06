@@ -241,6 +241,7 @@ var _ = (fs.NodeGetxattrer)((*brieFSNode)(nil))
 var _ = (fs.NodeSetxattrer)((*brieFSNode)(nil))
 var _ = (fs.NodeListxattrer)((*brieFSNode)(nil))
 var _ = (fs.NodeRemovexattrer)((*brieFSNode)(nil))
+var _ = (fs.NodeIoctler)((*brieFSNode)(nil))
 
 // collectExtents returns every extent of an inode in ascending offset order,
 // via briefs.IterateInodeExtents (which dispatches on InodeFlagIndexed: inline
@@ -595,4 +596,10 @@ func (n *brieFSNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscal
 // Removexattr removes an xattr. Mirrors briefs_xattr_set with value == nil.
 func (n *brieFSNode) Removexattr(ctx context.Context, name string) syscall.Errno {
 	return errToErrno(n.bfs.removeXattr(n.ino, name))
+}
+
+// Ioctl handles FS_IOC_GETFLAGS/SETFLAGS (chattr/lsattr) and
+// FS_IOC_FSGETXATTR/FSSETXATTR (xfs_io/statx). Unknown ioctls return ENOTTY.
+func (n *brieFSNode) Ioctl(ctx context.Context, f fs.FileHandle, cmd uint32, arg uint64, input []byte, output []byte) (int32, syscall.Errno) {
+	return n.bfs.ioctlFileattr(n.ino, cmd, input, output)
 }
