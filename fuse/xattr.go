@@ -149,6 +149,14 @@ func (b *BrieFS) setXattr(ino uint64, name string, value []byte, flags uint32) e
 	if err != nil {
 		return err
 	}
+	return b.setXattrLocked(in, name, value, flags)
+}
+
+// setXattrLocked is the core set/remove path assuming the inode-block lock is
+// held and @in is the current on-disk inode (it mutates @in in place). Used by
+// setXattr and by killpriv (removePrivs) to clear security.capability within a
+// write/truncate/chown without re-locking.
+func (b *BrieFS) setXattrLocked(in *briefs.Inode, name string, value []byte, flags uint32) error {
 	oldHead := in.XattrOffset
 
 	kvs, _, err := b.loadXattrEntries(in)

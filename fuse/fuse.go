@@ -281,6 +281,8 @@ var _ = (fs.NodeSymlinker)((*brieFSNode)(nil))
 var _ = (fs.NodeMknoder)((*brieFSNode)(nil))
 var _ = (fs.NodeRenamer)((*brieFSNode)(nil))
 var _ = (fs.NodeReadlinker)((*brieFSNode)(nil))
+var _ = (fs.NodeAllocater)((*brieFSNode)(nil))
+var _ = (fs.NodeSetattrer)((*brieFSNode)(nil))
 
 // collectExtents returns every extent of an inode in ascending offset order,
 // via briefs.IterateInodeExtents (which dispatches on InodeFlagIndexed: inline
@@ -696,4 +698,62 @@ func (n *brieFSNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 		return nil, errToErrno(err)
 	}
 	return []byte(target), 0
+}
+
+// fillAttrOut populates a FUSE AttrOut from an on-disk inode, including the
+// block count derived from its extents. Shared by Getattr and Setattr.
+func (n *brieFSNode) fillAttrOut(out *fuse.AttrOut, in *briefs.Inode) {
+	out.Mode = in.Filemode
+	out.Size = in.FileSize
+	out.Uid = in.Uid
+	out.Gid = in.Gid
+	out.Nlink = in.Nlinks
+	out.Atime = in.AtimeSec
+	out.Atimensec = uint32(in.AtimeNsec)
+	out.Mtime = in.MtimeSec
+	out.Mtimensec = uint32(in.MtimeNsec)
+	out.Ctime = in.CtimeSec
+	out.Ctimensec = uint32(in.CtimeNsec)
+	var totalBlocks uint64
+	exts, err := n.collectExtents(in)
+	if err == nil {
+		for _, ext := range exts {
+			totalBlocks += ext.Len
+		}
+	}
+	out.Blocks = totalBlocks * (n.bfs.blockSize / 512)
+	out.Blksize = uint32(n.bfs.blockSize)
+}
+
+// Setattr handles chmod/chown/utimes/truncate. Mirrors briefs_setattr
+// (file.c:836) via setattrOp (killpriv + truncate + metadata).
+func (n *brieFSNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	req := fuseSetAttrIn{
+		valid:     in.Valid,
+		size:      in.Size,
+		mode:      in.Mode,
+		uid:       in.Uid,
+		gid:       in.Gid,
+		atime:     in.Atime,
+		mtime:     in.Mtime,
+		ctime:     in.Ctime,
+		atimensec: in.Atimensec,
+		mtimensec: in.Mtimensec,
+		ctimensec: in.Ctimensec,
+	}
+	if err := n.bfs.setattrOp(n.ino, &req); err != nil {
+		return errToErrno(err)
+	}
+	di, err := n.bfs.inodes.ReadInode(n.ino)
+	if err != nil {
+		return syscall.EIO
+	}
+	n.fillAttrOut(out, di)
+	return 0
+}
+
+// Allocate handles fallocate. Mirrors briefs_fallocate (file.c:1876):
+// preallocate (unwritten extents) and PUNCH_HOLE; COLLAPSE/INSERT unsupported.
+func (n *brieFSNode) Allocate(ctx context.Context, f fs.FileHandle, off, size uint64, mode uint32) syscall.Errno {
+	return errToErrno(n.bfs.fallocateOp(n.ino, off, size, mode))
 }

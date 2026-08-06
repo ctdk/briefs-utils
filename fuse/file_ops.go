@@ -113,8 +113,8 @@ func (b *BrieFS) readFileData(ino uint64, dest []byte, off int64) ([]byte, error
 			readEnd = extEnd
 		}
 
-		if ext.Phys == 0 {
-			// Hole: zero the overlapping region.
+		if ext.Phys == 0 || ext.Flags&briefs.ExtentFlagUnwritten != 0 {
+			// Hole or unwritten (fallocate) extent: the region reads as zeros.
 			zeroStart := off
 			if zeroStart < extStart {
 				zeroStart = extStart
@@ -133,7 +133,10 @@ func (b *BrieFS) readFileData(ino uint64, dest []byte, off int64) ([]byte, error
 			continue
 		}
 
-		for blkOff := readStart; blkOff < readEnd; blkOff += blockSize {
+		// Iterate over block boundaries (not readStart, which may be mid-block)
+		// so the within-block offset (copyStart - blkOff) is correct.
+		firstBlk := (readStart / blockSize) * blockSize
+		for blkOff := firstBlk; blkOff < readEnd; blkOff += blockSize {
 			absBlock := ext.Phys + uint64((blkOff-extStart)/blockSize)
 			buf, err := b.dev.ReadBlock(absBlock)
 			if err != nil {
@@ -203,12 +206,21 @@ func (b *BrieFS) writeFileData(ino uint64, data []byte, off int64) (int, error) 
 	if userFlagsAppendOnly(in) && off != int64(in.FileSize) {
 		return 0, syscall.EPERM
 	}
+	// killpriv: a write to a setid file strips suid/sgid and clears
+	// security.capability (generic/093). Mirrors briefs_write_iter's
+	// file_remove_privs.
+	if err := b.removePrivs(in); err != nil {
+		return 0, err
+	}
 	oldSize := int64(in.FileSize)
 	totalSize := off + int64(len(data))
 
 	// Inline-data path: the file is inline (or empty) and the whole write fits
 	// in the 256-byte inline region.
-	if in.Flags&briefs.InodeFlagInlineData != 0 || oldSize == 0 {
+	// Inline-data path: the file is already inline, or it is truly empty (no
+	// extents — a size-0 file with fallocated unwritten extents is NOT empty and
+	// must stay extent-backed, else the write orphans the preallocated extents).
+	if in.Flags&briefs.InodeFlagInlineData != 0 || (oldSize == 0 && in.NumExtentsTotal == 0) {
 		if totalSize <= inlineDataMax {
 			b.writeInlineData(in, data, off, totalSize)
 			// Inline data lives in the snapshot-trusted inode block: commit, then
@@ -369,9 +381,13 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 		if found {
 			abs := ext.Phys + (iblock - ext.Offset)
 			var buf []byte
-			if segStart == blockStart && segEnd == blockEnd {
+			switch {
+			case ext.Flags&briefs.ExtentFlagUnwritten != 0:
+				// Unwritten (fallocate) block reads as zeros; write converts it.
+				buf = make([]byte, blockSize)
+			case segStart == blockStart && segEnd == blockEnd:
 				buf = make([]byte, blockSize) // full-block overwrite: no read needed
-			} else {
+			default:
 				buf, err = b.dev.ReadBlock(abs)
 				if err != nil {
 					b.rollbackAlloc(*allocated)
@@ -384,15 +400,12 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 				return 0, err
 			}
 			*drain = append(*drain, abs)
-			// A write into an unwritten extent converts it to written (clear the
-			// flag in the working list; the index rebuild persists the change).
+			// A write into an unwritten (fallocate) extent converts the written
+			// block to written and splits the extent: the blocks before/after stay
+			// unwritten (they still read as zeros). Clearing the flag on the whole
+			// extent would mark unwritten blocks written with stale content.
 			if ext.Flags&briefs.ExtentFlagUnwritten != 0 {
-				for i := range exts {
-					if exts[i].Offset == ext.Offset && exts[i].Phys == ext.Phys {
-						exts[i].Flags &^= briefs.ExtentFlagUnwritten
-						break
-					}
-				}
+				exts = splitUnwrittenAt(exts, ext, iblock)
 				rebuildNeeded = true
 			}
 		} else {
@@ -434,61 +447,75 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 	in.CtimeSec, in.CtimeNsec = sec, nsec
 
 	// --- Phase 2: journal + drain + commit + free old + write inode ---
-	// Journal JRN_EXTENT_ALLOC for every block allocated this op (data + btree
-	// nodes) so replay reserves them in the bitmap.
-	for _, rel := range *allocated {
-		if err := b.journalExtentAlloc(in.InodeNumber, 0, b.dataRegionStart+rel); err != nil {
+	var oldNodesToFree []uint64
+	if rebuildNeeded {
+		oldNodesToFree = oldNodes
+	}
+	if err := b.commitExtentChange(in, *allocated, nil, oldNodesToFree); err != nil {
+		return 0, err
+	}
+	return len(data), nil
+}
+
+// commitExtentChange journals and durably commits an extent-index change shared
+// by the write, fallocate, and truncate paths. allocatedRels are the new data +
+// btree-node blocks (already written to the page cache); freedAbs and
+// oldNodesAbs are data blocks / old btree nodes being freed. Ordering:
+// JRN_EXTENT_ALLOC -> drain -> JRN_INODE_FULL -> JRN_EXTENT_FREE -> Sync, so a
+// partial commit by a concurrent op's Sync can never publish the new root
+// without the drained blocks nor free blocks the on-disk inode still references.
+// The inode block is written after the commit (snapshot-trusted). The caller
+// must hold the inode's inodeBlockLock and have already mutated @in (size,
+// extents, times) in memory.
+func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels, freedAbs, oldNodesAbs []uint64) error {
+	ino := in.InodeNumber
+	for _, rel := range allocatedRels {
+		if err := b.journalExtentAlloc(ino, 0, b.dataRegionStart+rel); err != nil {
 			b.failWrite()
-			return 0, err
+			return err
 		}
 	}
-	// Drain data + btree nodes to disk BEFORE the snapshot commits (the
-	// snapshot trusts the btree root pointer; replay does not re-derive nodes).
+	// Drain new data + btree nodes before the snapshot commits (replay trusts
+	// the btree root pointer; it does not re-derive node contents).
 	if err := b.dev.Fdatasync(); err != nil {
 		b.failWrite()
-		return 0, err
+		return err
 	}
 	if err := b.journalInodeFull(in); err != nil {
 		b.failWrite()
-		return 0, err
+		return err
 	}
-	// Free replaced btree nodes AFTER the new-root snapshot is journaled. With
-	// concurrent file writes sharing the journal, another op's Sync may commit
-	// these records; ordering EXTENT_FREE after INODE_FULL means a partial commit
-	// can never free old nodes without also committing the new root (which would
-	// leave the on-disk inode referencing freed blocks). When the write was a
-	// pure RMW (no rebuild) oldNodes is the LIVE tree and must not be freed.
-	if rebuildNeeded {
-		for _, blk := range oldNodes {
-			if err := b.journalExtentFree(in.InodeNumber, blk); err != nil {
-				b.failWrite()
-				return 0, err
-			}
+	for _, abs := range freedAbs {
+		if err := b.journalExtentFree(ino, abs); err != nil {
+			b.failWrite()
+			return err
+		}
+	}
+	for _, abs := range oldNodesAbs {
+		if err := b.journalExtentFree(ino, abs); err != nil {
+			b.failWrite()
+			return err
 		}
 	}
 	if err := b.journal.Sync(false); err != nil {
 		b.failWrite()
-		return 0, err
+		return err
 	}
-	// The new root is committed; the replaced old btree nodes are no longer
-	// referenced. Free them in memory (their JRN_EXTENT_FREE is committed).
-	if rebuildNeeded {
-		for _, blk := range oldNodes {
-			b.dataAlloc.FreeBlock(blk - b.dataRegionStart)
-		}
+	for _, abs := range freedAbs {
+		b.dataAlloc.FreeBlock(abs - b.dataRegionStart)
 	}
-	// Write the inode block directly (snapshot-trusted; safe after the commit,
-	// since replay overwrites it from JRN_INODE_FULL if a crash preempts the
-	// write). Under the inodeBlockLock, no other op touches this block.
+	for _, abs := range oldNodesAbs {
+		b.dataAlloc.FreeBlock(abs - b.dataRegionStart)
+	}
 	if err := b.writeInodeDirect(in); err != nil {
 		b.failWrite()
-		return 0, err
+		return err
 	}
 	if err := b.dev.Fdatasync(); err != nil {
 		b.failWrite()
-		return 0, err
+		return err
 	}
-	return len(data), nil
+	return nil
 }
 
 // writeInodeDirect reads the inode-table block, patches the inode's slot with
@@ -562,6 +589,16 @@ func (b *BrieFS) zeroEofTail(exts []briefs.Extent, oldSize int64, drain *[]uint6
 // generalized to a full rebuild on every index change (valid under
 // drain-before-snapshot; the incremental insert is deferred).
 func (b *BrieFS) rebuildExtentIndex(in *briefs.Inode, exts []briefs.Extent, oldNodes []uint64, drain, allocated *[]uint64) error {
+	// No extents: clear the index (truncate to 0). oldNodes are freed by the
+	// caller's commitExtentChange.
+	if len(exts) == 0 {
+		in.Flags &^= briefs.InodeFlagIndexed
+		in.ExtentInlineBase = 0
+		in.NumExtentsInline = 0
+		in.NumExtentsTotal = 0
+		in.SetInlineExtents([8]briefs.Extent{})
+		return nil
+	}
 	// Inline-only stays inline if it fits and the inode is not tree-backed.
 	if len(exts) <= 8 && in.Flags&briefs.InodeFlagIndexed == 0 {
 		var arr [8]briefs.Extent
@@ -611,6 +648,30 @@ func (b *BrieFS) rebuildExtentIndex(in *briefs.Inode, exts []briefs.Extent, oldN
 	in.NumExtentsInline = 0
 	in.NumExtentsTotal = uint64(len(exts))
 	return nil
+}
+
+// splitUnwrittenAt replaces the unwritten extent @ext (covering @iblock) in the
+// sorted list with [before-unwritten, written-block, after-unwritten]: the
+// written block converts to a real (Flags=0) extent, the surrounding blocks
+// remain unwritten. Used by the write path when a write lands in an fallocate-
+// allocated extent.
+func splitUnwrittenAt(exts []briefs.Extent, ext briefs.Extent, iblock uint64) []briefs.Extent {
+	for i := range exts {
+		if exts[i].Offset == ext.Offset && exts[i].Phys == ext.Phys {
+			e := exts[i]
+			exts = append(exts[:i], exts[i+1:]...)
+			if iblock > e.Offset {
+				exts = insertExtentSorted(exts, briefs.Extent{Offset: e.Offset, Phys: e.Phys, Len: iblock - e.Offset, Flags: briefs.ExtentFlagUnwritten})
+			}
+			exts = insertExtentSorted(exts, briefs.Extent{Offset: iblock, Phys: e.Phys + (iblock - e.Offset), Len: 1, Flags: 0})
+			extEnd := e.Offset + e.Len
+			if after := iblock + 1; after < extEnd {
+				exts = insertExtentSorted(exts, briefs.Extent{Offset: after, Phys: e.Phys + (after - e.Offset), Len: extEnd - after, Flags: briefs.ExtentFlagUnwritten})
+			}
+			return exts
+		}
+	}
+	return exts
 }
 
 // --- extent list helpers ---
