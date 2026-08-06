@@ -200,7 +200,12 @@ func (b *BrieFS) dirIsEmpty(di *briefs.Inode) bool {
 // inode on a fresh create, the existing inode when the name is already present
 // and excl is false, or EEXIST when the name is present and excl is true.  The
 // caller must hold b.mu.
-func (b *BrieFS) createInDir(parentIno uint64, name string, mode, uid, gid uint32, excl bool) (*briefs.Inode, error) {
+// createNamedInode is the shared create path for files, directories, special
+// files (mknod), and symlinks. rdev is stored on the inode for block/char
+// devices; symlinkTarget (non-empty only for symlinks) is stored inline (<=256B)
+// or in one data block plus a JRN_SYMLINK_DATA record. The caller must hold
+// b.mu (taken here) — it is a directory operation.
+func (b *BrieFS) createNamedInode(parentIno uint64, name string, mode, uid, gid uint32, excl bool, rdev uint64, symlinkTarget string) (*briefs.Inode, error) {
 	if b.readOnly {
 		return nil, syscall.EROFS
 	}
@@ -278,6 +283,54 @@ func (b *BrieFS) createInDir(parentIno uint64, name string, mode, uid, gid uint3
 		b.cacheAbort()
 	}
 
+	// Special files carry their device number.
+	if rdev != 0 {
+		child.Rdev = rdev
+	}
+
+	// Symlinks store their target before the inode is persisted: inline for
+	// targets <= 256B, otherwise one data block journaled JRN_SYMLINK_DATA (the
+	// target is restored verbatim on replay, so the block is re-derivable and
+	// the cache flush at the end suffices).
+	if symlinkTarget != "" {
+		tlen := uint64(len(symlinkTarget))
+		child.FileSize = tlen
+		if tlen <= inlineDataMax {
+			region := [256]byte{}
+			copy(region[:], symlinkTarget)
+			child.SetInlineData(region)
+			child.Flags |= briefs.InodeFlagInlineData
+		} else {
+			rel := b.dataAlloc.AllocBlock()
+			if rel == 0 {
+				abort()
+				return nil, syscall.ENOSPC
+			}
+			abs := b.dataRegionStart + rel
+			buf := make([]byte, b.blockSize)
+			copy(buf, symlinkTarget)
+			if err := b.saveBlock(abs, buf); err != nil {
+				b.dataAlloc.FreeBlock(rel)
+				abort()
+				return nil, err
+			}
+			if err := b.journalExtentAlloc(child.InodeNumber, 0, abs); err != nil {
+				b.dataAlloc.FreeBlock(rel)
+				abort()
+				return nil, err
+			}
+			if err := b.journal.WriteRecord(briefs.JRN_SYMLINK_DATA,
+				(&briefs.JrnSymlinkData{Ino: child.InodeNumber, Phys: abs, TargetLen: uint32(tlen), Target: []byte(symlinkTarget)}).Marshal()); err != nil {
+				b.dataAlloc.FreeBlock(rel)
+				abort()
+				return nil, err
+			}
+			child.SetInlineExtent(0, 0, abs, 1, 0)
+			child.NumExtentsInline = 1
+			child.NumExtentsTotal = 1
+		}
+	}
+
 	// Directories get their own trie root before being linked into the parent.
 	if isDir {
 		if err := b.trieCreateRoot(child); err != nil {
@@ -336,7 +389,20 @@ func (b *BrieFS) createInDir(parentIno uint64, name string, mode, uid, gid uint3
 	return child, nil
 }
 
-// unlinkInDir removes a directory entry and drops the target's link count,
+// createInDir is the file/directory create path (no rdev, no symlink target).
+func (b *BrieFS) createInDir(parentIno uint64, name string, mode, uid, gid uint32, excl bool) (*briefs.Inode, error) {
+	return b.createNamedInode(parentIno, name, mode, uid, gid, excl, 0, "")
+}
+
+// mknodInDir creates a special file (block/char device, fifo, socket).
+func (b *BrieFS) mknodInDir(parentIno uint64, name string, mode, uid, gid uint32, rdev uint64) (*briefs.Inode, error) {
+	return b.createNamedInode(parentIno, name, mode, uid, gid, false, rdev, "")
+}
+
+// symlinkInDir creates a symbolic link with the given target.
+func (b *BrieFS) symlinkInDir(parentIno uint64, name string, target string, uid, gid uint32) (*briefs.Inode, error) {
+	return b.createNamedInode(parentIno, name, briefs.ModeSymlink|0o777, uid, gid, false, 0, target)
+}
 // mirroring briefs_unlink_common (dir.c:586).  isRmdir selects the rmdir path
 // (ENOTDIR/ENOTEMPTY checks, parent nlink drop, child nlink cleared).  When the
 // target's nlink reaches zero its inode is freed immediately (the kernel
@@ -441,8 +507,11 @@ func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error 
 		return err
 	}
 
-	// If the child is now unreferenced, free its inode.  (Data-extent freeing
-	// for non-empty files lands in Phase 5.)
+	// If the child is now unreferenced, free its data extents, its trie (for a
+	// dir), and its inode.  The JRN_DIR_UPDATE(del) above is already journaled,
+	// so the JRN_EXTENT_FREE records here cannot be committed without the entry
+	// removal (a partial commit never frees blocks the on-disk inode still
+	// references).
 	if child.Nlinks == 0 {
 		// For a removed directory, free its own trie root page.  The kernel
 		// does this at evict time (briefs_evict_inode); the FUSE bridge has no
@@ -457,6 +526,11 @@ func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error 
 				return err
 			}
 			child.DirTrieRoot = 0
+		}
+		// Free the file's data blocks + btree nodes (no-op for dirs/inline).
+		if err := b.freeInodeData(child); err != nil {
+			b.cacheAbort()
+			return err
 		}
 		if err := b.FreeInode(childIno); err != nil {
 			b.cacheAbort()

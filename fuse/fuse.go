@@ -211,6 +211,40 @@ func (b *BrieFS) lockOtherInodeBlock(parentIno, childIno uint64) *sync.Mutex {
 	return cLock
 }
 
+// lockInodeShards locks the (deduplicated) shards for a set of inodes in
+// ascending shard order and returns a cleanup that unlocks in reverse. Used by
+// multi-inode dir ops (rename), which also hold the global dir lock, so no two
+// dir ops hold these concurrently; the ascending order + dedup avoids self-
+// deadlock when several inodes share a shard.
+func (b *BrieFS) lockInodeShards(inos []uint64) func() {
+	seen := map[uint64]*sync.Mutex{}
+	var shards []uint64
+	for _, ino := range inos {
+		s, m := b.inodeBlockShard(ino)
+		if _, ok := seen[s]; !ok {
+			seen[s] = m
+			shards = append(shards, s)
+		}
+	}
+	sortShards(shards)
+	for _, s := range shards {
+		seen[s].Lock()
+	}
+	return func() {
+		for i := len(shards) - 1; i >= 0; i-- {
+			seen[shards[i]].Unlock()
+		}
+	}
+}
+
+func sortShards(s []uint64) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+			s[j-1], s[j] = s[j], s[j-1]
+		}
+	}
+}
+
 // readSuperblock reads and parses the superblock from block 0.
 // readSuperblock reads and parses the superblock from block 0.
 func readSuperblock(dev *BlockDevice) (*briefs.SuperblockLayout, error) {
@@ -242,6 +276,11 @@ var _ = (fs.NodeSetxattrer)((*brieFSNode)(nil))
 var _ = (fs.NodeListxattrer)((*brieFSNode)(nil))
 var _ = (fs.NodeRemovexattrer)((*brieFSNode)(nil))
 var _ = (fs.NodeIoctler)((*brieFSNode)(nil))
+var _ = (fs.NodeLinker)((*brieFSNode)(nil))
+var _ = (fs.NodeSymlinker)((*brieFSNode)(nil))
+var _ = (fs.NodeMknoder)((*brieFSNode)(nil))
+var _ = (fs.NodeRenamer)((*brieFSNode)(nil))
+var _ = (fs.NodeReadlinker)((*brieFSNode)(nil))
 
 // collectExtents returns every extent of an inode in ascending offset order,
 // via briefs.IterateInodeExtents (which dispatches on InodeFlagIndexed: inline
@@ -602,4 +641,59 @@ func (n *brieFSNode) Removexattr(ctx context.Context, name string) syscall.Errno
 // FS_IOC_FSGETXATTR/FSSETXATTR (xfs_io/statx). Unknown ioctls return ENOTTY.
 func (n *brieFSNode) Ioctl(ctx context.Context, f fs.FileHandle, cmd uint32, arg uint64, input []byte, output []byte) (int32, syscall.Errno) {
 	return n.bfs.ioctlFileattr(n.ino, cmd, input, output)
+}
+
+// Link creates a hard link. Mirrors briefs_link (dir.c:432).
+func (n *brieFSNode) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	src, ok := target.(*brieFSNode)
+	if !ok {
+		return nil, syscall.EINVAL
+	}
+	in, err := n.bfs.linkInDir(n.ino, name, src.ino)
+	if err != nil {
+		return nil, errToErrno(err)
+	}
+	n.fillEntryOut(out, in)
+	return n.newChildNode(ctx, in), 0
+}
+
+// Symlink creates a symbolic link. Mirrors briefs_symlink (file.c:2160).
+func (n *brieFSNode) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	uid, gid := callerCreds(ctx)
+	in, err := n.bfs.symlinkInDir(n.ino, name, target, uid, gid)
+	if err != nil {
+		return nil, errToErrno(err)
+	}
+	n.fillEntryOut(out, in)
+	return n.newChildNode(ctx, in), 0
+}
+
+// Mknod creates a special file. Mirrors briefs_mknod (file.c:2265).
+func (n *brieFSNode) Mknod(ctx context.Context, name string, mode, dev uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	uid, gid := callerCreds(ctx)
+	in, err := n.bfs.mknodInDir(n.ino, name, mode, uid, gid, uint64(dev))
+	if err != nil {
+		return nil, errToErrno(err)
+	}
+	n.fillEntryOut(out, in)
+	return n.newChildNode(ctx, in), 0
+}
+
+// Rename renames a directory entry, dispatching on the renameat2 flags
+// (EXCHANGE / WHITEOUT / NOREPLACE). Mirrors briefs_rename (dir.c:1162).
+func (n *brieFSNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	np, ok := newParent.(*brieFSNode)
+	if !ok {
+		return syscall.EINVAL
+	}
+	return errToErrno(n.bfs.renameInDir(n.ino, name, np.ino, newName, flags))
+}
+
+// Readlink returns the target of a symlink. Mirrors briefs_get_link.
+func (n *brieFSNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
+	target, err := n.bfs.readSymlink(n.ino)
+	if err != nil {
+		return nil, errToErrno(err)
+	}
+	return []byte(target), 0
 }
