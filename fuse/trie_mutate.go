@@ -152,6 +152,9 @@ func (b *BrieFS) triePageInit(depth, byteVal, nodeType uint8) (uint64, error) {
 		return 0, syscall.ENOSPC
 	}
 	block := b.dataRegionStart + rel
+	if b.inReplay {
+		rlog("    triePageInit(replay alloc) depth=%d block=%d rel=%d", depth, block, rel)
+	}
 
 	buf := make([]byte, b.blockSize)
 	binary.LittleEndian.PutUint32(buf[triePageMagicOff:], briefs.MagicTriePage)

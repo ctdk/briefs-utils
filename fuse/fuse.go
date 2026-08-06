@@ -67,6 +67,7 @@ type BrieFS struct {
 	xattrFinal map[uint64]uint64 // ino -> final xattr_offset (last JRN_INODE_FULL wins)
 	xattrNext  map[uint64]uint64 // phys xattr block -> next_block link
 	xattrLive  map[uint64]bool   // phys xattr blocks still referenced by a final chain
+	inReplay   bool              // true during replayJournal (trie page-init logging/gating)
 
 	// readOnly is set after a post-journal (phase-2) write error leaves the
 	// journal with uncommitted records referencing in-flight allocations.

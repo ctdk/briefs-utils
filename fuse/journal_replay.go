@@ -38,10 +38,28 @@ package fuse
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
 	"syscall"
 
 	"github.com/ctdk/briefs-utils/briefs"
 )
+
+// replayDebug, when set (BRIEFS_REPLAY_DEBUG=1), logs the replay to
+// /tmp/briefs-replay.log for diagnosis.
+var replayDebug = os.Getenv("BRIEFS_REPLAY_DEBUG") == "1"
+
+// rlog appends a replay debug line to /tmp/briefs-replay.log.
+func rlog(format string, args ...interface{}) {
+	if !replayDebug {
+		return
+	}
+	f, err := os.OpenFile("/tmp/briefs-replay.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, format+"\n", args...)
+}
 
 // replayJournal replays the live journal range at mount. It is a no-op when the
 // journal is clean (log_start == log_end). On success the journal is marked
@@ -49,6 +67,7 @@ import (
 // are persisted.
 func (b *BrieFS) replayJournal() error {
 	start, end, _ := b.journal.ReplayLogRange()
+	rlog("replayJournal: start=%d end=%d dirty=%v", start, end, start != end)
 	if start == end {
 		return nil // clean, nothing to replay
 	}
@@ -64,7 +83,11 @@ func (b *BrieFS) replayJournal() error {
 	}()
 
 	b.journal.SetInReplay(true)
-	defer b.journal.SetInReplay(false)
+	b.inReplay = true
+	defer func() {
+		b.journal.SetInReplay(false)
+		b.inReplay = false
+	}()
 
 	// One block cache spans the whole replay so re-derivation shares buffers.
 	b.cacheBegin()
@@ -158,6 +181,7 @@ func (b *BrieFS) walkJournal(reserveOnly bool) error {
 			}
 
 			recData := buf[off+briefs.JournalRecordHdrSize : off+briefs.JournalRecordHdrSize+dlen]
+			rlog("rec block=%d type=%d dlen=%d", cur, rtype, dlen)
 
 			// Checksum verify (zero checksum = legacy, accepted).
 			if !briefs.VerifyJournalRecordChecksum(rtype, hdr.Flags, recData, hdr.Checksum) {
@@ -337,17 +361,21 @@ func (b *BrieFS) replayDirUpdate(rec *briefs.JrnDirUpdate) error {
 	}
 
 	if rec.Op == 0 {
+		rlog("  dir-add parent=%d name=%q child=%d ftype=%d rootBefore=%d", rec.ParentIno, rec.Name, rec.ChildIno, rec.FType, di.DirTrieRoot)
 		if err := b.TrieInsert(di, rec.Name, rec.ChildIno, rec.FType); err != nil {
 			if err != syscall.EEXIST {
 				return err
 			}
 		}
+		rlog("    -> rootAfter=%d", di.DirTrieRoot)
 	} else {
+		rlog("  dir-del parent=%d name=%q rootBefore=%d", rec.ParentIno, rec.Name, di.DirTrieRoot)
 		if err := b.TrieRemove(di, rec.Name); err != nil {
 			if err != syscall.ENOENT {
 				return err
 			}
 		}
+		rlog("    -> rootAfter=%d", di.DirTrieRoot)
 	}
 
 	// Persist the parent disk inode (replayed trie root) into the cached block.
@@ -367,6 +395,12 @@ func (b *BrieFS) replayInodeFull(ino uint64, data []byte) error {
 	if raw == nil {
 		return nil
 	}
+	// Log the DirTrieRoot carried in the snapshot (offset 384).
+	var snapRoot uint64
+	if len(raw) >= 384+8 {
+		snapRoot = binary.LittleEndian.Uint64(raw[384:])
+	}
+	rlog("  inode-full ino=%d snapDirTrieRoot=%d", ino, snapRoot)
 	blk, off := b.inodes.inodeLocation(ino)
 	buf, err := b.loadBlock(blk)
 	if err != nil {
