@@ -7,6 +7,7 @@
   setattr/killpriv), Go journal port, per-inode-block locking. Still
   experimental — see xfstests-fuse-status.md for the xfstests pass/fail
   record and known issues.
+* The FUSE bridge should support the same mount options as the kernel module.
 * Expand xfstests coverage for BrieFS under FUSE: the replay-sensitive subset
   (generic/003, 029, 030, 032, 321, 322, 640, 475, 011) now passes under
   FUSE (475 dm-error replay + 011 dirstress confirmed on 2026-08-06);
