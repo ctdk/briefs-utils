@@ -136,6 +136,14 @@ func Mount(imagePath string, opts MountOptions) error {
 			Name:  "briefs",
 			Debug: opts.Debug,
 		},
+		// The root is never produced by a Lookup, so without this its
+		// stableAttr.Ino is 0 and stat reports ino 0 (and ".." from the
+		// root resolves to a go-fuse virtual inode).  Pin it to the real
+		// BrieFS root ino for parity with the kernel module.
+		RootStableAttr: &fs.StableAttr{
+			Ino:  sb.RootIno,
+			Mode: uint32(briefs.ModeDir),
+		},
 	})
 	if err != nil {
 		dev.Close()
@@ -399,12 +407,28 @@ func (n *brieFSNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 		return nil, syscall.EIO
 	}
 
+	var entries []fuse.DirEntry
+	dirMode := uint32(briefs.ModeDir)
+
+	// BrieFS does not store "." or ".." as trie entries. Like the kernel's
+	// dir_emit_dots, synthesize them here so `ls -a` (and empty directories)
+	// show them. ".." is the parent directory; the root's parent is itself.
+	parentIno := n.ino
+	if !n.IsRoot() {
+		if _, p := n.Parent(); p != nil {
+			if pn, ok := p.Operations().(*brieFSNode); ok && pn.ino != 0 {
+				parentIno = pn.ino
+			}
+		}
+	}
+	entries = append(entries, fuse.DirEntry{Mode: dirMode, Ino: n.ino, Name: "."})
+	entries = append(entries, fuse.DirEntry{Mode: dirMode, Ino: parentIno, Name: ".."})
+
 	if diskInode.DirTrieRoot == 0 {
-		return fs.NewListDirStream(nil), 0
+		return fs.NewListDirStream(entries), 0
 	}
 
 	iter := NewTrieIterator(n.bfs.dev, diskInode.DirTrieRoot)
-	var entries []fuse.DirEntry
 
 	for {
 		ino, ftype, name, err := iter.Next()
