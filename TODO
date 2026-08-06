@@ -8,10 +8,10 @@
   experimental — see xfstests-fuse-status.md for the xfstests pass/fail
   record and known issues.
 * Expand xfstests coverage for BrieFS under FUSE: the replay-sensitive subset
-  (generic/003, 029, 030, 032, 321, 322, 640) passes; generic/547 (fsstress
-  data mismatch) fails; generic/475, 011 not yet run. Broaden to the full
-  generic group, investigate the generic/547 failure, and run dirstress
-  (generic/011) + dm-error (generic/475) under FUSE.
+  (generic/003, 029, 030, 032, 321, 322, 640, 475, 011) now passes under
+  FUSE (475 dm-error replay + 011 dirstress confirmed on 2026-08-06);
+  generic/547 (fsstress data mismatch) still fails. Broaden to the full
+  generic group and investigate the generic/547 failure.
 * [Done for xfstests] mkfs.briefs and fsck.briefs command line flags are
   sufficiently xfstests-compatible (force flag `-f`, check-only default,
   `-r -y` repair shape). Further standards alignment may be useful.
