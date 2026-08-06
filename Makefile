@@ -1,5 +1,9 @@
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
+# mount(8) only searches for type helpers in /sbin and /usr/sbin (not
+# /usr/local/sbin), so the mount.fuse.briefs helper defaults to /usr/sbin;
+# override SBINDIR for packaging.
+SBINDIR ?= /usr/sbin
 
 .PHONY: all generate mkfs fsck fuse install clean
 
@@ -22,6 +26,8 @@ install: all
 	install -m 0755 mkfs.briefs $(DESTDIR)$(BINDIR)/mkfs.briefs
 	install -m 0755 fsck.briefs $(DESTDIR)$(BINDIR)/fsck.briefs
 	install -m 0755 fuse.briefs $(DESTDIR)$(BINDIR)/fuse.briefs
+	install -d $(DESTDIR)$(SBINDIR)
+	install -m 0755 mount.fuse.briefs $(DESTDIR)$(SBINDIR)/mount.fuse.briefs
 
 clean:
 	rm -f mkfs.briefs fsck.briefs fuse.briefs

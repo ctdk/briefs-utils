@@ -1,0 +1,72 @@
+#!/bin/bash
+# mount.fuse.briefs — mount(8) helper for `mount -t fuse.briefs`.
+#
+# mount(8) invokes a type-specific helper as:
+#
+#	mount.fuse.briefs <src> <target> -t fuse.briefs -o <options>
+#
+# This helper translates that into the fuse.briefs daemon invocation
+# (`fuse.briefs -i <src> -m <target>`), backgrounds it detached from the
+# controlling terminal (so mount doesn't wait on it), and waits for the
+# FUSE mount to become visible.  Unmounting is handled by the kernel via
+# the normal `umount <target>` path (which delivers DESTROY to the daemon,
+# letting it checkpoint the journal and exit cleanly).
+#
+# The helper is a userspace convenience only; `mount -t fuse.briefs` works
+# purely through this script and the fuse.briefs daemon — no kernel module
+# registration is involved.
+set -uo pipefail
+
+src=""
+target=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o)   shift; shift ;;
+    -o*)  shift ;;
+    -t)   shift; shift ;;
+    -t*)  shift ;;
+    -v|-f|-n|-i) shift ;;
+    --)   shift; break ;;
+    *)    if [ -z "$src" ]; then src="$1"
+          elif [ -z "$target" ]; then target="$1"; fi
+          shift ;;
+  esac
+done
+for a in "$@"; do
+  if [ -z "$src" ]; then src="$a"; elif [ -z "$target" ]; then target="$a"; fi
+done
+
+if [ -z "$src" ] || [ -z "$target" ]; then
+  echo "mount.fuse.briefs: usage: mount -t fuse.briefs <src> <target>" >&2
+  exit 64
+fi
+
+# Locate the fuse.briefs daemon: $FUSE_BRIEFS, then PATH, then common install dirs.
+daemon="${FUSE_BRIEFS:-}"
+if [ -z "$daemon" ] || ! command -v "$daemon" >/dev/null 2>&1; then
+  daemon="$(command -v fuse.briefs 2>/dev/null || true)"
+fi
+if [ -z "$daemon" ]; then
+  for d in /usr/local/bin/fuse.briefs /usr/bin/fuse.briefs /go/bin/fuse.briefs; do
+    [ -x "$d" ] && daemon="$d" && break
+  done
+fi
+if [ -z "$daemon" ]; then
+  echo "mount.fuse.briefs: fuse.briefs daemon not found (set FUSE_BRIEFS or install it)" >&2
+  exit 127
+fi
+
+mkdir -p "$target"
+log="/tmp/fuse.briefs-$(echo "$target" | tr / _).log"
+setsid "$daemon" -i "$src" -m "$target" </dev/null >"$log" 2>&1 &
+
+# Wait for the FUSE mount to become visible.
+for i in $(seq 1 100); do
+  if mountpoint -q "$target" 2>/dev/null; then
+    exit 0
+  fi
+  sleep 0.1
+done
+
+echo "mount.fuse.briefs: timed out waiting for $target; see $log" >&2
+exit 1

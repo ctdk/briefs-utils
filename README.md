@@ -86,6 +86,27 @@ fuse.briefs
 
 A FUSE bridge for BrieFS so you can mount BrieFS volumes without the commitment of loading and/or battling with a kernel module. The FUSE bridge is **read-write** (full kernel parity) but **experimental**: it implements all directory and file operations (create, mkdir, unlink, rmdir, link, symlink, mknod, rename with renameat2 EXCHANGE/WHITEOUT), extended attributes (user/trusted/security), fileattr/chattr (FS_IOC_GETFLAGS/SETFLAGS, FS_IOC_FSGETXATTR/FSSETXATTR), fallocate (KEEP_SIZE/PUNCH_HOLE), setattr (chmod/chown/utimes/truncate), and killpriv (suid/sgid + security.capability stripping). It also ports the kernel journal write path to Go, making FUSE-written volumes crash-consistent and kernel-mountable. However, it has not yet been tested across the full xfstests suite — see the `xfstests-fuse-status.md` document for the current pass/fail record and known issues.
 
+### Mounting with `mount -t fuse.briefs`
+
+`mount -t fuse.briefs <dev> <mnt>` works once the `mount.fuse.briefs` helper
+is installed in a directory `mount(8)` searches (`/sbin` or `/usr/sbin` —
+**not** `/usr/local/sbin`). `make install` places it in `/usr/sbin` by default
+(override `SBINDIR=` otherwise). The helper is a thin wrapper that
+backgrounds the `fuse.briefs` daemon and waits for the mount to come up:
+
+```
+$ sudo make install
+$ sudo mount -t fuse.briefs /dev/vdb1 /mnt/briefs
+$ ls -a /mnt/briefs
+.  ..  ...
+$ sudo umount /mnt/briefs
+```
+
+No kernel module and no `umount` helper are needed: `umount <mnt>` goes
+through the kernel FUSE unmount path, which delivers DESTROY to the daemon so
+it checkpoints the journal and exits cleanly. (`mount -t fuse.briefs` is a
+pure userspace mount; the BrieFS kernel module need not be loaded.)
+
 ```
 NAME:
    briefs-fuse - Mount a BrieFS filesystem image via FUSE
