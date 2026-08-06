@@ -153,6 +153,15 @@ func Mount(imagePath string, opts MountOptions) error {
 		MountOptions: fuse.MountOptions{
 			Name:  "briefs",
 			Debug: opts.Debug,
+			// FsName becomes the mount source (first column of
+			// /proc/mounts).  xfstests verifies a mount with
+			// `findmnt -S <dev>`, matching by source; without this the
+			// FUSE mount's source is the subtype name ("briefs"), so
+			// findmnt finds nothing and xfstests treats the device as
+			// unmounted (_check_if_dev_already_mounted -> _exit 1).
+			// Setting FsName to the backing device path makes the source
+			// match, like the kernel mount (/dev/vdb1 ... briefs).
+			FsName: imagePath,
 		},
 		// The root is never produced by a Lookup, so without this its
 		// stableAttr.Ino is 0 and stat reports ino 0 (and ".." from the
