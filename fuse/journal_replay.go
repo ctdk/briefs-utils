@@ -436,7 +436,7 @@ func (b *BrieFS) replayInodeUpdate(rec *briefs.JrnInodeUpdate) error {
 	di.Nlinks = rec.Nlink
 	di.Uid = rec.Uid
 	di.Gid = rec.Gid
-	di.FileSize = rec.Size
+	di.FileSize = rec.FileSize
 	di.AtimeSec = rec.ATimeSec
 	di.AtimeNsec = rec.ATimeNsec
 	di.MtimeSec = rec.MTimeSec

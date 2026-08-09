@@ -8,6 +8,172 @@ import (
 	"unsafe"
 )
 
+// Size returns the on-disk size of AllocHeader.
+func (s *AllocHeader) Size() int { return int(unsafe.Sizeof(AllocHeader{})) }
+
+// MarshalBinary serializes AllocHeader to its little-endian on-disk representation.
+func (s *AllocHeader) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint32(data[pos:], s.Magic); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Version); pos += 4
+	binary.LittleEndian.PutUint64(data[pos:], s.L0Words); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.L1Words); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.L2Words); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.BlockCount); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.FreeCount); pos += 8
+	return data, nil
+}
+
+// UnmarshalBinary deserializes AllocHeader from its little-endian on-disk representation.
+func (s *AllocHeader) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("AllocHeader data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Magic = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Version = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.L0Words = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.L1Words = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.L2Words = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.BlockCount = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.FreeCount = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	return nil
+}
+
+// Compile-time size assertion for AllocHeader.
+var _ = [1]struct{}{}[unsafe.Sizeof(AllocHeader{}) - 48]
+
+// Size returns the on-disk size of BtreeIdxEntry.
+func (s *BtreeIdxEntry) Size() int { return int(unsafe.Sizeof(BtreeIdxEntry{})) }
+
+// MarshalBinary serializes BtreeIdxEntry to its little-endian on-disk representation.
+func (s *BtreeIdxEntry) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint64(data[pos:], s.Child); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.HighKey); pos += 8
+	return data, nil
+}
+
+// UnmarshalBinary deserializes BtreeIdxEntry from its little-endian on-disk representation.
+func (s *BtreeIdxEntry) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("BtreeIdxEntry data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Child = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.HighKey = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	return nil
+}
+
+// Compile-time size assertion for BtreeIdxEntry.
+var _ = [1]struct{}{}[unsafe.Sizeof(BtreeIdxEntry{}) - 16]
+
+// Size returns the on-disk size of BtreeNodeHeader.
+func (s *BtreeNodeHeader) Size() int { return int(unsafe.Sizeof(BtreeNodeHeader{})) }
+
+// MarshalBinary serializes BtreeNodeHeader to its little-endian on-disk representation.
+func (s *BtreeNodeHeader) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint32(data[pos:], s.Magic); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Flags); pos += 4
+	binary.LittleEndian.PutUint16(data[pos:], s.Level); pos += 2
+	binary.LittleEndian.PutUint16(data[pos:], s.NumKeys); pos += 2
+	binary.LittleEndian.PutUint32(data[pos:], s._Pad); pos += 4
+	binary.LittleEndian.PutUint64(data[pos:], s.NextLeaf); pos += 8
+	return data, nil
+}
+
+// UnmarshalBinary deserializes BtreeNodeHeader from its little-endian on-disk representation.
+func (s *BtreeNodeHeader) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("BtreeNodeHeader data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Magic = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Flags = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Level = binary.LittleEndian.Uint16(data[pos:]); pos += 2
+	s.NumKeys = binary.LittleEndian.Uint16(data[pos:]); pos += 2
+	s._Pad = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.NextLeaf = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	return nil
+}
+
+// Compile-time size assertion for BtreeNodeHeader.
+var _ = [1]struct{}{}[unsafe.Sizeof(BtreeNodeHeader{}) - 24]
+
+// Size returns the on-disk size of Checkpoint.
+func (s *Checkpoint) Size() int { return int(unsafe.Sizeof(Checkpoint{})) }
+
+// MarshalBinary serializes Checkpoint to its little-endian on-disk representation.
+func (s *Checkpoint) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint64(data[pos:], s.Seq); pos += 8
+	binary.LittleEndian.PutUint32(data[pos:], s.RecordCount); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Reserved1); pos += 4
+	binary.LittleEndian.PutUint64(data[pos:], s.LogSequenceEnd); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.TrieRootNode); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.FreeDataCount); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.FreeInodeCount); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.Reserved2); pos += 8
+	return data, nil
+}
+
+// UnmarshalBinary deserializes Checkpoint from its little-endian on-disk representation.
+func (s *Checkpoint) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("Checkpoint data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Seq = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.RecordCount = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Reserved1 = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.LogSequenceEnd = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.TrieRootNode = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.FreeDataCount = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.FreeInodeCount = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Reserved2 = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	return nil
+}
+
+// Compile-time size assertion for Checkpoint.
+var _ = [1]struct{}{}[unsafe.Sizeof(Checkpoint{}) - 56]
+
+// Size returns the on-disk size of Extent.
+func (s *Extent) Size() int { return int(unsafe.Sizeof(Extent{})) }
+
+// MarshalBinary serializes Extent to its little-endian on-disk representation.
+func (s *Extent) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint64(data[pos:], s.Offset); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.Phys); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.Len); pos += 8
+	binary.LittleEndian.PutUint32(data[pos:], s.Flags); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Pad); pos += 4
+	return data, nil
+}
+
+// UnmarshalBinary deserializes Extent from its little-endian on-disk representation.
+func (s *Extent) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("Extent data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Offset = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Phys = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Len = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Flags = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Pad = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	return nil
+}
+
+// Compile-time size assertion for Extent.
+var _ = [1]struct{}{}[unsafe.Sizeof(Extent{}) - 32]
+
 // Size returns the on-disk size of Inode.
 func (s *Inode) Size() int { return int(unsafe.Sizeof(Inode{})) }
 
@@ -89,6 +255,310 @@ func (s *Inode) UnmarshalBinary(data []byte) error {
 
 // Compile-time size assertion for Inode.
 var _ = [1]struct{}{}[unsafe.Sizeof(Inode{}) - 512]
+
+// Size returns the on-disk size of JournalBlockHeader.
+func (s *JournalBlockHeader) Size() int { return int(unsafe.Sizeof(JournalBlockHeader{})) }
+
+// MarshalBinary serializes JournalBlockHeader to its little-endian on-disk representation.
+func (s *JournalBlockHeader) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint32(data[pos:], s.Magic); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.BlockSeq); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.RecordCount); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Reserved); pos += 4
+	return data, nil
+}
+
+// UnmarshalBinary deserializes JournalBlockHeader from its little-endian on-disk representation.
+func (s *JournalBlockHeader) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("JournalBlockHeader data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Magic = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.BlockSeq = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.RecordCount = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Reserved = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	return nil
+}
+
+// Compile-time size assertion for JournalBlockHeader.
+var _ = [1]struct{}{}[unsafe.Sizeof(JournalBlockHeader{}) - 16]
+
+// Size returns the on-disk size of JrnExtentAlloc.
+func (s *JrnExtentAlloc) Size() int { return int(unsafe.Sizeof(JrnExtentAlloc{})) }
+
+// MarshalBinary serializes JrnExtentAlloc to its little-endian on-disk representation.
+func (s *JrnExtentAlloc) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint64(data[pos:], s.Ino); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.Offset); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.Length); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.PhysStart); pos += 8
+	binary.LittleEndian.PutUint32(data[pos:], s.ExtentIndex); pos += 4
+	copy(data[pos:], s.Reserved[:]); pos += 44
+	return data, nil
+}
+
+// UnmarshalBinary deserializes JrnExtentAlloc from its little-endian on-disk representation.
+func (s *JrnExtentAlloc) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("JrnExtentAlloc data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Ino = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Offset = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Length = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.PhysStart = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.ExtentIndex = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	copy(s.Reserved[:], data[pos:pos+44]); pos += 44
+	return nil
+}
+
+// Compile-time size assertion for JrnExtentAlloc.
+var _ = [1]struct{}{}[unsafe.Sizeof(JrnExtentAlloc{}) - 80]
+
+// Size returns the on-disk size of JrnExtentFree.
+func (s *JrnExtentFree) Size() int { return int(unsafe.Sizeof(JrnExtentFree{})) }
+
+// MarshalBinary serializes JrnExtentFree to its little-endian on-disk representation.
+func (s *JrnExtentFree) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint64(data[pos:], s.Ino); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.Offset); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.PhysStart); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.Length); pos += 8
+	copy(data[pos:], s.Reserved[:]); pos += 48
+	return data, nil
+}
+
+// UnmarshalBinary deserializes JrnExtentFree from its little-endian on-disk representation.
+func (s *JrnExtentFree) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("JrnExtentFree data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Ino = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Offset = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.PhysStart = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Length = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	copy(s.Reserved[:], data[pos:pos+48]); pos += 48
+	return nil
+}
+
+// Compile-time size assertion for JrnExtentFree.
+var _ = [1]struct{}{}[unsafe.Sizeof(JrnExtentFree{}) - 80]
+
+// Size returns the on-disk size of JrnInodeAlloc.
+func (s *JrnInodeAlloc) Size() int { return int(unsafe.Sizeof(JrnInodeAlloc{})) }
+
+// MarshalBinary serializes JrnInodeAlloc to its little-endian on-disk representation.
+func (s *JrnInodeAlloc) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint64(data[pos:], s.Ino); pos += 8
+	binary.LittleEndian.PutUint32(data[pos:], s.Mode); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Nlink); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Uid); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Gid); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Reserved1); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s._Pad); pos += 4
+	binary.LittleEndian.PutUint64(data[pos:], s.Reserved2); pos += 8
+	return data, nil
+}
+
+// UnmarshalBinary deserializes JrnInodeAlloc from its little-endian on-disk representation.
+func (s *JrnInodeAlloc) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("JrnInodeAlloc data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Ino = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Mode = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Nlink = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Uid = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Gid = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Reserved1 = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s._Pad = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Reserved2 = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	return nil
+}
+
+// Compile-time size assertion for JrnInodeAlloc.
+var _ = [1]struct{}{}[unsafe.Sizeof(JrnInodeAlloc{}) - 40]
+
+// Size returns the on-disk size of JrnInodeFree.
+func (s *JrnInodeFree) Size() int { return int(unsafe.Sizeof(JrnInodeFree{})) }
+
+// MarshalBinary serializes JrnInodeFree to its little-endian on-disk representation.
+func (s *JrnInodeFree) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint64(data[pos:], s.Ino); pos += 8
+	for i := 0; i < len(s.Reserved); i++ {
+		binary.LittleEndian.PutUint32(data[pos:], s.Reserved[i]); pos += 4
+	}
+	binary.LittleEndian.PutUint32(data[pos:], s._Pad); pos += 4
+	binary.LittleEndian.PutUint64(data[pos:], s.Reserved2); pos += 8
+	return data, nil
+}
+
+// UnmarshalBinary deserializes JrnInodeFree from its little-endian on-disk representation.
+func (s *JrnInodeFree) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("JrnInodeFree data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Ino = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	for i := 0; i < len(s.Reserved); i++ {
+		s.Reserved[i] = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	}
+	s._Pad = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Reserved2 = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	return nil
+}
+
+// Compile-time size assertion for JrnInodeFree.
+var _ = [1]struct{}{}[unsafe.Sizeof(JrnInodeFree{}) - 32]
+
+// Size returns the on-disk size of JrnInodeFull.
+func (s *JrnInodeFull) Size() int { return int(unsafe.Sizeof(JrnInodeFull{})) }
+
+// MarshalBinary serializes JrnInodeFull to its little-endian on-disk representation.
+func (s *JrnInodeFull) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint64(data[pos:], s.Ino); pos += 8
+	copy(data[pos:], s.InodeData[:]); pos += 512
+	copy(data[pos:], s.Reserved[:]); pos += 40
+	return data, nil
+}
+
+// UnmarshalBinary deserializes JrnInodeFull from its little-endian on-disk representation.
+func (s *JrnInodeFull) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("JrnInodeFull data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Ino = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	copy(s.InodeData[:], data[pos:pos+512]); pos += 512
+	copy(s.Reserved[:], data[pos:pos+40]); pos += 40
+	return nil
+}
+
+// Compile-time size assertion for JrnInodeFull.
+var _ = [1]struct{}{}[unsafe.Sizeof(JrnInodeFull{}) - 560]
+
+// Size returns the on-disk size of JrnInodeUpdate.
+func (s *JrnInodeUpdate) Size() int { return int(unsafe.Sizeof(JrnInodeUpdate{})) }
+
+// MarshalBinary serializes JrnInodeUpdate to its little-endian on-disk representation.
+func (s *JrnInodeUpdate) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint64(data[pos:], s.Ino); pos += 8
+	binary.LittleEndian.PutUint32(data[pos:], s.Mode); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Nlink); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Uid); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Gid); pos += 4
+	binary.LittleEndian.PutUint64(data[pos:], s.FileSize); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.ATimeSec); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.ATimeNsec); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.MTimeSec); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.MTimeNsec); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.CTimeSec); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.CTimeNsec); pos += 8
+	binary.LittleEndian.PutUint32(data[pos:], s.Flags); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Reserved); pos += 4
+	return data, nil
+}
+
+// UnmarshalBinary deserializes JrnInodeUpdate from its little-endian on-disk representation.
+func (s *JrnInodeUpdate) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("JrnInodeUpdate data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Ino = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Mode = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Nlink = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Uid = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Gid = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.FileSize = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.ATimeSec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.ATimeNsec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.MTimeSec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.MTimeNsec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.CTimeSec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.CTimeNsec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Flags = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Reserved = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	return nil
+}
+
+// Compile-time size assertion for JrnInodeUpdate.
+var _ = [1]struct{}{}[unsafe.Sizeof(JrnInodeUpdate{}) - 88]
+
+// Size returns the on-disk size of JrnTrieAlloc.
+func (s *JrnTrieAlloc) Size() int { return int(unsafe.Sizeof(JrnTrieAlloc{})) }
+
+// MarshalBinary serializes JrnTrieAlloc to its little-endian on-disk representation.
+func (s *JrnTrieAlloc) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint64(data[pos:], s.Block); pos += 8
+	binary.LittleEndian.PutUint32(data[pos:], s.Op); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Reserved); pos += 4
+	return data, nil
+}
+
+// UnmarshalBinary deserializes JrnTrieAlloc from its little-endian on-disk representation.
+func (s *JrnTrieAlloc) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("JrnTrieAlloc data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Block = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Op = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Reserved = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	return nil
+}
+
+// Compile-time size assertion for JrnTrieAlloc.
+var _ = [1]struct{}{}[unsafe.Sizeof(JrnTrieAlloc{}) - 16]
+
+// Size returns the on-disk size of RecordHeader.
+func (s *RecordHeader) Size() int { return int(unsafe.Sizeof(RecordHeader{})) }
+
+// MarshalBinary serializes RecordHeader to its little-endian on-disk representation.
+func (s *RecordHeader) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint32(data[pos:], s.Type); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Flags); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.DataLen); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Checksum); pos += 4
+	return data, nil
+}
+
+// UnmarshalBinary deserializes RecordHeader from its little-endian on-disk representation.
+func (s *RecordHeader) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("RecordHeader data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Type = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Flags = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.DataLen = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Checksum = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	return nil
+}
+
+// Compile-time size assertion for RecordHeader.
+var _ = [1]struct{}{}[unsafe.Sizeof(RecordHeader{}) - 16]
 
 // Size returns the on-disk size of SuperblockLayout.
 func (s *SuperblockLayout) Size() int { return int(unsafe.Sizeof(SuperblockLayout{})) }

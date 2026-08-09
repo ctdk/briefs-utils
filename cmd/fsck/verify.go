@@ -27,27 +27,9 @@ func runVerificationPass(fs *fsckState, blockSize, inodeSize uint64) int {
 		fs.errorf("%v", err)
 	}
 
-	inodeL0w, inodeL1w, inodeL2w, inodeBlockCount, inodeAllocFree, err := readAllocatorHeader(file, sb.InodeBMOffset, blockSize)
-	if err != nil {
-		fs.errorf("read inode allocator header: %v", err)
-	} else {
-		if inodeAllocFree != sb.FreeInodes {
-			fs.errorf("inode free count mismatch: superblock says %d, allocator says %d",
-				sb.FreeInodes, inodeAllocFree)
-		}
-		verifyAllocatorBitmap(fs, sb.InodeBMOffset, blockSize, inodeL0w, inodeL1w, inodeL2w, inodeBlockCount, inodeAllocFree, "inode")
-	}
+	verifyAllocatorBitmap(fs, sb.InodeBMOffset, blockSize, sb.FreeInodes, "inode")
 
-	dataL0w, dataL1w, dataL2w, dataBlockCount, dataAllocFree, err := readAllocatorHeader(file, sb.TrieNodePoolStart, blockSize)
-	if err != nil {
-		fs.errorf("read data allocator header: %v", err)
-	} else {
-		if dataAllocFree != sb.FreeDataBlks {
-			fs.errorf("data block free count mismatch: superblock says %d, allocator says %d",
-				sb.FreeDataBlks, dataAllocFree)
-		}
-		verifyAllocatorBitmap(fs, sb.TrieNodePoolStart, blockSize, dataL0w, dataL1w, dataL2w, dataBlockCount, dataAllocFree, "data")
-	}
+	verifyAllocatorBitmap(fs, sb.TrieNodePoolStart, blockSize, sb.FreeDataBlks, "data")
 
 	// 3. Inode table
 	inodeTableStart := sb.InodeTableOffset

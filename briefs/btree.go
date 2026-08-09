@@ -69,24 +69,25 @@ var (
 // magic@0, flags@4, level@8, num_keys@10, 4 bytes padding@12, next_leaf@16.
 // There is NO prev_leaf — the kernel comment (briefs.h) states no path iterates
 // backward. next_leaf threads leaves left-to-right and is 0 for the last leaf
-// (and for all internal nodes, which set it to 0 on split).
+// (and for all internal nodes, which set it to 0 on split). The explicit _Pad
+// reproduces the kernel's 4-byte alignment padding at offset 12 so the
+// generated marshal matches the on-disk layout exactly.
+//
+//go:briefs-disk size=24
 type BtreeNodeHeader struct {
 	Magic    uint32
 	Flags    uint32
 	Level    uint16
 	NumKeys  uint16
+	_Pad     uint32
 	NextLeaf uint64 // offset 16; 0 if none (leaf only); internal nodes always 0
 }
 
 // UnmarshalBtreeHeader reads the node header from a block buffer.
 func UnmarshalBtreeHeader(buf []byte) BtreeNodeHeader {
-	return BtreeNodeHeader{
-		Magic:    binary.LittleEndian.Uint32(buf[0:]),
-		Flags:    binary.LittleEndian.Uint32(buf[4:]),
-		Level:    binary.LittleEndian.Uint16(buf[8:]),
-		NumKeys:  binary.LittleEndian.Uint16(buf[10:]),
-		NextLeaf: binary.LittleEndian.Uint64(buf[16:]),
-	}
+	var h BtreeNodeHeader
+	_ = h.UnmarshalBinary(buf)
+	return h
 }
 
 // IsLeaf reports whether the node header marks a leaf.
@@ -97,17 +98,15 @@ func (h BtreeNodeHeader) IsLeaf() bool {
 // ReadBtreeLeafExtent reads the i-th extent from a B-tree leaf node buffer.
 func ReadBtreeLeafExtent(buf []byte, i int) Extent {
 	offset := BtreeHeaderSize + i*32
-	return Extent{
-		Offset: binary.LittleEndian.Uint64(buf[offset:]),
-		Phys:   binary.LittleEndian.Uint64(buf[offset+8:]),
-		Len:    binary.LittleEndian.Uint64(buf[offset+16:]),
-		Flags:  binary.LittleEndian.Uint32(buf[offset+24:]),
-		Pad:    binary.LittleEndian.Uint32(buf[offset+28:]),
-	}
+	var e Extent
+	_ = e.UnmarshalBinary(buf[offset:])
+	return e
 }
 
 // BtreeIdxEntry is one internal-node entry: a child block pointer and the
 // high_key separator (the smallest key in the right sibling, > 0).
+//
+//go:briefs-disk size=16
 type BtreeIdxEntry struct {
 	Child   uint64
 	HighKey uint64
@@ -116,10 +115,9 @@ type BtreeIdxEntry struct {
 // ReadBtreeIdxEntry reads the i-th internal idx entry from a node buffer.
 func ReadBtreeIdxEntry(buf []byte, i int) BtreeIdxEntry {
 	offset := BtreeHeaderSize + i*16
-	return BtreeIdxEntry{
-		Child:   binary.LittleEndian.Uint64(buf[offset:]),
-		HighKey: binary.LittleEndian.Uint64(buf[offset+8:]),
-	}
+	var e BtreeIdxEntry
+	_ = e.UnmarshalBinary(buf[offset:])
+	return e
 }
 
 // BtreeTrailingChild reads the trailing_child pointer of an internal node.
@@ -131,31 +129,24 @@ func BtreeTrailingChild(buf []byte) uint64 {
 // (kernel padding) are zeroed so the checksummed region is deterministic. It is
 // the inverse of UnmarshalBtreeHeader.
 func MarshalBtreeHeader(buf []byte, hdr BtreeNodeHeader) {
-	binary.LittleEndian.PutUint32(buf[0:], hdr.Magic)
-	binary.LittleEndian.PutUint32(buf[4:], hdr.Flags)
-	binary.LittleEndian.PutUint16(buf[8:], hdr.Level)
-	binary.LittleEndian.PutUint16(buf[10:], hdr.NumKeys)
-	binary.LittleEndian.PutUint32(buf[12:], 0) // 4 bytes padding@12
-	binary.LittleEndian.PutUint64(buf[16:], hdr.NextLeaf)
+	data, _ := hdr.MarshalBinary()
+	copy(buf[:BtreeHeaderSize], data)
 }
 
 // PutBtreeLeafExtent writes the i-th extent into a B-tree leaf node buffer. It is
 // the inverse of ReadBtreeLeafExtent. Does NOT recompute the checksum.
 func PutBtreeLeafExtent(buf []byte, i int, ext Extent) {
 	offset := BtreeHeaderSize + i*32
-	binary.LittleEndian.PutUint64(buf[offset:], ext.Offset)
-	binary.LittleEndian.PutUint64(buf[offset+8:], ext.Phys)
-	binary.LittleEndian.PutUint64(buf[offset+16:], ext.Len)
-	binary.LittleEndian.PutUint32(buf[offset+24:], ext.Flags)
-	binary.LittleEndian.PutUint32(buf[offset+28:], ext.Pad)
+	data, _ := ext.MarshalBinary()
+	copy(buf[offset:], data)
 }
 
 // PutBtreeIdxEntry writes the i-th internal idx entry into a node buffer. It is
 // the inverse of ReadBtreeIdxEntry. Does NOT recompute the checksum.
 func PutBtreeIdxEntry(buf []byte, i int, e BtreeIdxEntry) {
 	offset := BtreeHeaderSize + i*16
-	binary.LittleEndian.PutUint64(buf[offset:], e.Child)
-	binary.LittleEndian.PutUint64(buf[offset+8:], e.HighKey)
+	data, _ := e.MarshalBinary()
+	copy(buf[offset:], data)
 }
 
 // SetBtreeTrailingChild writes the trailing_child pointer of an internal node.

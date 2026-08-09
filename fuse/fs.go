@@ -278,13 +278,17 @@ func (a *Allocator) Sync() error {
 
 	// Update header with free_count
 	hdr := make([]byte, blockSize)
-	binary.LittleEndian.PutUint32(hdr[0:], briefs.AllocMagic)
-	binary.LittleEndian.PutUint32(hdr[4:], 1) // version
-	binary.LittleEndian.PutUint64(hdr[8:], a.l0Words)
-	binary.LittleEndian.PutUint64(hdr[16:], a.l1Words)
-	binary.LittleEndian.PutUint64(hdr[24:], a.l2Words)
-	binary.LittleEndian.PutUint64(hdr[32:], a.blockCount)
-	binary.LittleEndian.PutUint64(hdr[40:], a.freeCount)
+	ah := &briefs.AllocHeader{
+		Magic:      briefs.AllocMagic,
+		Version:    1,
+		L0Words:    a.l0Words,
+		L1Words:    a.l1Words,
+		L2Words:    a.l2Words,
+		BlockCount: a.blockCount,
+		FreeCount:  a.freeCount,
+	}
+	ahData, _ := ah.MarshalBinary()
+	copy(hdr[:48], ahData)
 	if err := a.dev.WriteBlock(a.poolStart, hdr); err != nil {
 		return fmt.Errorf("sync allocator header: %w", err)
 	}

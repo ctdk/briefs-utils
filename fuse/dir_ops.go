@@ -76,7 +76,7 @@ func (b *BrieFS) journalInodeUpdate(in *briefs.Inode) error {
 		Nlink:     in.Nlinks,
 		Uid:       in.Uid,
 		Gid:       in.Gid,
-		Size:      in.FileSize,
+		FileSize:  in.FileSize,
 		ATimeSec:  in.AtimeSec,
 		ATimeNsec: in.AtimeNsec,
 		MTimeSec:  in.MtimeSec,

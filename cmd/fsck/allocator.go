@@ -43,9 +43,26 @@ func readAllocatorHeader(file *os.File, poolBlock, blockSize uint64) (l0w, l1w, 
 //   - L1 bits correctly summarize L2 (a set L1 bit means at least one L2 word under it is non-zero)
 //   - Trailing bits in the last L0/L1/L2 word are properly masked
 //   - Computed free count from L2 matches the header's free count
-func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize uint64, l0w, l1w, l2w, blockCount, headerFree uint64, label string) {
-	wordsPerBlock := blockSize / bytesPerWord // 512 u64 words per 4096-byte block
+//   - The header's free count matches the superblock's expectation (sbExpectedFree)
+func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize, sbExpectedFree uint64, label string) {
 	errorReportLimit := 10
+
+	// Read the header and all three bitmap levels through the shared codec.
+	l0, l1, l2, hdr, err := briefs.ReadAllocatorBitmap(fs.file, poolBlock, blockSize)
+	if err != nil {
+		fs.errorf("%s: read allocator bitmap: %v", label, err)
+		return
+	}
+	l0w := hdr.L0Words
+	l1w := hdr.L1Words
+	l2w := hdr.L2Words
+	blockCount := hdr.BlockCount
+	headerFree := hdr.FreeCount
+
+	if sbExpectedFree != headerFree {
+		fs.errorf("%s free count mismatch: superblock says %d, allocator says %d",
+			label, sbExpectedFree, headerFree)
+	}
 
 	// Compute expected level sizes
 	expectedL2 := (blockCount + (wordBits - 1)) / wordBits
@@ -69,56 +86,6 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize uint64, l0w, l1w,
 	}
 	if l2w != expectedL2 {
 		fs.errorf("%s: L2 word count mismatch: header says %d, expected %d", label, l2w, expectedL2)
-	}
-
-	// Read all L0 words
-	l0Blocks := (l0w + wordsPerBlock - 1) / wordsPerBlock
-	l0 := make([]uint64, l0w)
-	for bi := uint64(0); bi < l0Blocks; bi++ {
-		buf := make([]byte, blockSize)
-		block := poolBlock + 1 + bi
-		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
-			fs.errorf("%s: read L0 block %d: %v", label, block, err)
-			return
-		}
-		start := bi * wordsPerBlock
-		for j := uint64(0); j < wordsPerBlock && start+j < l0w; j++ {
-			l0[start+j] = binary.LittleEndian.Uint64(buf[j*bytesPerWord:])
-		}
-	}
-
-	// Read all L1 words
-	l1Start := poolBlock + 1 + l0Blocks
-	l1Blocks := (l1w + wordsPerBlock - 1) / wordsPerBlock
-	l1 := make([]uint64, l1w)
-	for bi := uint64(0); bi < l1Blocks; bi++ {
-		buf := make([]byte, blockSize)
-		block := l1Start + bi
-		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
-			fs.errorf("%s: read L1 block %d: %v", label, block, err)
-			return
-		}
-		start := bi * wordsPerBlock
-		for j := uint64(0); j < wordsPerBlock && start+j < l1w; j++ {
-			l1[start+j] = binary.LittleEndian.Uint64(buf[j*bytesPerWord:])
-		}
-	}
-
-	// Read all L2 words
-	l2Start := l1Start + l1Blocks
-	l2Blocks := (l2w + wordsPerBlock - 1) / wordsPerBlock
-	l2 := make([]uint64, l2w)
-	for bi := uint64(0); bi < l2Blocks; bi++ {
-		buf := make([]byte, blockSize)
-		block := l2Start + bi
-		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
-			fs.errorf("%s: read L2 block %d: %v", label, block, err)
-			return
-		}
-		start := bi * wordsPerBlock
-		for j := uint64(0); j < wordsPerBlock && start+j < l2w; j++ {
-			l2[start+j] = binary.LittleEndian.Uint64(buf[j*bytesPerWord:])
-		}
 	}
 
 	// Verify trailing bits in last L2 word are properly masked

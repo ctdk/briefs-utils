@@ -14,7 +14,6 @@
 package briefs
 
 import (
-	"encoding/binary"
 	"fmt"
 )
 
@@ -117,6 +116,8 @@ func VerifyJournalRecordChecksum(typ, flags uint32, data []byte, stored uint32) 
 }
 
 // RecordHeader is the 16-byte on-disk journal record header.
+//
+//go:briefs-disk size=16
 type RecordHeader struct {
 	Type     uint32
 	Flags    uint32
@@ -126,10 +127,32 @@ type RecordHeader struct {
 
 // ParseRecordHeader reads a 16-byte record header from buf.
 func ParseRecordHeader(buf []byte) RecordHeader {
-	return RecordHeader{
-		Type:     binary.LittleEndian.Uint32(buf[0:]),
-		Flags:    binary.LittleEndian.Uint32(buf[4:]),
-		DataLen:  binary.LittleEndian.Uint32(buf[8:]),
-		Checksum: binary.LittleEndian.Uint32(buf[12:]),
-	}
+	var h RecordHeader
+	_ = h.UnmarshalBinary(buf)
+	return h
+}
+
+// JournalBlockHeader is the 16-byte on-disk journal block header (struct
+// journal_block_header): magic, block_seq, record_count, reserved.
+//
+//go:briefs-disk size=16
+type JournalBlockHeader struct {
+	Magic       uint32
+	BlockSeq    uint32
+	RecordCount uint32
+	Reserved    uint32
+}
+
+// ParseJournalBlockHeader reads a 16-byte journal block header from buf.
+func ParseJournalBlockHeader(buf []byte) JournalBlockHeader {
+	var h JournalBlockHeader
+	_ = h.UnmarshalBinary(buf)
+	return h
+}
+
+// MarshalJournalBlockHeader writes a journal block header into the first
+// JournalBlockHdrSize bytes of buf.
+func MarshalJournalBlockHeader(buf []byte, h JournalBlockHeader) {
+	data, _ := h.MarshalBinary()
+	copy(buf[:JournalBlockHdrSize], data)
 }

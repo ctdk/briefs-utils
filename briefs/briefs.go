@@ -201,6 +201,8 @@ func DefaultJournalBlocks(totalBlocks uint64) uint64 {
 // more going on.
 
 // Extent represents a file extent (32 bytes).
+//
+//go:briefs-disk size=32
 type Extent struct {
 	Offset uint64
 	Phys   uint64

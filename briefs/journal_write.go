@@ -143,9 +143,11 @@ func (j *Journal) initCurBlock(seq uint32) {
 	for i := range j.curBlock {
 		j.curBlock[i] = 0
 	}
-	binary.LittleEndian.PutUint32(j.curBlock[0:], MagicJournal) // magic
-	binary.LittleEndian.PutUint32(j.curBlock[4:], seq)          // block_seq
-	// record_count at 8 = 0, reserved at 12 = 0
+	MarshalJournalBlockHeader(j.curBlock, JournalBlockHeader{
+		Magic:    MagicJournal,
+		BlockSeq: seq,
+		// record_count at 8 = 0, reserved at 12 = 0
+	})
 	j.blockSeq = seq
 	j.writeOffset = JournalBlockHdrSize
 }
@@ -221,17 +223,20 @@ func (j *Journal) writeRecordLocked(typ uint32, data []byte) error {
 
 	// Append record header + data.
 	off := j.writeOffset
-	binary.LittleEndian.PutUint32(j.curBlock[off+0:], typ)
-	binary.LittleEndian.PutUint32(j.curBlock[off+4:], 0) // flags
-	binary.LittleEndian.PutUint32(j.curBlock[off+8:], uint32(len(data)))
-	binary.LittleEndian.PutUint32(j.curBlock[off+12:],
-		ComputeJournalRecordChecksum(typ, 0, data))
+	rh := RecordHeader{
+		Type:     typ,
+		DataLen:  uint32(len(data)),
+		Checksum: ComputeJournalRecordChecksum(typ, 0, data),
+	}
+	rhBytes, _ := rh.MarshalBinary()
+	copy(j.curBlock[off:], rhBytes)
 	copy(j.curBlock[off+JournalRecordHdrSize:], data)
 
 	j.writeOffset += uint64(total)
 	// Increment the block's record_count.
-	rc := binary.LittleEndian.Uint32(j.curBlock[8:])
-	binary.LittleEndian.PutUint32(j.curBlock[8:], rc+1)
+	bh := ParseJournalBlockHeader(j.curBlock)
+	bh.RecordCount++
+	MarshalJournalBlockHeader(j.curBlock, bh)
 	j.dirty = true
 	j.recordsSinceCheckpoint++
 	return nil
@@ -374,13 +379,16 @@ func (j *Journal) checkpointLocked() error {
 
 	// Build the checkpoint record in a fresh block.
 	cpBuf := make([]byte, JournalBlockSize)
-	binary.LittleEndian.PutUint32(cpBuf[0:], MagicCheckpoint) // header magic
-	binary.LittleEndian.PutUint32(cpBuf[4:], j.blockSeq)      // block_seq
-	binary.LittleEndian.PutUint32(cpBuf[8:], 1)               // record_count = 1
+	MarshalJournalBlockHeader(cpBuf, JournalBlockHeader{
+		Magic:       MagicCheckpoint,
+		BlockSeq:    j.blockSeq,
+		RecordCount: 1, // the checkpoint record itself
+	})
 
+	curBh := ParseJournalBlockHeader(j.curBlock)
 	cp := &Checkpoint{
 		Seq:            j.checkpointSeq + 1,
-		RecordCount:    binary.LittleEndian.Uint32(j.curBlock[8:]),
+		RecordCount:    curBh.RecordCount,
 		LogSequenceEnd: j.writePos,
 		TrieRootNode:   j.sb.TrieRootBlock,
 		FreeDataCount:  j.sb.FreeDataBlks,

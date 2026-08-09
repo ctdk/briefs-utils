@@ -26,6 +26,8 @@ const AllocMagic = 0x4249544D // "BITM"
 // AllocHeader is the on-disk header for the allocator pool (first block of the
 // pool). It is exactly 48 bytes, matching the kernel's struct
 // alloc_pool_header.
+//
+//go:briefs-disk size=48
 type AllocHeader struct {
 	Magic      uint32 // "BITM"
 	Version    uint32 // 1
@@ -270,23 +272,8 @@ func (b *AllocBuilder) WriteBlocks() [][]byte {
 		FreeCount:  b.FreeCount,
 	}
 	hdrBuf := make([]byte, 4096)
-	hdrData := make([]byte, 48) // 8 bytes u64 * 6 + 2 * 4 bytes u32
-	pos := 0
-	binary.LittleEndian.PutUint32(hdrData[pos:], hdr.Magic)
-	pos += 4
-	binary.LittleEndian.PutUint32(hdrData[pos:], hdr.Version)
-	pos += 4
-	binary.LittleEndian.PutUint64(hdrData[pos:], hdr.L0Words)
-	pos += 8
-	binary.LittleEndian.PutUint64(hdrData[pos:], hdr.L1Words)
-	pos += 8
-	binary.LittleEndian.PutUint64(hdrData[pos:], hdr.L2Words)
-	pos += 8
-	binary.LittleEndian.PutUint64(hdrData[pos:], hdr.BlockCount)
-	pos += 8
-	binary.LittleEndian.PutUint64(hdrData[pos:], hdr.FreeCount)
-	pos += 8
-	copy(hdrBuf[:pos], hdrData)
+	hdrData, _ := hdr.MarshalBinary()
+	copy(hdrBuf[:48], hdrData)
 	blocks[0] = hdrBuf
 
 	// Pack words into blocks
@@ -312,21 +299,6 @@ func (b *AllocBuilder) packWords(blocks [][]byte, words []uint64, startBlock uin
 		}
 		blocks[startBlock+i/wordsPerBlock] = buf
 	}
-}
-
-// UnmarshalBinary deserializes an AllocHeader from a byte slice.
-func (h *AllocHeader) UnmarshalBinary(data []byte) error {
-	if len(data) < 48 {
-		return fmt.Errorf("allocator header data too short: %d < 48", len(data))
-	}
-	h.Magic = binary.LittleEndian.Uint32(data[0:])
-	h.Version = binary.LittleEndian.Uint32(data[4:])
-	h.L0Words = binary.LittleEndian.Uint64(data[8:])
-	h.L1Words = binary.LittleEndian.Uint64(data[16:])
-	h.L2Words = binary.LittleEndian.Uint64(data[24:])
-	h.BlockCount = binary.LittleEndian.Uint64(data[32:])
-	h.FreeCount = binary.LittleEndian.Uint64(data[40:])
-	return nil
 }
 
 // ReadAllocatorHeader reads and parses an allocator pool header from disk.
