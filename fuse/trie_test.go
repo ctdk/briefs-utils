@@ -1,7 +1,6 @@
 package fuse
 
 import (
-	"encoding/binary"
 	"os"
 	"testing"
 
@@ -9,41 +8,48 @@ import (
 )
 
 func makeTriePageRoot(buf []byte) {
-	binary.LittleEndian.PutUint32(buf[0:], briefs.MagicTriePage)
-	binary.LittleEndian.PutUint32(buf[4:], briefs.TriePageVersion)
-	binary.LittleEndian.PutUint16(buf[8:], 1)          // live_count
-	binary.LittleEndian.PutUint16(buf[10:], 0)         // free_name_off
-	binary.LittleEndian.PutUint64(buf[12:], ^uint64(1)) // free_slots: slot 0 allocated
-
-	// Slot 0 at offset 16: empty root INTERM node, all fields zero.
-	slotOff := uint64(16)
-	buf[slotOff+trieSlotDepth] = 0
-	buf[slotOff+trieSlotNodeType] = trieNodeTypeInterm
+	pg := &briefs.TriePage{
+		Magic:       briefs.MagicTriePage,
+		Version:     briefs.TriePageVersion,
+		LiveCount:   1,
+		FreeNameOff: 0,
+		FreeSlots:   ^uint64(1), // slot 0 allocated; rest free
+	}
+	if err := briefs.WriteTriePage(buf, pg); err != nil {
+		panic(err)
+	}
+	// Slot 0: empty root INTERM node.
+	root := &briefs.TrieSlot{NodeType: briefs.NodeTypeInterm}
+	if err := briefs.WriteTrieSlot(buf, 0, root); err != nil {
+		panic(err)
+	}
 }
 
 func writeTrieLeaf(buf []byte, slot uint, ino uint64, name string) {
-	slotOff := slotOffset(slot)
 	nameLen := len(name)
-	nameSize := nameLen + 2
-
-	// Place name at the top of the name heap, growing upward from block end.
-	nameStart := uint64(len(buf)) - uint64(nameSize)
-	binary.LittleEndian.PutUint16(buf[nameStart:], uint16(nameLen))
-	copy(buf[nameStart+2:], name)
-
-	binary.LittleEndian.PutUint64(buf[slotOff+trieSlotInode:], ino)
-	binary.LittleEndian.PutUint16(buf[slotOff+trieSlotNameLen:], uint16(nameSize))
-	binary.LittleEndian.PutUint16(buf[slotOff+trieSlotNameOffset:], uint16(nameSize))
-	buf[slotOff+trieSlotDepth] = uint8(len(name) - 1)
-	buf[slotOff+trieSlotNodeType] = 0 // pure leaf
-	buf[slotOff+trieSlotFType] = 8    // regular file
+	nameSize := uint16(nameLen + 2)
+	nameOff := nameSize
+	if _, err := briefs.WriteTrieName(buf, nameOff, name); err != nil {
+		panic(err)
+	}
+	s := &briefs.TrieSlot{
+		Inode:      ino,
+		NameLen:    nameSize,
+		NameOffset: nameOff,
+		Depth:      uint8(nameLen - 1),
+		NodeType:   0, // pure leaf
+		FType:      8, // regular file
+	}
+	if err := briefs.WriteTrieSlot(buf, slot, s); err != nil {
+		panic(err)
+	}
 }
 
 func TestReadTriePage(t *testing.T) {
 	buf := make([]byte, 4096)
 	makeTriePageRoot(buf)
 
-	page, err := ReadTriePage(buf)
+	page, err := briefs.ReadTriePage(buf)
 	if err != nil {
 		t.Fatalf("ReadTriePage: %v", err)
 	}
@@ -60,14 +66,14 @@ func TestReadTriePage(t *testing.T) {
 
 func TestReadTriePageBadMagic(t *testing.T) {
 	buf := make([]byte, 4096)
-	_, err := ReadTriePage(buf)
+	_, err := briefs.ReadTriePage(buf)
 	if err == nil {
 		t.Fatal("expected error for bad magic")
 	}
 }
 
 func TestReadTriePageTooShort(t *testing.T) {
-	_, err := ReadTriePage([]byte{0, 0, 0, 0})
+	_, err := briefs.ReadTriePage([]byte{0, 0, 0, 0})
 	if err == nil {
 		t.Fatal("expected error for short buffer")
 	}
@@ -78,7 +84,7 @@ func TestReadTrieSlot(t *testing.T) {
 	makeTriePageRoot(buf)
 	writeTrieLeaf(buf, 1, 5, "test.txt")
 
-	node, err := ReadTrieSlot(buf, 1)
+	node, err := briefs.ReadTrieSlot(buf, 1)
 	if err != nil {
 		t.Fatalf("ReadTrieSlot: %v", err)
 	}
@@ -98,9 +104,9 @@ func TestReadTrieSlot(t *testing.T) {
 		t.Errorf("FType: want 8, got %d", node.FType)
 	}
 
-	name, err := readTrieLeafNameStr(buf, 4096, node)
+	name, err := briefs.ReadTrieName(buf, node.NameLen, node.NameOffset)
 	if err != nil {
-		t.Fatalf("readTrieLeafNameStr: %v", err)
+		t.Fatalf("ReadTrieName: %v", err)
 	}
 	if name != "test.txt" {
 		t.Errorf("name: want 'test.txt', got '%s'", name)
@@ -114,18 +120,16 @@ func TestTrieIsLeaf(t *testing.T) {
 		want     bool
 	}{
 		{"pure leaf (0)", 0, true},
-		{"file type", trieNodeTypeFile, true},
-		{"dir type", trieNodeTypeDir, true},
-		{"interm", trieNodeTypeInterm, false},
-		{"interm+leaf", trieNodeTypeInterm | trieNodeStatusLeaf, true},
+		{"file type", briefs.NodeTypeFile, true},
+		{"dir type", briefs.NodeTypeDir, true},
+		{"interm", briefs.NodeTypeInterm, false},
+		{"interm+leaf", briefs.NodeTypeInterm | briefs.NodeStatusLeaf, true},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			node := &TrieNodeData{NodeType: tc.nodeType}
-			got := trieIsLeaf(node)
-			if got != tc.want {
-				t.Errorf("trieIsLeaf(0x%02X): want %v, got %v", tc.nodeType, tc.want, got)
+			if got := briefs.TrieIsLeaf(tc.nodeType); got != tc.want {
+				t.Errorf("TrieIsLeaf(0x%02X): want %v, got %v", tc.nodeType, tc.want, got)
 			}
 		})
 	}

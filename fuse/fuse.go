@@ -410,7 +410,7 @@ func (n *brieFSNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 
 	var childMode uint32
 	switch ftype {
-	case trieNodeTypeDir:
+	case briefs.NodeTypeDir:
 		childMode = uint32(briefs.ModeDir)
 	default:
 		childMode = childInode.Filemode

@@ -14,11 +14,16 @@
 // dev.Sync() (fdatasync) so a freshly allocated trie page is durable before
 // any later journal record that traverses into it can be committed (the
 // generic/065 bad-magic family).
+//
+// All slot/page reads and writes go through the shared briefs.TrieSlot /
+// briefs.TriePage codec (briefs/trie_disk.go). Mutations load a *TrieSlot /
+// *TriePage struct, edit its fields, and write it back into the page buffer
+// with putSlot / putPage before the buffer is persisted -- there is no
+// hand-written field-offset arithmetic here.
 
 package fuse
 
 import (
-	"encoding/binary"
 	"syscall"
 
 	"github.com/ctdk/briefs-utils/briefs"
@@ -27,56 +32,36 @@ import (
 // triePageDataEnd is the byte offset where the name heap begins growing
 // downward: 20-byte page header + 64 slots of 36 bytes = 2324.
 func triePageDataEnd() uint16 {
-	return uint16(triePageHeaderSize + trieSlotCount*trieSlotSize)
+	return uint16(briefs.TriePageHeaderSize + briefs.TrieSlotsPerBlock*briefs.TrieSlotSize)
 }
 
-// --- slot write accessors (within a page buffer) ---
-
-func trieSlotBuf(page []byte, slot uint) []byte {
-	off := triePageHeaderSize + int(slot)*trieSlotSize
-	return page[off : off+trieSlotSize]
+// putPage writes the trie page header back into buf. The header was just read
+// from the same buffer, so the only failure mode (out-of-range) is impossible;
+// this mirrors the old infallible pageSet* byte writes.
+func putPage(buf []byte, pg *briefs.TriePage) {
+	if err := briefs.WriteTriePage(buf, pg); err != nil {
+		panic("trie: putPage " + err.Error())
+	}
 }
 
-func slotSetFirstChild(s []byte, v uint64) { binary.LittleEndian.PutUint64(s[trieSlotFirstChild:], v) }
-func slotSetNextSibling(s []byte, v uint64) { binary.LittleEndian.PutUint64(s[trieSlotNextSibling:], v) }
-func slotSetInode(s []byte, v uint64)      { binary.LittleEndian.PutUint64(s[trieSlotInode:], v) }
-func slotSetNameLen(s []byte, v uint16)    { binary.LittleEndian.PutUint16(s[trieSlotNameLen:], v) }
-func slotSetNameOffset(s []byte, v uint16) {
-	binary.LittleEndian.PutUint16(s[trieSlotNameOffset:], v)
-}
-func slotSetDepth(s []byte, v uint8)    { s[trieSlotDepth] = v }
-func slotSetNodeType(s []byte, v uint8) { s[trieSlotNodeType] = v }
-func slotSetByteVal(s []byte, v uint8)  { s[trieSlotByteVal] = v }
-func slotSetFType(s []byte, v uint8)    { s[trieSlotFType] = v }
-func slotSetChildCount(s []byte, v uint16) {
-	binary.LittleEndian.PutUint16(s[trieSlotChildCount:], v)
-}
-
-// --- page header accessors ---
-
-func pageLiveCount(p []byte) uint16        { return binary.LittleEndian.Uint16(p[triePageLiveCountOff:]) }
-func pageSetLiveCount(p []byte, v uint16)  { binary.LittleEndian.PutUint16(p[triePageLiveCountOff:], v) }
-func pageFreeNameOff(p []byte) uint16      { return binary.LittleEndian.Uint16(p[triePageFreeNameOffOff:]) }
-func pageSetFreeNameOff(p []byte, v uint16) {
-	binary.LittleEndian.PutUint16(p[triePageFreeNameOffOff:], v)
-}
-func pageFreeSlots(p []byte) uint64        { return binary.LittleEndian.Uint64(p[triePageFreeSlotsOff:]) }
-func pageSetFreeSlots(p []byte, v uint64)  { binary.LittleEndian.PutUint64(p[triePageFreeSlotsOff:], v) }
-
-// trieIsLeafNode mirrors TRIE_IS_LEAF: a node is a leaf if it is not an
-// intermediate node, or it is an intermediate that also carries a leaf entry.
-func trieIsLeafNode(nt uint8) bool {
-	return (nt&trieNodeTypeInterm) == 0 || (nt&trieNodeStatusLeaf) != 0
+// putSlot writes a trie slot back into buf at the given slot index. The slot
+// index is always valid (it was just read from the same buffer), so the only
+// failure mode (out-of-range) is impossible -- this mirrors the old
+// infallible slotSet* byte writes, which would panic on the same out-of-range
+// slice access.
+func putSlot(buf []byte, slot uint, s *briefs.TrieSlot) {
+	if err := briefs.WriteTrieSlot(buf, slot, s); err != nil {
+		panic("trie: putSlot " + err.Error())
+	}
 }
 
 // triePageAllocSlot finds the first free slot (bit set in free_slots), clears
 // it, bumps live_count, and returns the slot index. Returns ok=false if full.
-func triePageAllocSlot(page []byte) (uint, bool) {
-	fs := pageFreeSlots(page)
-	for slot := uint(0); slot < trieSlotCount; slot++ {
-		if fs&(1<<slot) != 0 {
-			pageSetFreeSlots(page, fs&^(1<<slot))
-			pageSetLiveCount(page, pageLiveCount(page)+1)
+func triePageAllocSlot(pg *briefs.TriePage) (uint, bool) {
+	for slot := uint(0); slot < briefs.TrieSlotsPerBlock; slot++ {
+		if pg.FreeSlots&(1<<slot) != 0 {
+			pg.FreeSlots &^= 1 << slot
+			pg.LiveCount++
 			return slot, true
 		}
 	}
@@ -84,19 +69,18 @@ func triePageAllocSlot(page []byte) (uint, bool) {
 }
 
 // triePageHasNameHeap reports whether the page can fit a name entry of
-// name_size bytes (name_len + 2) in the heap.
-func triePageHasNameHeap(page []byte, nameSize uint16) bool {
+// nameSize bytes (name_len + 2) in the heap.
+func triePageHasNameHeap(pg *briefs.TriePage, blockSize uint64, nameSize uint16) bool {
 	if nameSize == 0 {
 		return true
 	}
-	return uint64(pageFreeNameOff(page))+uint64(nameSize) <=
-		uint64(len(page))-uint64(triePageDataEnd())
+	return uint64(pg.FreeNameOff)+uint64(nameSize) <= blockSize-uint64(triePageDataEnd())
 }
 
 // triePageAllocName allocates name-heap space for a node, reusing an existing
 // allocation if it is large enough.  Sets the node's name_offset and name_len.
 // Returns ENOSPC if the heap is full.
-func triePageAllocName(page []byte, s []byte, nameLen int) error {
+func triePageAllocName(pg *briefs.TriePage, slot *briefs.TrieSlot, blockSize uint64, nameLen int) error {
 	if nameLen == 0 {
 		return nil
 	}
@@ -105,20 +89,16 @@ func triePageAllocName(page []byte, s []byte, nameLen int) error {
 	}
 	nameSize := uint16(nameLen + 2)
 	// Reuse an existing allocation that is large enough.
-	if curOff := binary.LittleEndian.Uint16(s[trieSlotNameOffset:]); curOff > 0 {
-		if curLen := binary.LittleEndian.Uint16(s[trieSlotNameLen:]); curLen >= nameSize {
-			return nil
-		}
+	if slot.NameOffset > 0 && slot.NameLen >= nameSize {
+		return nil
 	}
-	freeOff := pageFreeNameOff(page)
-	nameBase := uint16(len(page)) - freeOff
-	if nameBase-nameSize < triePageDataEnd() {
+	if uint64(pg.FreeNameOff)+uint64(nameSize) > blockSize-uint64(triePageDataEnd()) {
 		return syscall.ENOSPC
 	}
-	newOff := freeOff + nameSize
-	pageSetFreeNameOff(page, newOff)
-	slotSetNameOffset(s, newOff)
-	slotSetNameLen(s, nameSize)
+	newOff := pg.FreeNameOff + nameSize
+	pg.FreeNameOff = newOff
+	slot.NameOffset = newOff
+	slot.NameLen = nameSize
 	return nil
 }
 
@@ -157,16 +137,21 @@ func (b *BrieFS) triePageInit(depth, byteVal, nodeType uint8) (uint64, error) {
 	}
 
 	buf := make([]byte, b.blockSize)
-	binary.LittleEndian.PutUint32(buf[triePageMagicOff:], briefs.MagicTriePage)
-	binary.LittleEndian.PutUint32(buf[triePageVersionOff:], 1)
-	pageSetLiveCount(buf, 1)
-	pageSetFreeNameOff(buf, 0)
-	pageSetFreeSlots(buf, ^uint64(1)) // slot 0 allocated; rest free
+	pg := &briefs.TriePage{
+		Magic:       briefs.MagicTriePage,
+		Version:     1,
+		LiveCount:   1,
+		FreeNameOff: 0,
+		FreeSlots:   ^uint64(1), // slot 0 allocated; rest free
+	}
+	putPage(buf, pg)
 
-	s0 := trieSlotBuf(buf, 0)
-	slotSetDepth(s0, depth)
-	slotSetByteVal(s0, byteVal)
-	slotSetNodeType(s0, nodeType)
+	slot := &briefs.TrieSlot{
+		Depth:    depth,
+		ByteVal:  byteVal,
+		NodeType: nodeType,
+	}
+	putSlot(buf, 0, slot)
 
 	if err := b.saveBlock(block, buf); err != nil {
 		b.dataAlloc.FreeBlock(rel)
@@ -210,33 +195,33 @@ func (b *BrieFS) trieAllocNode(nameLen int) (uint64, error) {
 		if err != nil {
 			continue
 		}
-		if binary.LittleEndian.Uint32(buf[triePageMagicOff:]) != briefs.MagicTriePage {
+		pg, err := briefs.ReadTriePage(buf)
+		if err != nil {
 			continue // stale/corrupt; drop from pool
 		}
-		if !triePageHasNameHeap(buf, nameSize) {
+		if !triePageHasNameHeap(pg, b.blockSize, nameSize) {
 			out = append(out, block)
 			continue
 		}
-		slot, ok := triePageAllocSlot(buf)
+		slot, ok := triePageAllocSlot(pg)
 		if !ok {
 			continue // full; drop from pool (don't re-add)
 		}
-		s := trieSlotBuf(buf, slot)
-		for i := range s {
-			s[i] = 0
-		}
+		s := &briefs.TrieSlot{}
 		if nameSize > 0 {
-			newOff := pageFreeNameOff(buf) + nameSize
-			pageSetFreeNameOff(buf, newOff)
-			slotSetNameOffset(s, newOff)
-			slotSetNameLen(s, nameSize)
+			newOff := pg.FreeNameOff + nameSize
+			pg.FreeNameOff = newOff
+			s.NameOffset = newOff
+			s.NameLen = nameSize
 		}
+		putPage(buf, pg)
+		putSlot(buf, slot, s)
 		if err := b.saveBlock(block, buf); err != nil {
 			return 0, err
 		}
 		ref = briefs.TrieMakeRef(block, slot)
 		// Keep the page in the pool only if it still has free slots.
-		if pageFreeSlots(buf) != 0 {
+		if pg.FreeSlots != 0 {
 			out = append(out, block)
 		}
 		found = true
@@ -257,11 +242,20 @@ func (b *BrieFS) trieAllocNode(nameLen int) (uint64, error) {
 		if err != nil {
 			return 0, err
 		}
-		s := trieSlotBuf(buf, 0)
-		newOff := pageFreeNameOff(buf) + nameSize
-		pageSetFreeNameOff(buf, newOff)
-		slotSetNameOffset(s, newOff)
-		slotSetNameLen(s, nameSize)
+		pg, err := briefs.ReadTriePage(buf)
+		if err != nil {
+			return 0, err
+		}
+		s, err := briefs.ReadTrieSlot(buf, 0)
+		if err != nil {
+			return 0, err
+		}
+		newOff := pg.FreeNameOff + nameSize
+		pg.FreeNameOff = newOff
+		s.NameOffset = newOff
+		s.NameLen = nameSize
+		putPage(buf, pg)
+		putSlot(buf, 0, s)
 		if err := b.saveBlock(block, buf); err != nil {
 			return 0, err
 		}
@@ -283,28 +277,30 @@ func (b *BrieFS) trieFreeNode(ref uint64) error {
 	if err != nil {
 		return err
 	}
-	fs := pageFreeSlots(buf)
-	if fs&(1<<slot) != 0 { // already free
+	pg, err := briefs.ReadTriePage(buf)
+	if err != nil {
+		return err
+	}
+	if pg.FreeSlots&(1<<slot) != 0 { // already free
 		return nil
 	}
-	pageSetFreeSlots(buf, fs|(1<<slot))
-	pageSetLiveCount(buf, pageLiveCount(buf)-1)
-	s := trieSlotBuf(buf, slot)
-	for i := range s {
-		s[i] = 0
-	}
-	pageEmpty := pageLiveCount(buf) == 0
+	pg.FreeSlots |= 1 << slot
+	pg.LiveCount--
+	putSlot(buf, slot, &briefs.TrieSlot{}) // zero the freed slot
+	pageEmpty := pg.LiveCount == 0
 
 	if !pageEmpty {
-		if pageFreeSlots(buf) != 0 {
+		if pg.FreeSlots != 0 {
 			b.addPartial(block)
 		}
+		putPage(buf, pg)
 		return b.saveBlock(block, buf)
 	}
 
 	// Page is empty: the empty page is held in the cache (flushCache writes it
 	// before the journal commits the JRN_TRIE_FREE below), then return the
 	// block to the allocator.
+	putPage(buf, pg)
 	if err := b.saveBlock(block, buf); err != nil {
 		return err
 	}
@@ -327,20 +323,31 @@ func (b *BrieFS) trieStoreName(ref uint64, name string) error {
 	if err != nil {
 		return err
 	}
-	s := trieSlotBuf(buf, slot)
-	if err := triePageAllocName(buf, s, len(name)); err != nil {
+	pg, err := briefs.ReadTriePage(buf)
+	if err != nil {
+		return err
+	}
+	s, err := briefs.ReadTrieSlot(buf, slot)
+	if err != nil {
+		return err
+	}
+	if err := triePageAllocName(pg, s, b.blockSize, len(name)); err != nil {
 		return err
 	}
 	if len(name) == 0 {
-		slotSetNameLen(s, 0)
-		slotSetNameOffset(s, 0)
+		s.NameLen = 0
+		s.NameOffset = 0
+		putPage(buf, pg)
+		putSlot(buf, slot, s)
 		return b.saveBlock(block, buf)
 	}
-	nameOff := binary.LittleEndian.Uint16(s[trieSlotNameOffset:])
-	nameStart := uint16(b.blockSize) - nameOff
-	binary.LittleEndian.PutUint16(buf[nameStart:], uint16(len(name)))
-	copy(buf[nameStart+2:], name)
-	slotSetNameLen(s, uint16(2+len(name)))
+	nameLen, err := briefs.WriteTrieName(buf, s.NameOffset, name)
+	if err != nil {
+		return err
+	}
+	s.NameLen = nameLen
+	putPage(buf, pg)
+	putSlot(buf, slot, s)
 	return b.saveBlock(block, buf)
 }
 
@@ -351,10 +358,10 @@ func (b *BrieFS) trieLinkChild(parent, child uint64) error {
 	if err != nil {
 		return err
 	}
-	ps := trieSlotBuf(pbuf, uint(briefs.TrieRefSlot(parent)))
 	if briefs.TrieRefIsNull(pnode.FirstChild) {
-		slotSetFirstChild(ps, child)
-		slotSetChildCount(ps, pnode.ChildCount+1)
+		pnode.FirstChild = child
+		pnode.ChildCount++
+		putSlot(pbuf, uint(briefs.TrieRefSlot(parent)), pnode)
 		return b.saveBlock(briefs.TrieRefBlock(parent), pbuf)
 	}
 	// Walk to the last sibling.
@@ -365,8 +372,8 @@ func (b *BrieFS) trieLinkChild(parent, child uint64) error {
 			return err
 		}
 		if briefs.TrieRefIsNull(lnode.NextSibling) {
-			ls := trieSlotBuf(lbuf, uint(briefs.TrieRefSlot(last)))
-			slotSetNextSibling(ls, child)
+			lnode.NextSibling = child
+			putSlot(lbuf, uint(briefs.TrieRefSlot(last)), lnode)
 			if err := b.saveBlock(briefs.TrieRefBlock(last), lbuf); err != nil {
 				return err
 			}
@@ -374,7 +381,8 @@ func (b *BrieFS) trieLinkChild(parent, child uint64) error {
 		}
 		last = lnode.NextSibling
 	}
-	slotSetChildCount(ps, pnode.ChildCount+1)
+	pnode.ChildCount++
+	putSlot(pbuf, uint(briefs.TrieRefSlot(parent)), pnode)
 	return b.saveBlock(briefs.TrieRefBlock(parent), pbuf)
 }
 
@@ -385,15 +393,16 @@ func (b *BrieFS) trieCreateChild(parent uint64, depth, byteVal, nodeType uint8, 
 	if err != nil || briefs.TrieRefIsNull(child) {
 		return 0, err
 	}
-	cbuf, _, err := b.trieRead(child)
+	cbuf, cnode, err := b.trieRead(child)
 	if err != nil {
 		_ = b.trieFreeNode(child)
 		return 0, err
 	}
-	cs := trieSlotBuf(cbuf, uint(briefs.TrieRefSlot(child)))
-	slotSetDepth(cs, depth)
-	slotSetByteVal(cs, byteVal)
-	slotSetNodeType(cs, nodeType)
+	// Preserve the name_offset/name_len that trieAllocNode may have set.
+	cnode.Depth = depth
+	cnode.ByteVal = byteVal
+	cnode.NodeType = nodeType
+	putSlot(cbuf, uint(briefs.TrieRefSlot(child)), cnode)
 	if err := b.saveBlock(briefs.TrieRefBlock(child), cbuf); err != nil {
 		_ = b.trieFreeNode(child)
 		return 0, err
@@ -415,7 +424,7 @@ func (b *BrieFS) trieFindOrCreateChild(parent uint64, depth, byteVal uint8) (uin
 	if !briefs.TrieRefIsNull(child) {
 		return child, nil
 	}
-	return b.trieCreateChild(parent, depth, byteVal, trieNodeTypeInterm, 0)
+	return b.trieCreateChild(parent, depth, byteVal, briefs.NodeTypeInterm, 0)
 }
 
 // trieFindChildWithPrev finds a child by byte_val, returning the child and its
@@ -454,22 +463,21 @@ func (b *BrieFS) trieUnlinkChild(parent, childPrev, child uint64) error {
 		return err
 	}
 	next := cnode.NextSibling
-	ps := trieSlotBuf(pbuf, uint(briefs.TrieRefSlot(parent)))
 	if briefs.TrieRefIsNull(childPrev) {
-		slotSetFirstChild(ps, next)
+		pnode.FirstChild = next
 	} else {
 		pvbuf, pnode2, err := b.trieRead(childPrev)
 		if err != nil {
 			return err
 		}
-		pvs := trieSlotBuf(pvbuf, uint(briefs.TrieRefSlot(childPrev)))
-		slotSetNextSibling(pvs, next)
+		pnode2.NextSibling = next
+		putSlot(pvbuf, uint(briefs.TrieRefSlot(childPrev)), pnode2)
 		if err := b.saveBlock(briefs.TrieRefBlock(childPrev), pvbuf); err != nil {
 			return err
 		}
-		_ = pnode2
 	}
-	slotSetChildCount(ps, pnode.ChildCount-1)
+	pnode.ChildCount--
+	putSlot(pbuf, uint(briefs.TrieRefSlot(parent)), pnode)
 	return b.saveBlock(briefs.TrieRefBlock(parent), pbuf)
 }
 
@@ -485,9 +493,9 @@ func (b *BrieFS) trieSplitLeaf(cur, child uint64, pos int, bval uint8, name stri
 
 	if oldNameLen == pos+1 {
 		// Old leaf is a prefix of the new name: promote it to INTERM|LEAF.
-		ls := trieSlotBuf(lbuf, uint(briefs.TrieRefSlot(child)))
-		slotSetNodeType(ls, trieNodeTypeInterm|trieNodeStatusLeaf)
-		slotSetDepth(ls, uint8(pos+1))
+		lnode.NodeType = briefs.NodeTypeInterm | briefs.NodeStatusLeaf
+		lnode.Depth = uint8(pos + 1)
+		putSlot(lbuf, uint(briefs.TrieRefSlot(child)), lnode)
 		if err := b.saveBlock(briefs.TrieRefBlock(child), lbuf); err != nil {
 			return 0, err
 		}
@@ -495,7 +503,7 @@ func (b *BrieFS) trieSplitLeaf(cur, child uint64, pos int, bval uint8, name stri
 	}
 
 	oldSibling := lnode.NextSibling
-	internal, err := b.trieCreateChild(cur, uint8(pos+1), bval, trieNodeTypeInterm, 0)
+	internal, err := b.trieCreateChild(cur, uint8(pos+1), bval, briefs.NodeTypeInterm, 0)
 	if err != nil || briefs.TrieRefIsNull(internal) {
 		return 0, syscall.ENOSPC
 	}
@@ -505,9 +513,8 @@ func (b *BrieFS) trieSplitLeaf(cur, child uint64, pos int, bval uint8, name stri
 	if err != nil {
 		return 0, err
 	}
-	gs := trieSlotBuf(gbuf, uint(briefs.TrieRefSlot(cur)))
 	if gnode.FirstChild == child {
-		slotSetFirstChild(gs, internal)
+		gnode.FirstChild = internal
 	} else {
 		w := gnode.FirstChild
 		for !briefs.TrieRefIsNull(w) {
@@ -516,8 +523,8 @@ func (b *BrieFS) trieSplitLeaf(cur, child uint64, pos int, bval uint8, name stri
 				break
 			}
 			if wnode.NextSibling == child {
-				ws := trieSlotBuf(wbuf, uint(briefs.TrieRefSlot(w)))
-				slotSetNextSibling(ws, internal)
+				wnode.NextSibling = internal
+				putSlot(wbuf, uint(briefs.TrieRefSlot(w)), wnode)
 				if err := b.saveBlock(briefs.TrieRefBlock(w), wbuf); err != nil {
 					return 0, err
 				}
@@ -526,17 +533,18 @@ func (b *BrieFS) trieSplitLeaf(cur, child uint64, pos int, bval uint8, name stri
 			w = wnode.NextSibling
 		}
 	}
+	putSlot(gbuf, uint(briefs.TrieRefSlot(cur)), gnode)
 	if err := b.saveBlock(briefs.TrieRefBlock(cur), gbuf); err != nil {
 		return 0, err
 	}
 
 	// Link the old leaf as the internal node's child.
-	ibuf, _, err := b.trieRead(internal)
+	ibuf, inode, err := b.trieRead(internal)
 	if err == nil {
-		is := trieSlotBuf(ibuf, uint(briefs.TrieRefSlot(internal)))
-		slotSetFirstChild(is, child)
-		slotSetNextSibling(is, oldSibling)
-		slotSetChildCount(is, 1)
+		inode.FirstChild = child
+		inode.NextSibling = oldSibling
+		inode.ChildCount = 1
+		putSlot(ibuf, uint(briefs.TrieRefSlot(internal)), inode)
 		if err := b.saveBlock(briefs.TrieRefBlock(internal), ibuf); err != nil {
 			return 0, err
 		}
@@ -544,12 +552,12 @@ func (b *BrieFS) trieSplitLeaf(cur, child uint64, pos int, bval uint8, name stri
 
 	// If split at the last byte, store the new name on the internal node.
 	if pos == nameLen-1 {
-		ibuf2, _, err := b.trieRead(internal)
+		ibuf2, inode2, err := b.trieRead(internal)
 		if err == nil {
-			is2 := trieSlotBuf(ibuf2, uint(briefs.TrieRefSlot(internal)))
-			slotSetNodeType(is2, trieNodeTypeInterm|trieNodeStatusLeaf)
-			slotSetFType(is2, ftype)
-			slotSetInode(is2, ino)
+			inode2.NodeType = briefs.NodeTypeInterm | briefs.NodeStatusLeaf
+			inode2.FType = ftype
+			inode2.Inode = ino
+			putSlot(ibuf2, uint(briefs.TrieRefSlot(internal)), inode2)
 			if err := b.saveBlock(briefs.TrieRefBlock(internal), ibuf2); err != nil {
 				return 0, err
 			}
@@ -564,7 +572,7 @@ func (b *BrieFS) trieSplitLeaf(cur, child uint64, pos int, bval uint8, name stri
 // trieCreateRoot creates the root node of a directory trie.  Mirrors
 // briefs_trie_create_root (trie.c:285).
 func (b *BrieFS) trieCreateRoot(di *briefs.Inode) error {
-	ref, err := b.triePageInit(0, 0, trieNodeTypeInterm)
+	ref, err := b.triePageInit(0, 0, briefs.NodeTypeInterm)
 	if err != nil {
 		return err
 	}
@@ -599,25 +607,25 @@ func (b *BrieFS) TrieInsert(di *briefs.Inode, name string, ino uint64, ftype uin
 				if err != nil {
 					return err
 				}
-				cs := trieSlotBuf(cbuf, uint(briefs.TrieRefSlot(existing)))
-				if cnode.NodeType&trieNodeTypeInterm != 0 {
-					if cnode.NodeType&trieNodeStatusLeaf != 0 {
-						ename, _ := readTrieLeafName(cbuf, b.blockSize, cnode)
-						if len(ename) == nameLen && string(ename) == name {
+				if cnode.NodeType&briefs.NodeTypeInterm != 0 {
+					if cnode.NodeType&briefs.NodeStatusLeaf != 0 {
+						ename, _ := briefs.ReadTrieName(cbuf, cnode.NameLen, cnode.NameOffset)
+						if len(ename) == nameLen && ename == name {
 							return syscall.EEXIST
 						}
 					}
-					slotSetNodeType(cs, cnode.NodeType|trieNodeStatusLeaf)
-					slotSetFType(cs, ftype)
-					slotSetInode(cs, ino)
+					cnode.NodeType |= briefs.NodeStatusLeaf
+					cnode.FType = ftype
+					cnode.Inode = ino
+					putSlot(cbuf, uint(briefs.TrieRefSlot(existing)), cnode)
 					if err := b.saveBlock(briefs.TrieRefBlock(existing), cbuf); err != nil {
 						return err
 					}
 					return b.trieStoreName(existing, name)
 				}
 				// Existing pure leaf: check duplicate, then split.
-				ename, _ := readTrieLeafName(cbuf, b.blockSize, cnode)
-				if len(ename) == nameLen && string(ename) == name {
+				ename, _ := briefs.ReadTrieName(cbuf, cnode.NameLen, cnode.NameOffset)
+				if len(ename) == nameLen && ename == name {
 					return syscall.EEXIST
 				}
 				cur, err = b.trieSplitLeaf(cur, existing, pos, bval, name, ino, ftype)
@@ -632,15 +640,15 @@ func (b *BrieFS) TrieInsert(di *briefs.Inode, name string, ino uint64, ftype uin
 			if err != nil || briefs.TrieRefIsNull(newLeaf) {
 				return syscall.ENOSPC
 			}
-			lbuf, _, err := b.trieRead(newLeaf)
+			lbuf, lnode, err := b.trieRead(newLeaf)
 			if err != nil {
 				_ = b.trieFreeNode(newLeaf)
 				return err
 			}
-			ls := trieSlotBuf(lbuf, uint(briefs.TrieRefSlot(newLeaf)))
-			slotSetNodeType(ls, 0)
-			slotSetFType(ls, ftype)
-			slotSetInode(ls, ino)
+			lnode.NodeType = 0
+			lnode.FType = ftype
+			lnode.Inode = ino
+			putSlot(lbuf, uint(briefs.TrieRefSlot(newLeaf)), lnode)
 			if err := b.saveBlock(briefs.TrieRefBlock(newLeaf), lbuf); err != nil {
 				return err
 			}
@@ -656,7 +664,7 @@ func (b *BrieFS) TrieInsert(di *briefs.Inode, name string, ino uint64, ftype uin
 		if err != nil {
 			return err
 		}
-		if cnode.NodeType&trieNodeTypeInterm == 0 {
+		if cnode.NodeType&briefs.NodeTypeInterm == 0 {
 			cur, err = b.trieSplitLeaf(cur, child, pos, bval, name, ino, ftype)
 			if err != nil {
 				return err
@@ -687,18 +695,18 @@ func (b *BrieFS) TrieUpdateEntry(di *briefs.Inode, name string, newIno uint64, n
 			return err
 		}
 		if pos == nameLen-1 {
-			if trieIsLeafNode(cnode.NodeType) {
-				ename, _ := readTrieLeafName(cbuf, b.blockSize, cnode)
-				if len(ename) == nameLen && string(ename) == name {
-					cs := trieSlotBuf(cbuf, uint(briefs.TrieRefSlot(child)))
-					slotSetInode(cs, newIno)
-					slotSetFType(cs, newType)
+			if briefs.TrieIsLeaf(cnode.NodeType) {
+				ename, _ := briefs.ReadTrieName(cbuf, cnode.NameLen, cnode.NameOffset)
+				if len(ename) == nameLen && ename == name {
+					cnode.Inode = newIno
+					cnode.FType = newType
+					putSlot(cbuf, uint(briefs.TrieRefSlot(child)), cnode)
 					return b.saveBlock(briefs.TrieRefBlock(child), cbuf)
 				}
 			}
 			return syscall.ENOENT
 		}
-		if cnode.NodeType&trieNodeTypeInterm == 0 {
+		if cnode.NodeType&briefs.NodeTypeInterm == 0 {
 			// Pure leaf where an INTERM is needed; caller must remove+insert.
 			return syscall.ENOENT
 		}
@@ -737,14 +745,14 @@ func (b *BrieFS) TrieRemove(di *briefs.Inode, name string) error {
 			if err != nil {
 				return err
 			}
-			if cnode.NodeType&trieNodeTypeInterm != 0 && cnode.NodeType&trieNodeStatusLeaf == 0 {
+			if cnode.NodeType&briefs.NodeTypeInterm != 0 && cnode.NodeType&briefs.NodeStatusLeaf == 0 {
 				// Name is a prefix of longer entries but not itself an entry.
 				return syscall.ENOENT
 			}
-			if cnode.NodeType&trieNodeTypeInterm != 0 {
+			if cnode.NodeType&briefs.NodeTypeInterm != 0 {
 				hasChildren := !briefs.TrieRefIsNull(cnode.FirstChild) || cnode.ChildCount != 0
-				cs := trieSlotBuf(cbuf, uint(briefs.TrieRefSlot(child)))
-				slotSetNodeType(cs, cnode.NodeType&^trieNodeStatusLeaf)
+				cnode.NodeType &^= briefs.NodeStatusLeaf
+				putSlot(cbuf, uint(briefs.TrieRefSlot(child)), cnode)
 				if hasChildren {
 					return b.saveBlock(briefs.TrieRefBlock(child), cbuf)
 				}
@@ -790,8 +798,8 @@ func (b *BrieFS) collapseAncestry(di *briefs.Inode, ancestry []uint64, anc int) 
 		if err != nil {
 			break
 		}
-		if cnode.NodeType&trieNodeTypeInterm == 0 ||
-			cnode.NodeType&trieNodeStatusLeaf != 0 ||
+		if cnode.NodeType&briefs.NodeTypeInterm == 0 ||
+			cnode.NodeType&briefs.NodeStatusLeaf != 0 ||
 			cnode.ChildCount != 0 ||
 			!briefs.TrieRefIsNull(cnode.FirstChild) {
 			break
@@ -801,9 +809,8 @@ func (b *BrieFS) collapseAncestry(di *briefs.Inode, ancestry []uint64, anc int) 
 		if err != nil {
 			break
 		}
-		ps := trieSlotBuf(pbuf, uint(briefs.TrieRefSlot(pblk)))
 		if pnode.FirstChild == check {
-			slotSetFirstChild(ps, cnode.NextSibling)
+			pnode.FirstChild = cnode.NextSibling
 		} else {
 			w := pnode.FirstChild
 			for !briefs.TrieRefIsNull(w) {
@@ -812,15 +819,16 @@ func (b *BrieFS) collapseAncestry(di *briefs.Inode, ancestry []uint64, anc int) 
 					break
 				}
 				if wnode.NextSibling == check {
-					ws := trieSlotBuf(wbuf, uint(briefs.TrieRefSlot(w)))
-					slotSetNextSibling(ws, cnode.NextSibling)
+					wnode.NextSibling = cnode.NextSibling
+					putSlot(wbuf, uint(briefs.TrieRefSlot(w)), wnode)
 					_ = b.saveBlock(briefs.TrieRefBlock(w), wbuf)
 					break
 				}
 				w = wnode.NextSibling
 			}
 		}
-		slotSetChildCount(ps, pnode.ChildCount-1)
+		pnode.ChildCount--
+		putSlot(pbuf, uint(briefs.TrieRefSlot(pblk)), pnode)
 		if err := b.saveBlock(briefs.TrieRefBlock(pblk), pbuf); err != nil {
 			return err
 		}
@@ -833,8 +841,8 @@ func (b *BrieFS) collapseAncestry(di *briefs.Inode, ancestry []uint64, anc int) 
 	if !briefs.TrieRefIsNull(di.DirTrieRoot) {
 		_, rnode, err := b.trieRead(di.DirTrieRoot)
 		if err == nil {
-			if rnode.NodeType&trieNodeTypeInterm != 0 &&
-				rnode.NodeType&trieNodeStatusLeaf == 0 &&
+			if rnode.NodeType&briefs.NodeTypeInterm != 0 &&
+				rnode.NodeType&briefs.NodeStatusLeaf == 0 &&
 				rnode.ChildCount == 0 &&
 				briefs.TrieRefIsNull(rnode.FirstChild) {
 				root := di.DirTrieRoot
@@ -845,3 +853,4 @@ func (b *BrieFS) collapseAncestry(di *briefs.Inode, ancestry []uint64, anc int) 
 	}
 	return nil
 }
+

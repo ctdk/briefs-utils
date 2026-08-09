@@ -93,17 +93,17 @@ func (b *BrieFS) cacheAbort() {
 // trieRead loads a trie node's page via the cache and returns the working
 // buffer plus the parsed slot.  Mutations to the buffer are visible to the
 // cache; call saveBlock to persist.
-func (b *BrieFS) trieRead(ref uint64) ([]byte, *TrieNodeData, error) {
+func (b *BrieFS) trieRead(ref uint64) ([]byte, *briefs.TrieSlot, error) {
 	block := briefs.TrieRefBlock(ref)
 	slot := briefs.TrieRefSlot(ref)
 	buf, err := b.loadBlock(block)
 	if err != nil {
 		return nil, nil, err
 	}
-	if _, err := ReadTriePage(buf); err != nil {
+	if _, err := briefs.ReadTriePage(buf); err != nil {
 		return nil, nil, err
 	}
-	node, err := ReadTrieSlot(buf, uint(slot))
+	node, err := briefs.ReadTrieSlot(buf, uint(slot))
 	if err != nil {
 		return nil, nil, err
 	}
