@@ -190,3 +190,83 @@ func (s *SuperblockLayout) UnmarshalBinary(data []byte) error {
 // Compile-time size assertion for SuperblockLayout.
 var _ = [1]struct{}{}[unsafe.Sizeof(SuperblockLayout{}) - 1024]
 
+// Size returns the on-disk size of TriePage. Packed structs have
+// unaligned on-disk fields that Go's struct alignment cannot represent, so
+// this is the declared size, not unsafe.Sizeof (the field-width sum is
+// verified at generation time).
+func (s *TriePage) Size() int { return 20 }
+
+// MarshalBinary serializes TriePage to its little-endian on-disk representation.
+func (s *TriePage) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint32(data[pos:], s.Magic); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Version); pos += 4
+	binary.LittleEndian.PutUint16(data[pos:], s.LiveCount); pos += 2
+	binary.LittleEndian.PutUint16(data[pos:], s.FreeNameOff); pos += 2
+	binary.LittleEndian.PutUint64(data[pos:], s.FreeSlots); pos += 8
+	return data, nil
+}
+
+// UnmarshalBinary deserializes TriePage from its little-endian on-disk representation.
+func (s *TriePage) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("TriePage data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Magic = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Version = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.LiveCount = binary.LittleEndian.Uint16(data[pos:]); pos += 2
+	s.FreeNameOff = binary.LittleEndian.Uint16(data[pos:]); pos += 2
+	s.FreeSlots = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	return nil
+}
+
+// Packed layout: 20 bytes (field-width sum verified at generation time).
+
+// Size returns the on-disk size of TrieSlot. Packed structs have
+// unaligned on-disk fields that Go's struct alignment cannot represent, so
+// this is the declared size, not unsafe.Sizeof (the field-width sum is
+// verified at generation time).
+func (s *TrieSlot) Size() int { return 36 }
+
+// MarshalBinary serializes TrieSlot to its little-endian on-disk representation.
+func (s *TrieSlot) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint64(data[pos:], s.FirstChild); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.NextSibling); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.Inode); pos += 8
+	binary.LittleEndian.PutUint16(data[pos:], s.NameLen); pos += 2
+	binary.LittleEndian.PutUint16(data[pos:], s.NameOffset); pos += 2
+	data[pos] = s.Depth; pos += 1
+	data[pos] = s.NodeType; pos += 1
+	data[pos] = s.ByteVal; pos += 1
+	data[pos] = s.FType; pos += 1
+	binary.LittleEndian.PutUint16(data[pos:], s.Flags); pos += 2
+	binary.LittleEndian.PutUint16(data[pos:], s.ChildCount); pos += 2
+	return data, nil
+}
+
+// UnmarshalBinary deserializes TrieSlot from its little-endian on-disk representation.
+func (s *TrieSlot) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("TrieSlot data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.FirstChild = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.NextSibling = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Inode = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.NameLen = binary.LittleEndian.Uint16(data[pos:]); pos += 2
+	s.NameOffset = binary.LittleEndian.Uint16(data[pos:]); pos += 2
+	s.Depth = data[pos]; pos += 1
+	s.NodeType = data[pos]; pos += 1
+	s.ByteVal = data[pos]; pos += 1
+	s.FType = data[pos]; pos += 1
+	s.Flags = binary.LittleEndian.Uint16(data[pos:]); pos += 2
+	s.ChildCount = binary.LittleEndian.Uint16(data[pos:]); pos += 2
+	return nil
+}
+
+// Packed layout: 36 bytes (field-width sum verified at generation time).
+
