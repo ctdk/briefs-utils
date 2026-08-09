@@ -328,7 +328,7 @@ func (b *BrieFS) buildXattrLiveSet() {
 		block := head
 		visited := 0
 		for block != 0 {
-			if visited > xattrMaxChain {
+			if visited > briefs.XattrMaxChain {
 				break
 			}
 			b.xattrLive[block] = true
@@ -531,7 +531,7 @@ func (b *BrieFS) replaySymlinkData(rec *briefs.JrnSymlinkData) error {
 // zero + CRC, but only when the block is still in its owning inode's final
 // xattr chain (the pass-1 live set). Mirrors replay_xattr_data() (journal.c:1180).
 func (b *BrieFS) replayXattrData(rec *briefs.JrnXattrData) error {
-	if rec == nil || rec.UsedSize == 0 || rec.UsedSize > xattrMaxUsed {
+	if rec == nil || rec.UsedSize == 0 || rec.UsedSize > briefs.XattrMaxUsed {
 		return nil
 	}
 	if !b.xattrLive[rec.PhysBlk] {

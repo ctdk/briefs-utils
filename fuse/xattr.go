@@ -47,14 +47,10 @@ import (
 )
 
 const (
-	xattrEntrySize       = 8
-	xattrV2HdrSize       = 32
-	xattrMaxUsed         = 4044
-	xattrMaxChain        = 1024
 	xattrBlockMaxEntries = 501
 	xattrMaxNameLen      = 255  // XATTR_NAME_MAX
 	xattrMaxValueLen     = 65536 // XATTR_SIZE_MAX
-	xattrPayloadCap      = xattrMaxUsed - xattrV2HdrSize // 4012
+	xattrPayloadCap      = briefs.XattrMaxUsed - 32 // 4012 (v2 header)
 )
 
 // xattrKV is an in-memory extended attribute (name includes its namespace
@@ -337,6 +333,7 @@ func (b *BrieFS) loadXattrEntries(in *briefs.Inode) ([]xattrKV, []uint64, error)
 	}
 	// Pass 1: load the whole chain into memory.
 	var blocks [][]byte
+	var headers []*briefs.XattrHeader
 	var abs []uint64
 	block := in.XattrOffset
 	visited := make(map[uint64]bool)
@@ -344,7 +341,7 @@ func (b *BrieFS) loadXattrEntries(in *briefs.Inode) ([]xattrKV, []uint64, error)
 		if visited[block] {
 			return nil, nil, fmt.Errorf("briefs: xattr chain loop at %d", block)
 		}
-		if len(visited) > xattrMaxChain {
+		if len(visited) > briefs.XattrMaxChain {
 			return nil, nil, fmt.Errorf("briefs: xattr chain too long")
 		}
 		visited[block] = true
@@ -352,16 +349,17 @@ func (b *BrieFS) loadXattrEntries(in *briefs.Inode) ([]xattrKV, []uint64, error)
 		if err != nil {
 			return nil, nil, err
 		}
-		magic := binary.LittleEndian.Uint32(buf[0:4])
-		if magic != briefs.MagicXattr {
-			return nil, nil, fmt.Errorf("briefs: xattr block %d bad magic", block)
+		h, err := briefs.ReadXattrHeader(buf)
+		if err != nil {
+			return nil, nil, fmt.Errorf("briefs: xattr block %d: %w", block, err)
 		}
 		if err := briefs.VerifyChainChecksum(buf, b.blockSize); err != nil {
 			return nil, nil, fmt.Errorf("briefs: xattr block %d CRC: %w", block, err)
 		}
 		blocks = append(blocks, buf)
+		headers = append(headers, h)
 		abs = append(abs, block)
-		block = binary.LittleEndian.Uint64(buf[16:24])
+		block = h.NextBlock
 	}
 
 	// Pass 2: parse entry blocks and assemble split values from the following
@@ -369,18 +367,23 @@ func (b *BrieFS) loadXattrEntries(in *briefs.Inode) ([]xattrKV, []uint64, error)
 	// its cont blocks are exactly those that follow until the next entry block.
 	var kvs []xattrKV
 	for i, buf := range blocks {
-		flags := binary.LittleEndian.Uint32(buf[24:28])
-		if flags&briefs.BrieFSXattrFlagCont != 0 {
+		h := headers[i]
+		if h.Flags&briefs.BrieFSXattrFlagCont != 0 {
 			continue // continuation block; consumed with its entry block
 		}
-		entryCount := binary.LittleEndian.Uint32(buf[12:16])
-		used := binary.LittleEndian.Uint32(buf[8:12])
+		entryCount := h.EntryCount
+		used := h.UsedSize
+		hdrSize := uint32(briefs.XattrHeaderSize(h.Version))
 		for j := uint32(0); j < entryCount; j++ {
-			base := xattrV2HdrSize + j*xattrEntrySize
-			nameLen := uint32(binary.LittleEndian.Uint16(buf[base:]))
-			valueLen := uint32(binary.LittleEndian.Uint16(buf[base+2:]))
-			nameOff := uint32(binary.LittleEndian.Uint16(buf[base+4:]))
-			valueOff := uint32(binary.LittleEndian.Uint16(buf[base+6:]))
+			base := int(hdrSize + j*uint32(briefs.XattrEntrySize))
+			e, err := briefs.ReadXattrEntry(buf, base)
+			if err != nil {
+				return nil, nil, err
+			}
+			nameLen := uint32(e.NameLen)
+			valueLen := uint32(e.ValueLen)
+			nameOff := uint32(e.NameOffset)
+			valueOff := uint32(e.ValueOffset)
 			name := string(buf[nameOff : nameOff+nameLen])
 			value := make([]byte, valueLen)
 			copied := uint32(0)
@@ -398,18 +401,19 @@ func (b *BrieFS) loadXattrEntries(in *briefs.Inode) ([]xattrKV, []uint64, error)
 				// Remainder from following continuation blocks.
 				cb := i + 1
 				for copied < valueLen && cb < len(blocks) {
-					cbuf := blocks[cb]
-					cflags := binary.LittleEndian.Uint32(cbuf[24:28])
-					if cflags&briefs.BrieFSXattrFlagCont == 0 {
+					ch := headers[cb]
+					if ch.Flags&briefs.BrieFSXattrFlagCont == 0 {
 						break // next entry block
 					}
-					cused := binary.LittleEndian.Uint32(cbuf[8:12])
-					cap := cused - xattrV2HdrSize
+					cused := ch.UsedSize
+					chdrSize := uint32(briefs.XattrHeaderSize(ch.Version))
+					cap := cused - chdrSize
 					take := cap
 					if take > valueLen-copied {
 						take = valueLen - copied
 					}
-					copy(value[copied:], cbuf[xattrV2HdrSize:xattrV2HdrSize+take])
+					cbuf := blocks[cb]
+					copy(value[copied:], cbuf[chdrSize:chdrSize+take])
 					copied += take
 					cb++
 				}
@@ -433,7 +437,7 @@ func (b *BrieFS) walkXattrChainBlocks(head uint64) ([]uint64, error) {
 		if visited[block] {
 			return nil, fmt.Errorf("briefs: xattr free loop at %d", block)
 		}
-		if len(visited) > xattrMaxChain {
+		if len(visited) > briefs.XattrMaxChain {
 			return nil, fmt.Errorf("briefs: xattr chain too long")
 		}
 		visited[block] = true
@@ -442,7 +446,11 @@ func (b *BrieFS) walkXattrChainBlocks(head uint64) ([]uint64, error) {
 		if err != nil {
 			return nil, err
 		}
-		block = binary.LittleEndian.Uint64(buf[16:24])
+		h, err := briefs.ReadXattrHeader(buf)
+		if err != nil {
+			return nil, fmt.Errorf("briefs: xattr block %d: %w", block, err)
+		}
+		block = h.NextBlock
 	}
 	return out, nil
 }
@@ -474,7 +482,7 @@ func buildXattrChain(kvs []xattrKV) ([]*xattrBlockDesc, error) {
 	for i, kv := range kvs {
 		nameLen := uint32(len(kv.name))
 		valueLen := uint32(len(kv.value))
-		needEntry := uint32(xattrEntrySize) + align4(nameLen)
+		needEntry := uint32(briefs.XattrEntrySize) + align4(nameLen)
 	again:
 		maxPayload := uint32(xattrPayloadCap)
 		if needEntry > maxPayload-cur.payloadUsed || len(cur.kv) >= xattrBlockMaxEntries {
@@ -512,7 +520,7 @@ func buildXattrChain(kvs []xattrKV) ([]*xattrBlockDesc, error) {
 			}
 		}
 	}
-	if len(descs) > xattrMaxChain {
+	if len(descs) > briefs.XattrMaxChain {
 		return nil, syscall.ENOSPC
 	}
 	return descs, nil
@@ -522,52 +530,58 @@ func buildXattrChain(kvs []xattrKV) ([]*xattrBlockDesc, error) {
 // into a full block buffer. Mirrors the kernel serialize loop (xattr.c:1072).
 func serializeXattrBlock(d *xattrBlockDesc, kvs []xattrKV, absBlocks []uint64, i uint64, blockSize uint64) []byte {
 	buf := make([]byte, blockSize)
-	var next uint64
-	if i+1 < uint64(len(absBlocks)) {
-		next = absBlocks[i+1]
+	hdrSize := uint32(briefs.XattrHeaderSize(briefs.BrieFSXattrVersion)) // 32
+
+	hdr := &briefs.XattrHeader{
+		Magic:    briefs.MagicXattr,
+		Version:  briefs.BrieFSXattrVersion,
+		Reserved: 0,
 	}
-	binary.LittleEndian.PutUint32(buf[0:4], briefs.MagicXattr)
-	binary.LittleEndian.PutUint32(buf[4:8], briefs.BrieFSXattrVersion)
-	binary.LittleEndian.PutUint64(buf[16:24], next)
-	binary.LittleEndian.PutUint32(buf[28:32], 0) // reserved
+	if i+1 < uint64(len(absBlocks)) {
+		hdr.NextBlock = absBlocks[i+1]
+	}
 
 	var used uint32
 	if d.cont {
-		binary.LittleEndian.PutUint32(buf[24:28], briefs.BrieFSXattrFlagCont)
-		binary.LittleEndian.PutUint32(buf[12:16], 0) // entry_count
+		hdr.Flags = briefs.BrieFSXattrFlagCont
+		hdr.EntryCount = 0
 		frag := d.fragLen
-		copy(buf[xattrV2HdrSize:], kvs[d.kvIdx].value[d.valueOff:d.valueOff+frag])
-		used = uint32(xattrV2HdrSize) + frag
+		copy(buf[hdrSize:], kvs[d.kvIdx].value[d.valueOff:d.valueOff+frag])
+		used = hdrSize + frag
 	} else {
-		binary.LittleEndian.PutUint32(buf[24:28], 0) // flags
-		binary.LittleEndian.PutUint32(buf[12:16], uint32(len(d.kv)))
-		off := uint32(xattrV2HdrSize) + uint32(len(d.kv))*xattrEntrySize
+		hdr.Flags = 0
+		hdr.EntryCount = uint32(len(d.kv))
+		off := hdrSize + uint32(len(d.kv))*uint32(briefs.XattrEntrySize)
 		for j, kvIdx := range d.kv {
 			kv := kvs[kvIdx]
 			nameLen := uint32(len(kv.name))
 			valueLen := uint32(len(kv.value))
 			inlineLen := d.inlineLen[j]
-			base := xattrV2HdrSize + uint32(j)*xattrEntrySize
-			binary.LittleEndian.PutUint16(buf[base:], uint16(nameLen))
-			binary.LittleEndian.PutUint16(buf[base+2:], uint16(valueLen))
-			binary.LittleEndian.PutUint16(buf[base+4:], uint16(off))
+			base := int(hdrSize + uint32(j)*uint32(briefs.XattrEntrySize))
+			entry := &briefs.XattrEntry{
+				NameLen:    uint16(nameLen),
+				ValueLen:   uint16(valueLen),
+				NameOffset: uint16(off),
+			}
 			copy(buf[off:], kv.name)
 			off += align4(nameLen)
 			switch {
 			case valueLen == 0:
-				binary.LittleEndian.PutUint16(buf[base+6:], 0)
+				entry.ValueOffset = 0
 			case inlineLen == 0:
 				// Sentinel: the whole value lives in continuation block(s).
-				binary.LittleEndian.PutUint16(buf[base+6:], 0)
+				entry.ValueOffset = 0
 			default:
-				binary.LittleEndian.PutUint16(buf[base+6:], uint16(off))
+				entry.ValueOffset = uint16(off)
 				copy(buf[off:], kv.value[:inlineLen])
 				off += align4(inlineLen)
 			}
+			briefs.WriteXattrEntry(buf, base, entry)
 		}
 		used = off
 	}
-	binary.LittleEndian.PutUint32(buf[8:12], used)
+	hdr.UsedSize = used
+	briefs.WriteXattrHeader(buf, hdr)
 	// Zero the tail beyond used; the CRC over [0,4080) is recomputed.
 	binary.LittleEndian.PutUint64(buf[4080:], briefs.ComputeChainChecksum(buf, blockSize))
 	return buf
@@ -575,5 +589,9 @@ func serializeXattrBlock(d *xattrBlockDesc, kvs []xattrKV, absBlocks []uint64, i
 
 // usedSizeOf returns the used_size field of a serialized xattr block buffer.
 func usedSizeOf(buf []byte) uint32 {
-	return binary.LittleEndian.Uint32(buf[8:12])
+	h, err := briefs.ReadXattrHeader(buf)
+	if err != nil || h == nil {
+		return 0
+	}
+	return h.UsedSize
 }

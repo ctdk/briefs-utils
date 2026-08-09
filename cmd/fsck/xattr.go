@@ -1,8 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
-
 	"github.com/ctdk/briefs-utils/briefs"
 )
 
@@ -26,20 +24,10 @@ import (
 //
 // Multiple blocks may be chained via v2 briefs_xattr_header.next_block; a block
 // with the BRIEFS_XATTR_FLAG_CONT flag holds raw value bytes and no entries.
-const (
-	xattrEntrySize  = 8
-	xattrMaxUsed    = 4044
-	xattrMaxChain   = 1024
-	xattrV1HdrSize  = 16
-	xattrV2HdrSize  = 32
-)
-
-func xattrHeaderSize(version uint32) uint32 {
-	if version == 1 {
-		return xattrV1HdrSize
-	}
-	return xattrV2HdrSize
-}
+//
+// All header/entry reads go through the shared briefs.XattrHeader /
+// briefs.XattrEntry codec (briefs/xattr_disk.go); the v1-vs-v2 header-size
+// distinction lives in briefs.XattrHeaderSize.
 
 // verifyXattrBlock validates an inode's external xattr chain, when present,
 // and records every block in fs.usedBlocks so the cross-reference
@@ -54,14 +42,9 @@ func verifyXattrBlock(fs *fsckState, ino uint64, in *briefs.Inode, blockSize uin
 	}
 
 	type xattrBlock struct {
-		abs        uint64
-		buf        []byte
-		version    uint32
-		hdrSize    uint32
-		used       uint32
-		entryCount uint32
-		next       uint64
-		cont       bool
+		abs uint64
+		buf []byte
+		h   *briefs.XattrHeader
 	}
 
 	visited := make(map[uint64]bool)
@@ -73,8 +56,8 @@ func verifyXattrBlock(fs *fsckState, ino uint64, in *briefs.Inode, blockSize uin
 	// validate split values against the continuation blocks that follow their
 	// entry block.
 	for block != 0 {
-		if len(visited) > xattrMaxChain {
-			fs.errorf("ino %d: xattr chain exceeds max length %d", ino, xattrMaxChain)
+		if len(visited) > briefs.XattrMaxChain {
+			fs.errorf("ino %d: xattr chain exceeds max length %d", ino, briefs.XattrMaxChain)
 			return
 		}
 		if visited[block] {
@@ -90,32 +73,16 @@ func verifyXattrBlock(fs *fsckState, ino uint64, in *briefs.Inode, blockSize uin
 			return
 		}
 
-		magic := binary.LittleEndian.Uint32(buf[0:4])
-		if magic != briefs.MagicXattr {
-			fs.errorf("ino %d: xattr block %d bad magic 0x%08X (expected 0x%08X)",
-				ino, abs, magic, briefs.MagicXattr)
+		h, err := briefs.ReadXattrHeader(buf)
+		if err != nil {
+			fs.errorf("ino %d: xattr block %d: %v", ino, abs, err)
 			return
 		}
-		version := binary.LittleEndian.Uint32(buf[4:8])
-		if version != 1 && version != 2 {
-			fs.errorf("ino %d: xattr block %d unsupported version %d",
-				ino, abs, version)
-			return
-		}
-		hdrSize := xattrHeaderSize(version)
-		used := binary.LittleEndian.Uint32(buf[8:12])
-		if used > xattrMaxUsed || used < hdrSize {
+		hdrSize := uint32(briefs.XattrHeaderSize(h.Version))
+		if h.UsedSize > briefs.XattrMaxUsed || h.UsedSize < hdrSize {
 			fs.errorf("ino %d: xattr block %d used_size %d out of range [%d,%d]",
-				ino, abs, used, hdrSize, xattrMaxUsed)
+				ino, abs, h.UsedSize, hdrSize, briefs.XattrMaxUsed)
 			return
-		}
-		entryCount := binary.LittleEndian.Uint32(buf[12:16])
-
-		var nextBlock uint64
-		var flags uint32
-		if version == 2 {
-			nextBlock = binary.LittleEndian.Uint64(buf[16:24])
-			flags = binary.LittleEndian.Uint32(buf[24:28])
 		}
 
 		// CRC32C over [0, 4080), stored at offset 4080 -- the same coverage the
@@ -126,64 +93,59 @@ func verifyXattrBlock(fs *fsckState, ino uint64, in *briefs.Inode, blockSize uin
 			return
 		}
 
-		isCont := (flags & briefs.BrieFSXattrFlagCont) != 0
+		isCont := (h.Flags & briefs.BrieFSXattrFlagCont) != 0
 		if isCont {
-			if entryCount != 0 {
+			if h.EntryCount != 0 {
 				fs.errorf("ino %d: xattr continuation block %d has entry_count %d",
-					ino, abs, entryCount)
+					ino, abs, h.EntryCount)
 				return
 			}
 		}
 
-		chain = append(chain, xattrBlock{
-			abs:        abs,
-			buf:        buf,
-			version:    version,
-			hdrSize:    hdrSize,
-			used:       used,
-			entryCount: entryCount,
-			next:       nextBlock,
-			cont:       isCont,
-		})
+		chain = append(chain, xattrBlock{abs: abs, buf: buf, h: h})
 
 		// Cross-reference: treat the xattr block as allocated metadata so the
 		// orphan/leak passes account for it.
 		fs.usedBlocks[abs] = true
 
-		if !isCont && entryCount == 0 {
+		if !isCont && h.EntryCount == 0 {
 			fs.warnf("ino %d: xattr block %d has zero entries (should have been freed)",
 				ino, abs)
 		}
 
-		block = nextBlock
+		block = h.NextBlock
 	}
 
 	// Pass 2: validate entry records and split-value capacity.
 	for b := range chain {
 		bblk := &chain[b]
-		if bblk.cont {
+		if bblk.h.Flags&briefs.BrieFSXattrFlagCont != 0 {
 			continue
 		}
-		hdrSize := bblk.hdrSize
-		used := bblk.used
-		entryCount := bblk.entryCount
+		hdrSize := uint32(briefs.XattrHeaderSize(bblk.h.Version))
+		used := bblk.h.UsedSize
+		entryCount := bblk.h.EntryCount
 
 		// The entry array must fit inside the used region.
-		if uint64(entryCount)*xattrEntrySize+uint64(hdrSize) > uint64(used) {
+		if uint64(entryCount)*briefs.XattrEntrySize+uint64(hdrSize) > uint64(used) {
 			fs.errorf("ino %d: xattr block %d entry_count %d exceeds used_size %d",
 				ino, bblk.abs, entryCount, used)
 			return
 		}
 
-		entries := bblk.buf[hdrSize:]
 		var totalDemand uint64
 		var totalInline uint64
 		for i := uint32(0); i < entryCount; i++ {
-			base := i * xattrEntrySize
-			nameLen := uint32(binary.LittleEndian.Uint16(entries[base+0 : base+2]))
-			valueLen := uint32(binary.LittleEndian.Uint16(entries[base+2 : base+4]))
-			nameOff := uint32(binary.LittleEndian.Uint16(entries[base+4 : base+6]))
-			valueOff := uint32(binary.LittleEndian.Uint16(entries[base+6 : base+8]))
+			base := int(hdrSize + i*uint32(briefs.XattrEntrySize))
+			e, err := briefs.ReadXattrEntry(bblk.buf, base)
+			if err != nil {
+				fs.errorf("ino %d: xattr block %d entry %d: %v", ino, bblk.abs, i, err)
+				return
+			}
+			nameLen := uint32(e.NameLen)
+			valueLen := uint32(e.ValueLen)
+			nameOff := uint32(e.NameOffset)
+			valueOff := uint32(e.ValueOffset)
 
 			if nameLen == 0 {
 				fs.errorf("ino %d: xattr block %d entry %d has zero name_len",
@@ -208,7 +170,7 @@ func verifyXattrBlock(fs *fsckState, ino uint64, in *briefs.Inode, blockSize uin
 
 			// valueOff points into the entry block's payload, after the entry
 			// array and the names/inline values that precede this entry.
-			minValueOff := hdrSize + entryCount*xattrEntrySize
+			minValueOff := hdrSize + entryCount*uint32(briefs.XattrEntrySize)
 			if valueOff < minValueOff || valueOff > used {
 				fs.errorf("ino %d: xattr block %d entry %d value_offset %d out of range [%d,%d]",
 					ino, bblk.abs, i, valueOff, minValueOff, used)
@@ -225,8 +187,9 @@ func verifyXattrBlock(fs *fsckState, ino uint64, in *briefs.Inode, blockSize uin
 		// Capacity available in the contiguous continuation blocks that follow
 		// this entry block.
 		var contCap uint64
-		for k := b + 1; k < len(chain) && chain[k].cont; k++ {
-			contCap += uint64(chain[k].used - chain[k].hdrSize)
+		for k := b + 1; k < len(chain) && chain[k].h.Flags&briefs.BrieFSXattrFlagCont != 0; k++ {
+			chdrSize := uint32(briefs.XattrHeaderSize(chain[k].h.Version))
+			contCap += uint64(chain[k].h.UsedSize) - uint64(chdrSize)
 		}
 
 		if totalDemand > totalInline+contCap {

@@ -270,3 +270,69 @@ func (s *TrieSlot) UnmarshalBinary(data []byte) error {
 
 // Packed layout: 36 bytes (field-width sum verified at generation time).
 
+// Size returns the on-disk size of XattrEntry.
+func (s *XattrEntry) Size() int { return int(unsafe.Sizeof(XattrEntry{})) }
+
+// MarshalBinary serializes XattrEntry to its little-endian on-disk representation.
+func (s *XattrEntry) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint16(data[pos:], s.NameLen); pos += 2
+	binary.LittleEndian.PutUint16(data[pos:], s.ValueLen); pos += 2
+	binary.LittleEndian.PutUint16(data[pos:], s.NameOffset); pos += 2
+	binary.LittleEndian.PutUint16(data[pos:], s.ValueOffset); pos += 2
+	return data, nil
+}
+
+// UnmarshalBinary deserializes XattrEntry from its little-endian on-disk representation.
+func (s *XattrEntry) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("XattrEntry data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.NameLen = binary.LittleEndian.Uint16(data[pos:]); pos += 2
+	s.ValueLen = binary.LittleEndian.Uint16(data[pos:]); pos += 2
+	s.NameOffset = binary.LittleEndian.Uint16(data[pos:]); pos += 2
+	s.ValueOffset = binary.LittleEndian.Uint16(data[pos:]); pos += 2
+	return nil
+}
+
+// Compile-time size assertion for XattrEntry.
+var _ = [1]struct{}{}[unsafe.Sizeof(XattrEntry{}) - 8]
+
+// Size returns the on-disk size of XattrHeader.
+func (s *XattrHeader) Size() int { return int(unsafe.Sizeof(XattrHeader{})) }
+
+// MarshalBinary serializes XattrHeader to its little-endian on-disk representation.
+func (s *XattrHeader) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint32(data[pos:], s.Magic); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Version); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.UsedSize); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.EntryCount); pos += 4
+	binary.LittleEndian.PutUint64(data[pos:], s.NextBlock); pos += 8
+	binary.LittleEndian.PutUint32(data[pos:], s.Flags); pos += 4
+	binary.LittleEndian.PutUint32(data[pos:], s.Reserved); pos += 4
+	return data, nil
+}
+
+// UnmarshalBinary deserializes XattrHeader from its little-endian on-disk representation.
+func (s *XattrHeader) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("XattrHeader data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Magic = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Version = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.UsedSize = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.EntryCount = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.NextBlock = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Flags = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Reserved = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	return nil
+}
+
+// Compile-time size assertion for XattrHeader.
+var _ = [1]struct{}{}[unsafe.Sizeof(XattrHeader{}) - 32]
+
