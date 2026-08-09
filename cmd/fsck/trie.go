@@ -1,32 +1,12 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"math/bits"
 	"os"
 
 	"github.com/ctdk/briefs-utils/briefs"
 )
-
-// trieSlot mirrors the kernel's packed trie node slot.
-type trieSlot struct {
-	FirstChild  uint64
-	NextSibling uint64
-	Inode       uint64
-	NameLen     uint16
-	NameOffset  uint16
-	Depth       uint8
-	NodeType    uint8
-	ByteVal     uint8
-	FType       uint8
-	Flags       uint16
-	ChildCount  uint16
-}
-
-const trieSlotSize = 36
-const triePageHeaderSize = 20
-const trieSlotCount = briefs.TrieSlotsPerBlock
 
 // trieEntry represents a single directory entry found in the trie.
 type trieEntry struct {
@@ -40,74 +20,6 @@ type trieEntry struct {
 type dirInfo struct {
 	ino      uint64
 	trieRoot uint64
-}
-
-// trieIsLeaf returns true if the node has leaf data (pure leaf or INTERM+NODE_STATUS_LEAF).
-func trieIsLeaf(nt uint8) bool {
-	return (nt&briefs.NodeTypeInterm) == 0 || (nt&briefs.NodeStatusLeaf) != 0
-}
-
-// readTriePage reads and validates a packed trie page header.
-func readTriePage(buf []byte) (magic uint32, liveCount uint16, freeSlots uint64, err error) {
-	if uint64(len(buf)) < triePageHeaderSize {
-		return 0, 0, 0, fmt.Errorf("buffer too small for trie page header")
-	}
-	magic = binary.LittleEndian.Uint32(buf[0:])
-	if magic != briefs.MagicTriePage {
-		return magic, 0, 0, fmt.Errorf("bad trie page magic 0x%08X (expected 0x%08X)", magic, briefs.MagicTriePage)
-	}
-	liveCount = binary.LittleEndian.Uint16(buf[8:])
-	freeSlots = binary.LittleEndian.Uint64(buf[12:])
-	return magic, liveCount, freeSlots, nil
-}
-
-// parseTrieSlot reads a single node slot from a page buffer.
-func parseTrieSlot(buf []byte, slot uint) (trieSlot, error) {
-	off := uint64(triePageHeaderSize + slot*trieSlotSize)
-	if off+trieSlotSize > uint64(len(buf)) {
-		return trieSlot{}, fmt.Errorf("slot %d out of range", slot)
-	}
-	return trieSlot{
-		FirstChild:  binary.LittleEndian.Uint64(buf[off:]),
-		NextSibling: binary.LittleEndian.Uint64(buf[off+8:]),
-		Inode:       binary.LittleEndian.Uint64(buf[off+16:]),
-		NameLen:     binary.LittleEndian.Uint16(buf[off+24:]),
-		NameOffset:  binary.LittleEndian.Uint16(buf[off+26:]),
-		Depth:       buf[off+28],
-		NodeType:    buf[off+29],
-		ByteVal:     buf[off+30],
-		FType:       buf[off+31],
-		Flags:       binary.LittleEndian.Uint16(buf[off+32:]),
-		ChildCount:  binary.LittleEndian.Uint16(buf[off+34:]),
-	}, nil
-}
-
-// extractTrieNodeName reads the name from the trailing bytes of a trie page buffer.
-func extractTrieNodeName(buf []byte, node trieSlot) string {
-	// The kernel stores name_len = 2 (length prefix) + actual name length.
-	maxNameLen := uint16(briefs.BrieFSMaxNameLen + 2)
-	if node.NameLen < 2 || node.NameLen > maxNameLen || node.NameOffset == 0 {
-		return ""
-	}
-	if int(node.NameOffset) > len(buf) {
-		return ""
-	}
-	nameStart := len(buf) - int(node.NameOffset)
-	if nameStart < 0 || nameStart+2 > len(buf) {
-		return ""
-	}
-	storedLen := int(binary.LittleEndian.Uint16(buf[nameStart:]))
-	if storedLen < 1 || storedLen > briefs.BrieFSMaxNameLen {
-		return ""
-	}
-	// NameLen in the slot must match the 2-byte prefix + stored name length.
-	if uint16(storedLen)+2 != node.NameLen {
-		return ""
-	}
-	if nameStart+2+storedLen > len(buf) {
-		return ""
-	}
-	return string(buf[nameStart+2 : nameStart+2+storedLen])
 }
 
 // verifyDirectoryTrie walks a directory's packed trie, validating structure and collecting entries.
@@ -152,7 +64,7 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootRef uint64, blockS
 			continue
 		}
 
-		_, liveCount, freeSlots, err := readTriePage(buf)
+		page, err := briefs.ReadTriePage(buf)
 		if err != nil {
 			fs.errorf("ino %d dir trie: ref %d: %v", parentIno, ref, err)
 			fs.failedTrieDirs[parentIno] = true
@@ -160,25 +72,25 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootRef uint64, blockS
 		}
 
 		// Cross-check the page header's live_count against the free-slot bitmap.
-		allocated := bits.OnesCount64(freeSlots)
-		if allocated != int(trieSlotCount-liveCount) {
+		allocated := bits.OnesCount64(page.FreeSlots)
+		if allocated != int(briefs.TrieSlotsPerBlock-page.LiveCount) {
 			fs.errorf("ino %d dir trie: page %d live_count=%d inconsistent with free_slots bitmap (%d allocated)",
-				parentIno, block, liveCount, allocated)
+				parentIno, block, page.LiveCount, allocated)
 		}
 
-		if slot >= trieSlotCount {
+		if slot >= briefs.TrieSlotsPerBlock {
 			fs.errorf("ino %d dir trie: ref %d: slot %d out of range", parentIno, ref, slot)
 			fs.failedTrieDirs[parentIno] = true
 			continue
 		}
 
-		if freeSlots&(1<<slot) != 0 {
+		if page.FreeSlots&(1<<slot) != 0 {
 			fs.errorf("ino %d dir trie: ref %d: slot %d is marked free", parentIno, ref, slot)
 			fs.failedTrieDirs[parentIno] = true
 			continue
 		}
 
-		node, err := parseTrieSlot(buf, slot)
+		node, err := briefs.ReadTrieSlot(buf, slot)
 		if err != nil {
 			fs.errorf("ino %d dir trie: ref %d: %v", parentIno, ref, err)
 			fs.failedTrieDirs[parentIno] = true
@@ -207,10 +119,10 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootRef uint64, blockS
 
 		// Validate depth and byte_val for root.
 		if ref == rootRef && node.Depth != 0 {
-			fs.errorf("ino %d dir trie: root ref %d: depth is %d, expected 0", parentIno, ref, node.Depth)
+			fs.errorf("ino %d dir trie: root ref %d: depth is %d, expected 0", parentIno, ref)
 		}
 		if ref == rootRef && node.ByteVal != 0 {
-			fs.errorf("ino %d dir trie: root ref %d: byte_val is %d, expected 0", parentIno, ref, node.ByteVal)
+			fs.errorf("ino %d dir trie: root ref %d: byte_val is %d, expected 0", parentIno, ref)
 		}
 
 		// Validate child_count vs first_child.
@@ -237,12 +149,12 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootRef uint64, blockS
 		}
 
 		// Extract leaf entry if this node has one.
-		if trieIsLeaf(node.NodeType) {
+		if briefs.TrieIsLeaf(node.NodeType) {
 			if node.Flags&uint16(briefs.NodeFlagDeleted) == 0 {
-				name := extractTrieNodeName(buf, node)
-				if name == "" {
-					fs.errorf("ino %d dir trie: ref %d: empty or invalid name (name_len=%d, name_offset=%d)",
-						parentIno, ref, node.NameLen, node.NameOffset)
+				name, err := briefs.ReadTrieName(buf, node.NameLen, node.NameOffset)
+				if err != nil {
+					fs.errorf("ino %d dir trie: ref %d: empty or invalid name (name_len=%d, name_offset=%d): %v",
+						parentIno, ref, node.NameLen, node.NameOffset, err)
 				} else {
 					entries = append(entries, trieEntry{
 						Inode:  node.Inode,
@@ -274,11 +186,11 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootRef uint64, blockS
 					fs.errorf("ino %d dir trie: read child page %d: %v", parentIno, childBlock, err)
 					break
 				}
-				if _, _, _, err := readTriePage(cbuf); err != nil {
+				if _, err := briefs.ReadTriePage(cbuf); err != nil {
 					fs.errorf("ino %d dir trie: child ref %d: %v", parentIno, child, err)
 					break
 				}
-				cn, err := parseTrieSlot(cbuf, childSlot)
+				cn, err := briefs.ReadTrieSlot(cbuf, childSlot)
 				if err != nil {
 					fs.errorf("ino %d dir trie: child ref %d: %v", parentIno, child, err)
 					break
@@ -341,14 +253,14 @@ func collectDirectoryEntries(fs *fsckState, parentIno uint64, rootRef uint64, bl
 		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
 			return nil, fmt.Errorf("read page %d: %w", block, err)
 		}
-		if _, _, _, err := readTriePage(buf); err != nil {
+		if _, err := briefs.ReadTriePage(buf); err != nil {
 			return nil, fmt.Errorf("page %d: %w", block, err)
 		}
-		if slot >= trieSlotCount {
+		if slot >= briefs.TrieSlotsPerBlock {
 			return nil, fmt.Errorf("slot %d out of range", slot)
 		}
 
-		node, err := parseTrieSlot(buf, slot)
+		node, err := briefs.ReadTrieSlot(buf, slot)
 		if err != nil {
 			return nil, err
 		}
@@ -358,10 +270,10 @@ func collectDirectoryEntries(fs *fsckState, parentIno uint64, rootRef uint64, bl
 			continue
 		}
 
-		if trieIsLeaf(node.NodeType) {
+		if briefs.TrieIsLeaf(node.NodeType) {
 			if node.Flags&uint16(briefs.NodeFlagDeleted) == 0 {
-				name := extractTrieNodeName(buf, node)
-				if name != "" {
+				name, err := briefs.ReadTrieName(buf, node.NameLen, node.NameOffset)
+				if err == nil && name != "" {
 					entries = append(entries, trieEntry{
 						Inode:  node.Inode,
 						FType:  node.FType,
@@ -385,7 +297,7 @@ func collectDirectoryEntries(fs *fsckState, parentIno uint64, rootRef uint64, bl
 
 // pushChildren pushes a node's children onto the walk stack in reverse order so
 // that they are processed first-child-first. It returns the updated slices.
-func pushChildren(stack []uint64, leafEmitted []bool, file *os.File, node trieSlot, blockSize uint64) ([]uint64, []bool) {
+func pushChildren(stack []uint64, leafEmitted []bool, file *os.File, node *briefs.TrieSlot, blockSize uint64) ([]uint64, []bool) {
 	if node.FirstChild == 0 {
 		return stack, leafEmitted
 	}
@@ -397,7 +309,7 @@ func pushChildren(stack []uint64, leafEmitted []bool, file *os.File, node trieSl
 		if _, err := file.ReadAt(cbuf, int64(briefs.TrieRefBlock(child)*blockSize)); err != nil {
 			break
 		}
-		cn, err := parseTrieSlot(cbuf, briefs.TrieRefSlot(child))
+		cn, err := briefs.ReadTrieSlot(cbuf, briefs.TrieRefSlot(child))
 		if err != nil {
 			break
 		}
@@ -436,11 +348,11 @@ func collectDirectoryTrieBlocks(fs *fsckState, parentIno uint64, rootRef uint64,
 		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
 			return nil, fmt.Errorf("read page %d: %w", block, err)
 		}
-		if _, _, _, err := readTriePage(buf); err != nil {
+		if _, err := briefs.ReadTriePage(buf); err != nil {
 			return nil, fmt.Errorf("page %d: %w", block, err)
 		}
 
-		node, err := parseTrieSlot(buf, slot)
+		node, err := briefs.ReadTrieSlot(buf, slot)
 		if err != nil {
 			return nil, err
 		}
@@ -454,7 +366,7 @@ func collectDirectoryTrieBlocks(fs *fsckState, parentIno uint64, rootRef uint64,
 			if _, err := fs.file.ReadAt(cbuf, int64(briefs.TrieRefBlock(child)*blockSize)); err != nil {
 				break
 			}
-			cn, err := parseTrieSlot(cbuf, briefs.TrieRefSlot(child))
+			cn, err := briefs.ReadTrieSlot(cbuf, briefs.TrieRefSlot(child))
 			if err != nil {
 				break
 			}

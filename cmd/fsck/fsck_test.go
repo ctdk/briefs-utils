@@ -827,11 +827,11 @@ func TestFsckCompactTrieNameLenField(t *testing.T) {
 
 	found := false
 	for slot := uint(0); slot < briefs.TrieSlotsPerBlock; slot++ {
-		s, perr := parseTrieSlot(compacted, slot)
+		s, perr := briefs.ReadTrieSlot(compacted, slot)
 		if perr != nil || s.NameOffset == 0 {
 			continue
 		}
-		nm := extractTrieNodeName(compacted, s)
+		nm, _ := briefs.ReadTrieName(compacted, s.NameLen, s.NameOffset)
 		if nm == "" {
 			continue
 		}

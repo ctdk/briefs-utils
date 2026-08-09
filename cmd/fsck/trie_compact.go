@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
 	"sort"
@@ -11,17 +10,17 @@ import (
 
 // compactTrieNode is an in-memory node used while rebuilding a directory trie.
 type compactTrieNode struct {
-	Depth     uint8
-	ByteVal   uint8
-	NodeType  uint8
-	FType     uint8
-	Inode     uint64
-	Name      string
-	NameOff   uint16
-	Parent    *compactTrieNode
-	Children  []*compactTrieNode
-	Block     uint64
-	Slot      uint
+	Depth    uint8
+	ByteVal  uint8
+	NodeType uint8
+	FType    uint8
+	Inode    uint64
+	Name     string
+	NameOff  uint16
+	Parent   *compactTrieNode
+	Children []*compactTrieNode
+	Block    uint64
+	Slot     uint
 }
 
 // compactTriePage is a freshly packed trie page under construction.
@@ -146,10 +145,10 @@ func packCompactTrie(root *compactTrieNode, blockSize uint64, allocBlock func() 
 		needed := nameLen + 2
 
 		for _, p := range pages {
-			if p.NextSlot >= trieSlotCount {
+			if p.NextSlot >= briefs.TrieSlotsPerBlock {
 				continue
 			}
-			slotEnd := uint16(triePageHeaderSize + (p.NextSlot+1)*trieSlotSize)
+			slotEnd := uint16(briefs.TriePageHeaderSize + (p.NextSlot+1)*briefs.TrieSlotSize)
 			// The slot must not overlap with existing names at the page end.
 			if slotEnd > uint16(blockSize)-p.NameOff {
 				continue
@@ -179,7 +178,7 @@ func packCompactTrie(root *compactTrieNode, blockSize uint64, allocBlock func() 
 			Block:    block,
 			NextSlot: 0,
 		}
-		slotEnd := uint16(triePageHeaderSize + trieSlotSize)
+		slotEnd := uint16(briefs.TriePageHeaderSize + briefs.TrieSlotSize)
 		// The slot must fit and, for leaves, the name must fit too.
 		if slotEnd > uint16(blockSize)-p.NameOff {
 			return fmt.Errorf("trie slot does not fit in a fresh page")
@@ -232,23 +231,28 @@ func packCompactTrie(root *compactTrieNode, blockSize uint64, allocBlock func() 
 	return pages, nil
 }
 
-// writeCompactTriePages serializes freshly packed trie pages to disk.
+// writeCompactTriePages serializes freshly packed trie pages to disk via the
+// shared briefs trie codec (page header + slots + name heap).
 func writeCompactTriePages(file *os.File, pages []*compactTriePage, blockSize uint64) error {
 	for _, p := range pages {
 		buf := make([]byte, blockSize)
-		binary.LittleEndian.PutUint32(buf[0:], briefs.MagicTriePage)
-		binary.LittleEndian.PutUint32(buf[4:], briefs.TriePageVersion)
-		binary.LittleEndian.PutUint16(buf[8:], uint16(p.SlotsUsed))
-		binary.LittleEndian.PutUint16(buf[10:], p.NameOff)
+
 		freeSlots := ^uint64(0)
 		for i := uint(0); i < p.SlotsUsed; i++ {
 			freeSlots &^= 1 << i
 		}
-		binary.LittleEndian.PutUint64(buf[12:], freeSlots)
+		pg := &briefs.TriePage{
+			Magic:       briefs.MagicTriePage,
+			Version:     briefs.TriePageVersion,
+			LiveCount:   uint16(p.SlotsUsed),
+			FreeNameOff: p.NameOff,
+			FreeSlots:   freeSlots,
+		}
+		if err := briefs.WriteTriePage(buf, pg); err != nil {
+			return fmt.Errorf("write trie page header: %w", err)
+		}
 
 		for _, node := range p.Nodes {
-			off := uint64(triePageHeaderSize + node.Slot*trieSlotSize)
-
 			var firstChild uint64
 			if len(node.Children) > 0 {
 				c := node.Children[0]
@@ -266,37 +270,29 @@ func writeCompactTriePages(file *os.File, pages []*compactTriePage, blockSize ui
 				}
 			}
 
-			binary.LittleEndian.PutUint64(buf[off+0:], firstChild)
-			binary.LittleEndian.PutUint64(buf[off+8:], nextSibling)
-			binary.LittleEndian.PutUint64(buf[off+16:], node.Inode)
-			// name_len stores the FULL name-entry size (2-byte length prefix +
-			// name bytes), not just the name byte count. The kernel's reader
-			// derives the actual name length as name_len - 2 (briefs.h:609,
-			// briefs_trie.c: "elen = trie_node_name_len(node) - 2"), so writing
-			// only len(name) made the kernel read len(name)-2 bytes and truncate
-			// every directory entry ("big" -> "b"). Nameless (intermediate) nodes
-			// keep name_len = 0, matching the kernel's "0 if free/no name" rule.
-			var nameLenField uint16
-			if len(node.Name) > 0 {
-				nameLenField = uint16(len(node.Name)) + 2
+			// WriteTrieName writes the 2-byte length prefix + name into the name
+			// heap and returns the on-disk name_len (len(name)+2, or 0 for a
+			// nameless intermediate node). The kernel reader derives the actual
+			// name length as name_len - 2, so the +2 is load-bearing.
+			nameLen, err := briefs.WriteTrieName(buf, node.NameOff, node.Name)
+			if err != nil {
+				return fmt.Errorf("write trie name: %w", err)
 			}
-			binary.LittleEndian.PutUint16(buf[off+24:], nameLenField)
-			binary.LittleEndian.PutUint16(buf[off+26:], node.NameOff)
-			buf[off+28] = node.Depth
-			buf[off+29] = node.NodeType
-			buf[off+30] = node.ByteVal
-			buf[off+31] = node.FType
-			binary.LittleEndian.PutUint16(buf[off+32:], 0) // flags
-			binary.LittleEndian.PutUint16(buf[off+34:], uint16(len(node.Children)))
-		}
-
-		for _, node := range p.Nodes {
-			if node.NameOff == 0 {
-				continue
+			slot := briefs.TrieSlot{
+				FirstChild:  firstChild,
+				NextSibling: nextSibling,
+				Inode:       node.Inode,
+				NameLen:     nameLen,
+				NameOffset:  node.NameOff,
+				Depth:       node.Depth,
+				NodeType:    node.NodeType,
+				ByteVal:     node.ByteVal,
+				FType:       node.FType,
+				ChildCount:  uint16(len(node.Children)),
 			}
-			nameStart := uint64(blockSize) - uint64(node.NameOff)
-			binary.LittleEndian.PutUint16(buf[nameStart:], uint16(len(node.Name)))
-			copy(buf[nameStart+2:], node.Name)
+			if err := briefs.WriteTrieSlot(buf, node.Slot, &slot); err != nil {
+				return fmt.Errorf("write trie slot: %w", err)
+			}
 		}
 
 		if _, err := file.WriteAt(buf, int64(p.Block*blockSize)); err != nil {
