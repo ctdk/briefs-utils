@@ -1,4 +1,27 @@
-// Package briefs defines the BrieFS on-disk format.
+// Package briefs defines the BrieFS on-disk format shared by mkfs, fsck, and
+// the FUSE bridge, and kept byte-for-byte compatible with the kernel module.
+//
+// On-disk struct convention. Every fixed-layout struct that is persisted to
+// disk lives in this package and carries a gendisk marker of the form
+//
+//	//go:briefs-disk size=N
+//
+// or, for structs whose C layout is packed (unaligned fields, where Go's
+// struct alignment cannot represent the on-disk size), the packed variant
+//
+//	//go:briefs-disk packed size=N
+//
+// The codegen tool (cmd/gendisk, run via `//go:generate` in generate.go and
+// the Makefile `generate` target) emits little-endian MarshalBinary /
+// UnmarshalBinary / Size methods plus a compile-time size assertion
+// (unsafe.Sizeof == N for plain structs; a declared Size() and a gen-time
+// field-width sum check for packed structs). The assertion turns any future
+// layout drift into a build or generation failure, so the on-disk layer is
+// guarded automatically. Where the C struct has implicit alignment padding,
+// the Go struct carries an explicit _Pad/Reserved field so the sequential
+// marshal writes the correct bytes. mkfs/fsck/fuse consume the generated
+// methods (often through thin adapter functions); no package keeps its own
+// hand-rolled copy of a persisted struct's layout.
 package briefs
 
 import (

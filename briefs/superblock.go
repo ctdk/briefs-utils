@@ -40,22 +40,24 @@ type SuperblockLayout struct {
 	// the C header (/* 176 */) are incorrect.
 	// No _Padding field needed.
 
-	// Block 0: metadata pointers
-	EATOffset   uint64  // offset 168
-	EATBlocks      uint64  // offset 184
-	TrieRootBlock  uint64  // offset 192
-	TrieBlocksUsed uint64  // offset 200
-	TrieNodePoolStart uint64  // offset 208
-	TrieNodePoolSize  uint64  // offset 216
-	InodeBMOffset  uint64  // offset 224
-	InodeBMBlocks  uint64  // offset 232
-	InodeTableOffset uint64  // offset 232 (replaces data_bitmap_offset + data_bitmap_blocks)
-	JournalOffset  uint64  // offset 240
-	JournalBlocks  uint64  // offset 248
-	CheckpointSeq  uint64
-	JournalLogStart uint64
-	JournalLogEnd  uint64
-	ReservedJournal [4]uint64
+	// Block 0: metadata pointers. Offsets are authoritative per the generated
+	// MarshalBinary in gen_disk.go (the sequential marshal pins the on-disk
+	// byte order; the size assertion pins the total to 1024).
+	EATOffset         uint64 // offset 168
+	EATBlocks         uint64 // offset 176
+	TrieRootBlock     uint64 // offset 184
+	TrieBlocksUsed    uint64 // offset 192
+	TrieNodePoolStart uint64 // offset 200
+	TrieNodePoolSize  uint64 // offset 208
+	InodeBMOffset     uint64 // offset 216
+	InodeBMBlocks     uint64 // offset 224
+	InodeTableOffset  uint64 // offset 232
+	JournalOffset     uint64 // offset 240
+	JournalBlocks     uint64 // offset 248
+	CheckpointSeq     uint64 // offset 256
+	JournalLogStart   uint64 // offset 264
+	JournalLogEnd     uint64 // offset 272
+	ReservedJournal   [4]uint64
 
 	// utf8, null padded
 	Label [BrieFSVolLabelLen]byte

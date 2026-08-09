@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"math/bits"
 	"os"
 
 	"github.com/ctdk/briefs-utils/briefs"
@@ -159,7 +160,7 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize, sbExpectedFree u
 	// Compute actual free count from L2 bitmap
 	computedFree := uint64(0)
 	for i := uint64(0); i < l2w; i++ {
-		computedFree += uint64(popcount64(l2[i]))
+		computedFree += uint64(bits.OnesCount64(l2[i]))
 	}
 
 	if computedFree != headerFree {
@@ -172,15 +173,6 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize, sbExpectedFree u
 
 	fmt.Fprintf(os.Stderr, "  %s bitmap pyramid: consistent (%d L0, %d L1, %d L2 words, %d free)\n",
 		label, l0w, l1w, l2w, computedFree)
-}
-
-// popcount64 returns the number of set bits in a 64-bit word.
-func popcount64(x uint64) int {
-	// simple parallel popcount
-	x = x - ((x >> 1) & 0x5555555555555555)
-	x = (x & 0x3333333333333333) + ((x >> 2) & 0x3333333333333333)
-	x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0F
-	return int((x * 0x0101010101010101) >> 56)
 }
 
 // readAllocatorL2 reads the L2 bitmap words from an allocator pool.

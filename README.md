@@ -128,6 +128,19 @@ GLOBAL OPTIONS:
    --version, -v                 print the version
 ```
 
+On-disk format codegen
+---------------------
+
+Every persisted struct lives in the `briefs/` package with a gendisk marker
+(`//go:briefs-disk size=N`, or `//go:briefs-disk packed size=N` for structs
+whose C layout is packed/unaligned). The `cmd/gendisk` tool — run via
+`//go:generate` and the Makefile `generate` target, which is a build
+prerequisite for `mkfs`/`fsck`/`fuse` — emits little-endian
+`MarshalBinary`/`UnmarshalBinary`/`Size` methods plus a compile-time size
+assertion that pins each struct to its kernel `BUILD_BUG_ON` size. Any layout
+drift becomes a build or generation failure, so the on-disk layer is guarded
+automatically and no package keeps a hand-rolled copy of a persisted layout.
+
 RELATED
 -------
 
