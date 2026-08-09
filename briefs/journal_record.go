@@ -163,28 +163,47 @@ func (r *JrnTrieAlloc) Marshal() []byte {
 
 // JrnDirUpdate mirrors struct jrn_dir_update (280 bytes). Op is 0 for add,
 // 1 for delete. FType is the d_type form (S_IFMT >> 12): 4=dir, 8=reg,
-// 10=lnk, etc.
+// 10=lnk, etc. The name lives in the fixed 255-byte Name field; the live
+// byte count is NameLen (<= 255). The kernel layout is parent_ino@0,
+// child_ino@8, name_len@16, name[255]@20, op@275, ftype@276, reserved[1]@277,
+// then 2 bytes trailing alignment padding to 280; the explicit Reserved and
+// _Pad fields reproduce that so the generated marshal matches the on-disk
+// layout exactly.
+//
+//go:briefs-disk size=280
 type JrnDirUpdate struct {
 	ParentIno uint64
 	ChildIno  uint64
-	Name      string // <= 255 bytes
-	Op        uint8  // 0 = add, 1 = delete
+	NameLen   uint32
+	Name      [255]byte
+	Op        uint8 // 0 = add, 1 = delete
 	FType     uint8
+	Reserved  [1]byte
+	_Pad      [2]byte
+}
+
+// NewJrnDirUpdate builds a JRN_DIR_UPDATE record from a directory-entry name.
+// NameLen is set to the name length (clamped to 255) and the name bytes are
+// copied into the fixed Name field. Use this instead of a struct literal so
+// NameLen and Name stay in sync.
+func NewJrnDirUpdate(parent, child uint64, name string, op, ftype uint8) *JrnDirUpdate {
+	nl := len(name)
+	if nl > 255 {
+		nl = 255
+	}
+	r := &JrnDirUpdate{
+		ParentIno: parent,
+		ChildIno:  child,
+		NameLen:   uint32(nl),
+		Op:        op,
+		FType:     ftype,
+	}
+	copy(r.Name[:], name[:nl])
+	return r
 }
 
 func (r *JrnDirUpdate) Marshal() []byte {
-	b := make([]byte, JrnDirUpdateSize)
-	binary.LittleEndian.PutUint64(b[0:], r.ParentIno)
-	binary.LittleEndian.PutUint64(b[8:], r.ChildIno)
-	binary.LittleEndian.PutUint32(b[16:], uint32(len(r.Name)))
-	if len(r.Name) > 255 {
-		copy(b[20:275], r.Name[:255])
-	} else {
-		copy(b[20:], r.Name)
-	}
-	b[275] = r.Op
-	b[276] = r.FType
-	// reserved(1) at 277, pad(2) at 278 stay zero
+	b, _ := r.MarshalBinary()
 	return b
 }
 
@@ -207,8 +226,24 @@ func MarshalJrnInodeFull(ino uint64, rawInode []byte) []byte {
 	return b
 }
 
+// JrnSymlinkPrefix is the 20-byte fixed prefix of struct jrn_symlink_data
+// (ino, phys, target_len). The target bytes follow as a variable-length tail
+// and are appended by JrnSymlinkData.Marshal. The prefix is packed: the
+// on-disk size is 20 but Go would align a struct ending in uint32 to 24, so
+// the packed marker pins Size() to the declared 20 and the gen-time field-
+// width sum (8+8+4=20) is verified.
+//
+//go:briefs-disk packed size=20
+type JrnSymlinkPrefix struct {
+	Ino       uint64
+	Phys      uint64
+	TargetLen uint32
+}
+
 // JrnSymlinkData mirrors struct jrn_symlink_data: a 20-byte prefix
 // (ino, phys, target_len) followed by the target bytes (no trailing NUL).
+// The runtime struct keeps the Target slice for convenience; Marshal
+// serializes the codegen'd prefix then appends the raw target tail.
 type JrnSymlinkData struct {
 	Ino       uint64
 	Phys      uint64
@@ -217,16 +252,31 @@ type JrnSymlinkData struct {
 }
 
 func (r *JrnSymlinkData) Marshal() []byte {
-	b := make([]byte, JrnSymlinkDataPrefix+len(r.Target))
-	binary.LittleEndian.PutUint64(b[0:], r.Ino)
-	binary.LittleEndian.PutUint64(b[8:], r.Phys)
-	binary.LittleEndian.PutUint32(b[16:], uint32(len(r.Target)))
-	copy(b[20:], r.Target)
+	p := &JrnSymlinkPrefix{
+		Ino:       r.Ino,
+		Phys:      r.Phys,
+		TargetLen: uint32(len(r.Target)),
+	}
+	b, _ := p.MarshalBinary()
+	b = append(b, r.Target...)
 	return b
+}
+
+// JrnXattrPrefix is the 20-byte fixed prefix of struct jrn_xattr_data
+// (ino, phys_block, used_size). The block content follows as a variable-
+// length tail. Packed for the same reason as JrnSymlinkPrefix.
+//
+//go:briefs-disk packed size=20
+type JrnXattrPrefix struct {
+	Ino      uint64
+	PhysBlk  uint64
+	UsedSize uint32
 }
 
 // JrnXattrData mirrors struct jrn_xattr_data: a 20-byte prefix
 // (ino, phys_block, used_size) followed by used_size bytes of block content.
+// The runtime struct keeps the Data slice for convenience; Marshal serializes
+// the codegen'd prefix then appends the raw content tail.
 type JrnXattrData struct {
 	Ino      uint64
 	PhysBlk  uint64
@@ -235,11 +285,13 @@ type JrnXattrData struct {
 }
 
 func (r *JrnXattrData) Marshal() []byte {
-	b := make([]byte, JrnXattrDataPrefix+len(r.Data))
-	binary.LittleEndian.PutUint64(b[0:], r.Ino)
-	binary.LittleEndian.PutUint64(b[8:], r.PhysBlk)
-	binary.LittleEndian.PutUint32(b[16:], r.UsedSize)
-	copy(b[20:], r.Data)
+	p := &JrnXattrPrefix{
+		Ino:      r.Ino,
+		PhysBlk:  r.PhysBlk,
+		UsedSize: r.UsedSize,
+	}
+	b, _ := p.MarshalBinary()
+	b = append(b, r.Data...)
 	return b
 }
 // --- Unmarshal helpers (journal replay) ---
@@ -304,20 +356,14 @@ func UnmarshalTrieAlloc(b []byte) *JrnTrieAlloc {
 
 // UnmarshalDirUpdate parses a 280-byte JRN_DIR_UPDATE payload.
 func UnmarshalDirUpdate(b []byte) *JrnDirUpdate {
-	if len(b) < JrnDirUpdateSize {
+	r := &JrnDirUpdate{}
+	if err := r.UnmarshalBinary(b); err != nil {
 		return nil
 	}
-	nameLen := binary.LittleEndian.Uint32(b[16:])
-	if nameLen > 255 {
-		nameLen = 255
+	if r.NameLen > 255 {
+		r.NameLen = 255
 	}
-	return &JrnDirUpdate{
-		ParentIno: binary.LittleEndian.Uint64(b[0:]),
-		ChildIno:  binary.LittleEndian.Uint64(b[8:]),
-		Name:      string(b[20 : 20+nameLen]),
-		Op:        b[275],
-		FType:     b[276],
-	}
+	return r
 }
 
 // UnmarshalInodeFullIno returns the inode number from a JRN_INODE_FULL payload.
@@ -345,13 +391,17 @@ func UnmarshalSymlinkData(b []byte) *JrnSymlinkData {
 	if len(b) < JrnSymlinkDataPrefix {
 		return nil
 	}
-	tlen := binary.LittleEndian.Uint32(b[16:])
+	var p JrnSymlinkPrefix
+	if err := p.UnmarshalBinary(b); err != nil {
+		return nil
+	}
+	tlen := p.TargetLen
 	if uint32(len(b)) < JrnSymlinkDataPrefix+tlen {
 		return nil
 	}
 	return &JrnSymlinkData{
-		Ino:       binary.LittleEndian.Uint64(b[0:]),
-		Phys:      binary.LittleEndian.Uint64(b[8:]),
+		Ino:       p.Ino,
+		Phys:      p.Phys,
 		TargetLen: tlen,
 		Target:    b[JrnSymlinkDataPrefix : JrnSymlinkDataPrefix+tlen],
 	}
@@ -363,13 +413,17 @@ func UnmarshalXattrData(b []byte) *JrnXattrData {
 	if len(b) < JrnXattrDataPrefix {
 		return nil
 	}
-	used := binary.LittleEndian.Uint32(b[16:])
+	var p JrnXattrPrefix
+	if err := p.UnmarshalBinary(b); err != nil {
+		return nil
+	}
+	used := p.UsedSize
 	if uint32(len(b)) < JrnXattrDataPrefix+used {
 		return nil
 	}
 	return &JrnXattrData{
-		Ino:      binary.LittleEndian.Uint64(b[0:]),
-		PhysBlk:  binary.LittleEndian.Uint64(b[8:]),
+		Ino:      p.Ino,
+		PhysBlk:  p.PhysBlk,
 		UsedSize: used,
 		Data:     b[JrnXattrDataPrefix : JrnXattrDataPrefix+used],
 	}

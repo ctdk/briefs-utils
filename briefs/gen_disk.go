@@ -286,6 +286,44 @@ func (s *JournalBlockHeader) UnmarshalBinary(data []byte) error {
 // Compile-time size assertion for JournalBlockHeader.
 var _ = [1]struct{}{}[unsafe.Sizeof(JournalBlockHeader{}) - 16]
 
+// Size returns the on-disk size of JrnDirUpdate.
+func (s *JrnDirUpdate) Size() int { return int(unsafe.Sizeof(JrnDirUpdate{})) }
+
+// MarshalBinary serializes JrnDirUpdate to its little-endian on-disk representation.
+func (s *JrnDirUpdate) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint64(data[pos:], s.ParentIno); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.ChildIno); pos += 8
+	binary.LittleEndian.PutUint32(data[pos:], s.NameLen); pos += 4
+	copy(data[pos:], s.Name[:]); pos += 255
+	data[pos] = s.Op; pos += 1
+	data[pos] = s.FType; pos += 1
+	copy(data[pos:], s.Reserved[:]); pos += 1
+	copy(data[pos:], s._Pad[:]); pos += 2
+	return data, nil
+}
+
+// UnmarshalBinary deserializes JrnDirUpdate from its little-endian on-disk representation.
+func (s *JrnDirUpdate) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("JrnDirUpdate data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.ParentIno = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.ChildIno = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.NameLen = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	copy(s.Name[:], data[pos:pos+255]); pos += 255
+	s.Op = data[pos]; pos += 1
+	s.FType = data[pos]; pos += 1
+	copy(s.Reserved[:], data[pos:pos+1]); pos += 1
+	copy(s._Pad[:], data[pos:pos+2]); pos += 2
+	return nil
+}
+
+// Compile-time size assertion for JrnDirUpdate.
+var _ = [1]struct{}{}[unsafe.Sizeof(JrnDirUpdate{}) - 280]
+
 // Size returns the on-disk size of JrnExtentAlloc.
 func (s *JrnExtentAlloc) Size() int { return int(unsafe.Sizeof(JrnExtentAlloc{})) }
 
@@ -502,6 +540,36 @@ func (s *JrnInodeUpdate) UnmarshalBinary(data []byte) error {
 // Compile-time size assertion for JrnInodeUpdate.
 var _ = [1]struct{}{}[unsafe.Sizeof(JrnInodeUpdate{}) - 88]
 
+// Size returns the on-disk size of JrnSymlinkPrefix. Packed structs have
+// unaligned on-disk fields that Go's struct alignment cannot represent, so
+// this is the declared size, not unsafe.Sizeof (the field-width sum is
+// verified at generation time).
+func (s *JrnSymlinkPrefix) Size() int { return 20 }
+
+// MarshalBinary serializes JrnSymlinkPrefix to its little-endian on-disk representation.
+func (s *JrnSymlinkPrefix) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint64(data[pos:], s.Ino); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.Phys); pos += 8
+	binary.LittleEndian.PutUint32(data[pos:], s.TargetLen); pos += 4
+	return data, nil
+}
+
+// UnmarshalBinary deserializes JrnSymlinkPrefix from its little-endian on-disk representation.
+func (s *JrnSymlinkPrefix) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("JrnSymlinkPrefix data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Ino = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.Phys = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.TargetLen = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	return nil
+}
+
+// Packed layout: 20 bytes (field-width sum verified at generation time).
+
 // Size returns the on-disk size of JrnTrieAlloc.
 func (s *JrnTrieAlloc) Size() int { return int(unsafe.Sizeof(JrnTrieAlloc{})) }
 
@@ -529,6 +597,36 @@ func (s *JrnTrieAlloc) UnmarshalBinary(data []byte) error {
 
 // Compile-time size assertion for JrnTrieAlloc.
 var _ = [1]struct{}{}[unsafe.Sizeof(JrnTrieAlloc{}) - 16]
+
+// Size returns the on-disk size of JrnXattrPrefix. Packed structs have
+// unaligned on-disk fields that Go's struct alignment cannot represent, so
+// this is the declared size, not unsafe.Sizeof (the field-width sum is
+// verified at generation time).
+func (s *JrnXattrPrefix) Size() int { return 20 }
+
+// MarshalBinary serializes JrnXattrPrefix to its little-endian on-disk representation.
+func (s *JrnXattrPrefix) MarshalBinary() ([]byte, error) {
+	data := make([]byte, s.Size())
+	pos := 0
+	binary.LittleEndian.PutUint64(data[pos:], s.Ino); pos += 8
+	binary.LittleEndian.PutUint64(data[pos:], s.PhysBlk); pos += 8
+	binary.LittleEndian.PutUint32(data[pos:], s.UsedSize); pos += 4
+	return data, nil
+}
+
+// UnmarshalBinary deserializes JrnXattrPrefix from its little-endian on-disk representation.
+func (s *JrnXattrPrefix) UnmarshalBinary(data []byte) error {
+	if len(data) < s.Size() {
+		return fmt.Errorf("JrnXattrPrefix data too short: %d < %d", len(data), s.Size())
+	}
+	pos := 0
+	s.Ino = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.PhysBlk = binary.LittleEndian.Uint64(data[pos:]); pos += 8
+	s.UsedSize = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	return nil
+}
+
+// Packed layout: 20 bytes (field-width sum verified at generation time).
 
 // Size returns the on-disk size of RecordHeader.
 func (s *RecordHeader) Size() int { return int(unsafe.Sizeof(RecordHeader{})) }

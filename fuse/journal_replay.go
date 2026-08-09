@@ -361,16 +361,18 @@ func (b *BrieFS) replayDirUpdate(rec *briefs.JrnDirUpdate) error {
 	}
 
 	if rec.Op == 0 {
-		rlog("  dir-add parent=%d name=%q child=%d ftype=%d rootBefore=%d", rec.ParentIno, rec.Name, rec.ChildIno, rec.FType, di.DirTrieRoot)
-		if err := b.TrieInsert(di, rec.Name, rec.ChildIno, rec.FType); err != nil {
+		name := string(rec.Name[:rec.NameLen])
+		rlog("  dir-add parent=%d name=%q child=%d ftype=%d rootBefore=%d", rec.ParentIno, name, rec.ChildIno, rec.FType, di.DirTrieRoot)
+		if err := b.TrieInsert(di, name, rec.ChildIno, rec.FType); err != nil {
 			if err != syscall.EEXIST {
 				return err
 			}
 		}
 		rlog("    -> rootAfter=%d", di.DirTrieRoot)
 	} else {
-		rlog("  dir-del parent=%d name=%q rootBefore=%d", rec.ParentIno, rec.Name, di.DirTrieRoot)
-		if err := b.TrieRemove(di, rec.Name); err != nil {
+		name := string(rec.Name[:rec.NameLen])
+		rlog("  dir-del parent=%d name=%q rootBefore=%d", rec.ParentIno, name, di.DirTrieRoot)
+		if err := b.TrieRemove(di, name); err != nil {
 			if err != syscall.ENOENT {
 				return err
 			}

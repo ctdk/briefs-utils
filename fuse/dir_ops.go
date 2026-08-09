@@ -91,13 +91,7 @@ func (b *BrieFS) journalInodeUpdate(in *briefs.Inode) error {
 // journalDirUpdate writes a JRN_DIR_UPDATE record. op is 0 for add, 1 for
 // delete; ftype is the d_type (S_IFMT >> 12).  Mirrors briefs_journal_dir_update.
 func (b *BrieFS) journalDirUpdate(parentIno, childIno uint64, name string, op, ftype uint8) error {
-	rec := &briefs.JrnDirUpdate{
-		ParentIno: parentIno,
-		ChildIno:  childIno,
-		Name:      name,
-		Op:        op,
-		FType:     ftype,
-	}
+	rec := briefs.NewJrnDirUpdate(parentIno, childIno, name, op, ftype)
 	return b.journal.WriteRecord(briefs.JRN_DIR_UPDATE, rec.Marshal())
 }
 
