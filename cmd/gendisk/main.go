@@ -40,6 +40,12 @@ type typeInfo struct {
 	Fields []fieldInfo
 	// ExpectedSize, if non-zero, is the exact byte size asserted at compile time.
 	ExpectedSize int64
+	// Packed is true for structs marked "packed": their on-disk layout has
+	// unaligned fields (Go has no packed structs), so the generated Size()
+	// returns ExpectedSize directly instead of unsafe.Sizeof, and the size
+	// is verified at generation time by summing field widths rather than via
+	// the unsafe.Sizeof compile-time assertion.
+	Packed bool
 }
 
 // diskGen holds the generator state for a package.
@@ -84,6 +90,27 @@ func findSize(docs ...*ast.CommentGroup) int64 {
 		}
 	}
 	return 0
+}
+
+// findPacked reports whether any marker comment line contains the "packed"
+// token (alongside the //go:briefs-disk marker). Packed structs have on-disk
+// layouts with unaligned fields that Go's struct alignment cannot represent,
+// so their Size() is the declared size, not unsafe.Sizeof.
+func findPacked(docs ...*ast.CommentGroup) bool {
+	for _, doc := range docs {
+		if doc == nil {
+			continue
+		}
+		for _, line := range doc.List {
+			if !strings.Contains(line.Text, "go:briefs-disk") {
+				continue
+			}
+			if strings.Contains(line.Text, "packed") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func parsePackage(dir string) (*diskGen, []typeInfo, error) {
@@ -178,6 +205,7 @@ func parsePackage(dir string) (*diskGen, []typeInfo, error) {
 					Name:         ts.Name.Name,
 					Fields:       fields,
 					ExpectedSize: findSize(gd.Doc, ts.Doc),
+					Packed:       findPacked(gd.Doc, ts.Doc),
 				})
 			}
 		}
@@ -279,10 +307,26 @@ import (
 }
 
 func writeType(buf *bytes.Buffer, t typeInfo, gen *diskGen) error {
+	// Packed structs have no unsafe.Sizeof to lean on (Go has no packed
+	// attribute; unaligned fields sit at aligned Go offsets). Verify the
+	// field-width sum equals the declared size at generation time so a
+	// layout/size mismatch fails `go generate` instead of silently emitting
+	// a wrong codec.
+	if t.Packed && t.ExpectedSize != 0 {
+		sum, err := structWidth(t.Fields, gen)
+		if err != nil {
+			return fmt.Errorf("packed size check for %s: %w", t.Name, err)
+		}
+		if sum != t.ExpectedSize {
+			return fmt.Errorf("packed struct %s: field-width sum %d != declared size %d", t.Name, sum, t.ExpectedSize)
+		}
+	}
+
 	d := map[string]interface{}{
-		"Name":         t.Name,
-		"Fields":       t.Fields,
-		"ExpectedSize": t.ExpectedSize,
+		"Name":       t.Name,
+		"Fields":     t.Fields,
+		"SizeMethod": sizeMethodString(t),
+		"SizeAssert": sizeAssertString(t),
 	}
 
 	funcMap := template.FuncMap{
@@ -294,8 +338,82 @@ func writeType(buf *bytes.Buffer, t typeInfo, gen *diskGen) error {
 	return tmpl.Execute(buf, d)
 }
 
-const typeTmpl = `// Size returns the on-disk size of {{.Name}}.
-func (s *{{.Name}}) Size() int { return int(unsafe.Sizeof({{.Name}}{})) }
+// sizeMethodString renders the Size() method for a struct. Packed structs have
+// on-disk layouts with unaligned fields that Go's struct alignment cannot
+// represent, so unsafe.Sizeof would be wrong; their Size() returns the declared
+// size (verified at generation time by the field-width sum in writeType).
+// Everything else uses unsafe.Sizeof, which the compile-time assertion checks.
+func sizeMethodString(t typeInfo) string {
+	if t.Packed {
+		return fmt.Sprintf("// Size returns the on-disk size of %s. Packed structs have\n"+
+			"// unaligned on-disk fields that Go's struct alignment cannot represent, so\n"+
+			"// this is the declared size, not unsafe.Sizeof (the field-width sum is\n"+
+			"// verified at generation time).\n"+
+			"func (s *%s) Size() int { return %d }", t.Name, t.Name, t.ExpectedSize)
+	}
+	return fmt.Sprintf("// Size returns the on-disk size of %s.\n"+
+		"func (s *%s) Size() int { return int(unsafe.Sizeof(%s{})) }", t.Name, t.Name, t.Name)
+}
+
+// sizeAssertString renders the trailing size guardrail: a compile-time
+// unsafe.Sizeof assertion for naturally-aligned structs, a generation-time
+// field-width-sum note for packed structs, or a bare separator newline when no
+// size is declared. The leading and trailing newlines position the block as a
+// blank-line-separated trailer after the UnmarshalBinary close brace.
+func sizeAssertString(t typeInfo) string {
+	switch {
+	case t.ExpectedSize != 0 && !t.Packed:
+		return fmt.Sprintf("\n// Compile-time size assertion for %s.\n"+
+			"var _ = [1]struct{}{}[unsafe.Sizeof(%s{}) - %d]\n\n", t.Name, t.Name, t.ExpectedSize)
+	case t.ExpectedSize != 0 && t.Packed:
+		return fmt.Sprintf("\n// Packed layout: %d bytes (field-width sum verified at generation time).\n\n",
+			t.ExpectedSize)
+	default:
+		return "\n"
+	}
+}
+
+// structWidth sums the on-disk byte width of every field (skipping disk:"-"
+// fields). It mirrors the sequential pos increments the generated marshal
+// emits, so for a packed struct it equals the true on-disk size.
+func structWidth(fields []fieldInfo, gen *diskGen) (int64, error) {
+	var sum int64
+	for _, f := range fields {
+		w, err := fieldWidth(f, gen)
+		if err != nil {
+			return 0, err
+		}
+		sum += w
+	}
+	return sum, nil
+}
+
+// fieldWidth returns the on-disk byte width of a single field.
+func fieldWidth(f fieldInfo, gen *diskGen) (int64, error) {
+	if hasTag(f.Tag, "disk", "-") {
+		return 0, nil
+	}
+	if kind := scalarKind(f.Type); kind != "" {
+		return int64(scalarWidth(kind)), nil
+	}
+	if n, ok := byteArrayLen(f.Type, gen.consts); ok {
+		return n, nil
+	}
+	if elemKind, ok := scalarArrayElem(f.Type); ok {
+		arr := f.Type.(*ast.ArrayType)
+		n := evalConstExpr(arr.Len, gen.consts)
+		return n * int64(scalarWidth(elemKind)), nil
+	}
+	if elem, ok := structArrayElem(f.Type); ok {
+		// No current packed struct uses a struct-array field. If one is
+		// added, extend this to compute the element's own field-width sum.
+		_ = elem
+		return 0, fmt.Errorf("struct array field %s: packed sizing not implemented", f.Name)
+	}
+	return 0, fmt.Errorf("unsupported field type for %s", f.Name)
+}
+
+const typeTmpl = `{{.SizeMethod}}
 
 // MarshalBinary serializes {{.Name}} to its little-endian on-disk representation.
 func (s *{{.Name}}) MarshalBinary() ([]byte, error) {
@@ -314,11 +432,7 @@ func (s *{{.Name}}) UnmarshalBinary(data []byte) error {
 {{range .Fields}}	{{unmarshalField .}}
 {{end}}	return nil
 }
-
-{{if .ExpectedSize}}// Compile-time size assertion for {{.Name}}.
-var _ = [1]struct{}{}[unsafe.Sizeof({{.Name}}{}) - {{.ExpectedSize}}]
-{{end}}
-`
+{{.SizeAssert}}`
 
 func marshalField(f fieldInfo, gen *diskGen) (string, error) {
 	if hasTag(f.Tag, "disk", "-") {

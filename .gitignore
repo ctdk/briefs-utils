@@ -5,6 +5,7 @@
 /mkfs.briefs
 /fsck.briefs
 /fuse.briefs
+/gendisk
 *.exe
 .claude
 CLAUDE.md
