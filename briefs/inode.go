@@ -3,7 +3,6 @@ package briefs
 // inode structs and methods
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -60,26 +59,17 @@ func (in *Inode) SetInlineData(data [256]byte) {
 // InlineExtents parses and returns the 8 inline extents stored in the raw region.
 func (in *Inode) InlineExtents() [8]Extent {
 	var ext [8]Extent
-	pos := 0
 	for i := 0; i < 8; i++ {
-		ext[i].Offset = binary.LittleEndian.Uint64(in.inlineRegion[pos:]); pos += 8
-		ext[i].Phys = binary.LittleEndian.Uint64(in.inlineRegion[pos:]); pos += 8
-		ext[i].Len = binary.LittleEndian.Uint64(in.inlineRegion[pos:]); pos += 8
-		ext[i].Flags = binary.LittleEndian.Uint32(in.inlineRegion[pos:]); pos += 4
-		ext[i].Pad = binary.LittleEndian.Uint32(in.inlineRegion[pos:]); pos += 4
+		_ = ext[i].UnmarshalBinary(in.inlineRegion[i*32 : (i+1)*32])
 	}
 	return ext
 }
 
 // SetInlineExtents serializes the 8 inline extents into the raw region.
 func (in *Inode) SetInlineExtents(ext [8]Extent) {
-	pos := 0
 	for i := 0; i < 8; i++ {
-		binary.LittleEndian.PutUint64(in.inlineRegion[pos:], ext[i].Offset); pos += 8
-		binary.LittleEndian.PutUint64(in.inlineRegion[pos:], ext[i].Phys); pos += 8
-		binary.LittleEndian.PutUint64(in.inlineRegion[pos:], ext[i].Len); pos += 8
-		binary.LittleEndian.PutUint32(in.inlineRegion[pos:], ext[i].Flags); pos += 4
-		binary.LittleEndian.PutUint32(in.inlineRegion[pos:], ext[i].Pad); pos += 4
+		b, _ := ext[i].MarshalBinary()
+		copy(in.inlineRegion[i*32:], b)
 	}
 }
 
@@ -167,12 +157,9 @@ func (in *Inode) SetInlineExtent(index int, offset, phys, length, flags uint64) 
 	if index < 0 || index >= 8 {
 		return InlineExtentRangeErr
 	}
-	pos := index * 32
-	binary.LittleEndian.PutUint64(in.inlineRegion[pos:], offset); pos += 8
-	binary.LittleEndian.PutUint64(in.inlineRegion[pos:], phys); pos += 8
-	binary.LittleEndian.PutUint64(in.inlineRegion[pos:], length); pos += 8
-	binary.LittleEndian.PutUint32(in.inlineRegion[pos:], uint32(flags)); pos += 4
-	binary.LittleEndian.PutUint32(in.inlineRegion[pos:], 0)
+	e := Extent{Offset: offset, Phys: phys, Len: length, Flags: uint32(flags)}
+	b, _ := e.MarshalBinary()
+	copy(in.inlineRegion[index*32:], b)
 	// Update inline extent count if this is the last one
 	if index+1 > int(in.NumExtentsInline) {
 		in.NumExtentsInline = uint32(index + 1)

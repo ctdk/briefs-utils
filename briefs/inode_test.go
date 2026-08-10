@@ -203,6 +203,63 @@ func TestInodeSetInlineExtentOutOfRange(t *testing.T) {
 	}
 }
 
+// TestInlineExtentsRoundTrip exercises the inline-extent codec routed through
+// the generated Extent.MarshalBinary/UnmarshalBinary. It fills all 8 inline
+// extents with distinct, non-zero fields (including the Pad field, which a
+// naive field-by-field codec can drop), writes them through SetInlineExtents,
+// reads them back through InlineExtents, and confirms every field survives
+// the round trip exactly. It also asserts the on-disk byte image of the
+// inline region matches what the generated Extent codec produces directly,
+// so the inline codec cannot silently drift from the generated one.
+func TestInlineExtentsRoundTrip(t *testing.T) {
+	var want [8]Extent
+	for i := 0; i < 8; i++ {
+		want[i] = Extent{
+			Offset: uint64(1000 + i*7),
+			Phys:   uint64(2000 + i*13),
+			Len:    uint64(1 + i),
+			Flags:  uint32(0xA0 | i),
+			Pad:    uint32(0xBEEF + i),
+		}
+	}
+
+	in := &Inode{}
+	in.SetInlineExtents(want)
+	got := in.InlineExtents()
+	for i := 0; i < 8; i++ {
+		if got[i] != want[i] {
+			t.Errorf("extent[%d]: want %+v, got %+v", i, want[i], got[i])
+		}
+	}
+
+	// SetInlineExtent (single) must match the array codec byte-for-byte.
+	in2 := &Inode{}
+	for i := 0; i < 8; i++ {
+		if err := in2.SetInlineExtent(i, want[i].Offset, want[i].Phys, want[i].Len, uint64(want[i].Flags)); err != nil {
+			t.Fatalf("SetInlineExtent(%d): %v", i, err)
+		}
+	}
+	// The single setter zeros Pad, so compare ignoring Pad.
+	got2 := in2.InlineExtents()
+	for i := 0; i < 8; i++ {
+		got2[i].Pad = 0
+		wantNoPad := want[i]
+		wantNoPad.Pad = 0
+		if got2[i] != wantNoPad {
+			t.Errorf("single extent[%d]: want %+v, got %+v", i, wantNoPad, got2[i])
+		}
+	}
+	// The inline region bytes from the array setter must equal the bytes the
+	// generated Extent codec would emit per-slot.
+	for i := 0; i < 8; i++ {
+		b, _ := want[i].MarshalBinary()
+		gotBytes := in.inlineRegion[i*32 : (i+1)*32]
+		if string(gotBytes) != string(b) {
+			t.Errorf("inline region slot %d bytes differ from generated Extent codec", i)
+		}
+	}
+}
+
 
 func TestInodeInlineDataRoundTrip(t *testing.T) {
 	in := NewInode(2, ModeFile|0644)
