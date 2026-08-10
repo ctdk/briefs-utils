@@ -163,6 +163,19 @@ func (sb *Superblock) MarshalBinary() []byte {
 	return data
 }
 
+// InodeLocation computes the inode-table block and the byte offset within
+// that block for the given 1-based inode number, from the superblock's
+// inode-table offset, block size, and inode size. It is the single source
+// of the inode-table indexing formula shared by mkfs, fsck, and the FUSE
+// bridge, mirroring the kernel's briefs_iget inode-table lookup.
+func InodeLocation(sb *SuperblockLayout, ino uint64) (block, off uint64) {
+	inodesPerBlock := sb.BlockSize / sb.InodeSize
+	idx := ino - 1
+	block = sb.InodeTableOffset + idx/inodesPerBlock
+	off = (idx % inodesPerBlock) * sb.InodeSize
+	return
+}
+
 // ReadSuperblock reads and parses the superblock from an io.ReaderAt.
 func ReadSuperblock(r io.ReaderAt, blockSize uint64) (*SuperblockLayout, error) {
 	buf := make([]byte, blockSize)

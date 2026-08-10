@@ -254,10 +254,8 @@ func collectInodeExtents(fs *fsckState, ino uint64, in *briefs.Inode, blockSize 
 // writeModifiedInodes writes any inodes staged in the repair plan back to
 // their fixed slots in the inode table.
 func writeModifiedInodes(file *os.File, sb *briefs.SuperblockLayout, plan *repairPlan, blockSize uint64) error {
-	inodesPerBlock := blockSize / sb.InodeSize
 	for ino, in := range plan.inodes {
-		blockOffset := sb.InodeTableOffset + (ino-1)/inodesPerBlock
-		byteOffset := ((ino - 1) % inodesPerBlock) * sb.InodeSize
+		blockOffset, byteOffset := briefs.InodeLocation(sb, ino)
 		off := int64(blockOffset*blockSize + byteOffset)
 		if err := in.WriteAt(file, off); err != nil {
 			return fmt.Errorf("write inode %d at offset %d: %w", ino, off, err)

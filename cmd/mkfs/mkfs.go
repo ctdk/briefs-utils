@@ -36,12 +36,7 @@ func stderrIsTerminal() bool {
 // The inode table starts at: inode_table_offset
 // (This matches what the kernel computes in briefs_iget.)
 func calculateInodeLocation(sb *briefs.Superblock, inodeNum uint64) (blockOffset uint64, byteOffset uint64) {
-	inodesPerBlock := sb.Lay.BlockSize / sb.Lay.InodeSize // 4096 / 512 = 8
-	inodeTableStartBlock := sb.Lay.InodeTableOffset
-	inodeIndex := inodeNum - 1
-	blockOffset = inodeTableStartBlock + (inodeIndex / inodesPerBlock)
-	byteOffset = (inodeIndex % inodesPerBlock) * sb.Lay.InodeSize
-	return blockOffset, byteOffset
+	return briefs.InodeLocation(&sb.Lay, inodeNum)
 }
 
 func main() {

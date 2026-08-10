@@ -299,28 +299,22 @@ func (a *Allocator) Sync() error {
 
 // InodeManager handles on-disk inode read/write.
 type InodeManager struct {
-	dev          *BlockDevice
-	sb           *briefs.SuperblockLayout
-	inodesPerBlk uint64
-	tableStart   uint64
+	dev *BlockDevice
+	sb  *briefs.SuperblockLayout
 }
 
 // NewInodeManager creates an InodeManager from the superblock.
 func NewInodeManager(dev *BlockDevice, sb *briefs.SuperblockLayout) *InodeManager {
 	return &InodeManager{
-		dev:          dev,
-		sb:           sb,
-		inodesPerBlk: sb.BlockSize / sb.InodeSize,
-		tableStart:   sb.InodeTableOffset,
+		dev: dev,
+		sb:  sb,
 	}
 }
 
-// inodeLocation computes the block and byte offset for a given inode number.
+// inodeLocation computes the block and byte offset for a given inode number,
+// delegating to the shared briefs.InodeLocation formula.
 func (im *InodeManager) inodeLocation(ino uint64) (blockOffset uint64, byteOffset uint64) {
-	idx := ino - 1
-	blockOffset = im.tableStart + idx/im.inodesPerBlk
-	byteOffset = (idx % im.inodesPerBlk) * im.sb.InodeSize
-	return
+	return briefs.InodeLocation(im.sb, ino)
 }
 
 // ReadInode reads and unmarshals an inode from disk.
