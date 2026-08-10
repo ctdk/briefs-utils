@@ -28,6 +28,13 @@ import (
 // deletes, so the leaf chain is not a reliable invariant and is deliberately
 // not checked here.
 //
+// The descent skeleton (read/magic/fanout/within-leaf sort + null-child and
+// cycle guards) is shared with the extent-collection walk via briefs.WalkBtree;
+// this caller supplies only the structural checks WalkBtree does not: level
+// ordering, separator high-key ordering, the cross-leaf cursor, and the
+// extent-count tally. Checksum is not re-verified (VerifyCRC is false) because
+// the prior collect pass already validated the tree.
+//
 // This runs only for tree-backed inodes (InodeFlagIndexed) whose basic walk
 // already succeeded (not in fs.failedBtreeInos). A structural failure sets
 // fs.failedBtreeInos[ino] so the Phase 1 repair guard refuses --repair (the
@@ -44,118 +51,69 @@ func verifyBtreeStructures(fs *fsckState, ino uint64, in *briefs.Inode, blockSiz
 		return // verifyInode rejects this, but guard anyway
 	}
 
-	s := &btreeVerifyState{
-		fs:        fs,
-		ino:       ino,
-		blockSize: blockSize,
-		visited:   make(map[uint64]bool),
-	}
-
-	count, err := s.verifySubtree(root, 0, true)
+	s := &btreeVerifyState{fs: fs, ino: ino}
+	err := briefs.WalkBtree(fs.file, root, briefs.BtreeWalkOptions{
+		BlockSize:        blockSize,
+		NullChildIsFault: true,
+		// Tolerant stays false: the first structural fault aborts the walk and
+		// marks the inode failed, exactly as the hand-rolled descent did.
+	}, briefs.BtreeNodeVisitor{
+		VisitNode: s.visitNode,
+		VisitLeaf: s.visitLeaf,
+	})
 	if err != nil {
 		fs.errorf("ino %d: %v", ino, err)
 		fs.failedBtreeInos[ino] = true
 		return
 	}
-	if uint64(count) != in.NumExtentsTotal {
+	if uint64(s.count) != in.NumExtentsTotal {
 		fs.errorf("ino %d: %v (walked %d, num_extents_total %d)",
-			ino, briefs.ErrBtreeCountMismatch, count, in.NumExtentsTotal)
+			ino, briefs.ErrBtreeCountMismatch, s.count, in.NumExtentsTotal)
 		fs.failedBtreeInos[ino] = true
 	}
 }
 
-// btreeVerifyState carries the cross-leaf ordering cursor and cycle guard
-// through the recursive descent.
+// btreeVerifyState carries the cross-leaf ordering cursor and the extent-count
+// tally through the WalkBtree callbacks. The cycle guard lives in WalkBtree,
+// so this state holds only the verify-specific accumulators.
 type btreeVerifyState struct {
-	fs        *fsckState
-	ino       uint64
-	blockSize uint64
-	visited   map[uint64]bool
+	fs  *fsckState
+	ino uint64
 
+	// count tallies extents across every visited leaf.
+	count int
 	// prevLeafMax is the max extent offset of the most recently visited leaf;
-	// havePrev is false until the first leaf is visited. Used to enforce
-	// cross-leaf key ordering as leaves are visited left-to-right.
+	// havePrev is false until the first non-empty leaf is visited. Used to
+	// enforce cross-leaf key ordering as leaves are visited left-to-right.
 	prevLeafMax uint64
 	havePrev     bool
 }
 
-// verifySubtree walks the subtree rooted at @block and returns the number of
-// extents in it. @expectedLevel is the level the node should have (ignored when
-// @isRoot, since the root's level depends on tree height). It returns an error
-// (wrapped with the offending block) on any structural fault; the caller then
-// records the inode as failed.
-func (s *btreeVerifyState) verifySubtree(block uint64, expectedLevel uint16, isRoot bool) (int, error) {
-	if block == 0 {
-		return 0, fmt.Errorf("btree node %d: %w (null child pointer)", block, briefs.ErrBtreeBadChild)
-	}
-	if s.visited[block] {
-		return 0, fmt.Errorf("btree node %d: %w", block, briefs.ErrBtreeCycle)
-	}
-	s.visited[block] = true
-
-	buf := make([]byte, s.blockSize)
-	if _, err := s.fs.file.ReadAt(buf, int64(block*s.blockSize)); err != nil {
-		return 0, fmt.Errorf("btree node %d: read: %w", block, err)
-	}
-	hdr := briefs.UnmarshalBtreeHeader(buf)
-	if hdr.Magic != briefs.BtreeMagic {
-		return 0, fmt.Errorf("btree node %d: %w", block, briefs.ErrBtreeBadMagic)
-	}
-	// The checksum was already verified by the collectInodeExtents walk (which
-	// succeeded for this inode), so it is not re-verified here.
-
+// visitNode applies the per-node structural checks WalkBtree does not: level
+// ordering (for both leaves and internal nodes) and, for internal nodes,
+// strictly-ascending non-zero separator high_keys. It is called for every node
+// after WalkBtree has already validated magic, fanout, and (for leaves)
+// within-leaf ordering.
+func (s *btreeVerifyState) visitNode(info briefs.BtreeNodeInfo) error {
+	hdr := info.Hdr
 	if hdr.IsLeaf() {
-		if int(hdr.NumKeys) > briefs.BtreeLeafFanout {
-			return 0, fmt.Errorf("btree node %d: %w (leaf %d > %d)",
-				block, briefs.ErrBtreeCountOverflow, hdr.NumKeys, briefs.BtreeLeafFanout)
-		}
 		// Leaves are level 0.
 		if hdr.Level != 0 {
-			return 0, fmt.Errorf("btree node %d: %w (leaf with level %d, want 0)",
-				block, briefs.ErrBtreeBadChild, hdr.Level)
+			return fmt.Errorf("btree node %d: %w (leaf with level %d, want 0)",
+				info.Block, briefs.ErrBtreeBadChild, hdr.Level)
 		}
-
-		var count int
-		var prevOffset uint64
-		var leafMax uint64
-		for i := uint16(0); i < hdr.NumKeys; i++ {
-			ext := briefs.ReadBtreeLeafExtent(buf, int(i))
-			if i > 0 && ext.Offset <= prevOffset {
-				return 0, fmt.Errorf("btree node %d: %w (offset %d after %d)",
-					block, briefs.ErrBtreeUnsorted, ext.Offset, prevOffset)
-			}
-			prevOffset = ext.Offset
-			leafMax = ext.Offset
-			count++
-		}
-
-		// Cross-leaf ordering: this leaf's first offset must exceed the
-		// previous leaf's max offset. Empty leaves don't advance the cursor.
-		if hdr.NumKeys > 0 {
-			first := briefs.ReadBtreeLeafExtent(buf, 0).Offset
-			if s.havePrev && first <= s.prevLeafMax {
-				return 0, fmt.Errorf("btree node %d: %w (leaf first offset %d <= previous leaf max %d)",
-					block, briefs.ErrBtreeCrossLeafUnsorted, first, s.prevLeafMax)
-			}
-			s.prevLeafMax = leafMax
-			s.havePrev = true
-		}
-		return count, nil
+		return nil
 	}
 
 	// Internal node.
-	if int(hdr.NumKeys) > briefs.BtreeIdxFanout {
-		return 0, fmt.Errorf("btree node %d: %w (internal %d > %d)",
-			block, briefs.ErrBtreeCountOverflow, hdr.NumKeys, briefs.BtreeIdxFanout)
-	}
-	// An internal node sits above leaves, so its level must be >= 1.
 	if hdr.Level == 0 {
-		return 0, fmt.Errorf("btree node %d: %w (internal node with level 0)", block, briefs.ErrBtreeBadChild)
+		return fmt.Errorf("btree node %d: %w (internal node with level 0)",
+			info.Block, briefs.ErrBtreeBadChild)
 	}
 	// A non-root internal node must be exactly one level below its parent.
-	if !isRoot && hdr.Level != expectedLevel {
-		return 0, fmt.Errorf("btree node %d: %w (level %d, want %d)",
-			block, briefs.ErrBtreeBadChild, hdr.Level, expectedLevel)
+	if !info.IsRoot && hdr.Level != info.ExpectedLevel {
+		return fmt.Errorf("btree node %d: %w (level %d, want %d)",
+			info.Block, briefs.ErrBtreeBadChild, hdr.Level, info.ExpectedLevel)
 	}
 
 	// Separator high_keys must be strictly ascending and > 0. Separators are
@@ -163,36 +121,33 @@ func (s *btreeVerifyState) verifySubtree(block uint64, expectedLevel uint16, isR
 	// non-ascending or zero separator is corruption.
 	var prevHigh uint64
 	for i := uint16(0); i < hdr.NumKeys; i++ {
-		e := briefs.ReadBtreeIdxEntry(buf, int(i))
+		e := briefs.ReadBtreeIdxEntry(info.Buf, int(i))
 		if e.HighKey == 0 {
-			return 0, fmt.Errorf("btree node %d: %w (idx[%d].high_key=0; separators must be > 0)",
-				block, briefs.ErrBtreeBadHighKey, i)
+			return fmt.Errorf("btree node %d: %w (idx[%d].high_key=0; separators must be > 0)",
+				info.Block, briefs.ErrBtreeBadHighKey, i)
 		}
 		if i > 0 && e.HighKey <= prevHigh {
-			return 0, fmt.Errorf("btree node %d: %w (idx[%d].high_key=%d after %d)",
-				block, briefs.ErrBtreeBadHighKey, i, e.HighKey, prevHigh)
+			return fmt.Errorf("btree node %d: %w (idx[%d].high_key=%d after %d)",
+				info.Block, briefs.ErrBtreeBadHighKey, i, e.HighKey, prevHigh)
 		}
 		prevHigh = e.HighKey
 	}
+	return nil
+}
 
-	// Recurse into children left-to-right (idx children then the trailing
-	// child), which yields leaves in ascending key order. Each child must be
-	// one level below this node.
-	childLevel := hdr.Level - 1
-	total := 0
-	for i := uint16(0); i < hdr.NumKeys; i++ {
-		e := briefs.ReadBtreeIdxEntry(buf, int(i))
-		c, err := s.verifySubtree(e.Child, childLevel, false)
-		if err != nil {
-			return 0, err
+// visitLeaf enforces cross-leaf key ordering (this leaf's first offset must
+// exceed the previous leaf's max offset) and adds the leaf's extent count to
+// the running tally. Empty leaves do not advance the cursor.
+func (s *btreeVerifyState) visitLeaf(info briefs.BtreeNodeInfo, extents []briefs.Extent) error {
+	if len(extents) > 0 {
+		first := extents[0].Offset
+		if s.havePrev && first <= s.prevLeafMax {
+			return fmt.Errorf("btree node %d: %w (leaf first offset %d <= previous leaf max %d)",
+				info.Block, briefs.ErrBtreeCrossLeafUnsorted, first, s.prevLeafMax)
 		}
-		total += c
+		s.prevLeafMax = extents[len(extents)-1].Offset
+		s.havePrev = true
 	}
-	trailing := briefs.BtreeTrailingChild(buf)
-	c, err := s.verifySubtree(trailing, childLevel, false)
-	if err != nil {
-		return 0, err
-	}
-	total += c
-	return total, nil
+	s.count += len(extents)
+	return nil
 }
