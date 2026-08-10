@@ -124,32 +124,11 @@ func (a *Allocator) FreeBlock(relBlock uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if a.l0 == nil || relBlock >= a.blockCount {
+	if a.l0 == nil {
 		return
 	}
-
-	w2 := relBlock / 64
-	b2 := relBlock % 64
-	w1 := w2 / 64
-	b1 := w2 % 64
-	w0 := w1 / 64
-	b0 := w1 % 64
-
-	// Already free?
-	if a.l2[w2]&(1<<b2) != 0 {
-		return
-	}
-
-	a.l2[w2] |= 1 << b2
-	a.freeCount++
-	a.dirty = true
-
-	// Propagate upward if word was all-zero
-	if a.l2[w2] == (1 << b2) {
-		a.l1[w1] |= 1 << b1
-		if a.l1[w1] == (1 << b1) {
-			a.l0[w0] |= 1 << b0
-		}
+	if briefs.AllocMarkFree(a.l0, a.l1, a.l2, &a.freeCount, a.blockCount, relBlock) {
+		a.dirty = true
 	}
 }
 
@@ -158,32 +137,11 @@ func (a *Allocator) ReserveBlock(relBlock uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if a.l0 == nil || relBlock >= a.blockCount {
+	if a.l0 == nil {
 		return
 	}
-
-	w2 := relBlock / 64
-	b2 := relBlock % 64
-	w1 := w2 / 64
-	b1 := w2 % 64
-	w0 := w1 / 64
-	b0 := w1 % 64
-
-	// Already allocated?
-	if a.l2[w2]&(1<<b2) == 0 {
-		return
-	}
-
-	a.l2[w2] &^= 1 << b2
-	a.freeCount--
-	a.dirty = true
-
-	// Propagate upward if word becomes zero
-	if a.l2[w2] == 0 {
-		a.l1[w1] &^= 1 << b1
-		if a.l1[w1] == 0 {
-			a.l0[w0] &^= 1 << b0
-		}
+	if briefs.AllocMarkAllocated(a.l0, a.l1, a.l2, &a.freeCount, a.blockCount, relBlock) {
+		a.dirty = true
 	}
 }
 
@@ -201,12 +159,10 @@ func (a *Allocator) FreeCount() uint64 {
 func (a *Allocator) Allocated(rel uint64) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.l0 == nil || rel >= a.blockCount {
+	if a.l0 == nil {
 		return false
 	}
-	w2 := rel / 64
-	b2 := rel % 64
-	return (a.l2[w2] & (1 << b2)) == 0 // bit clear = allocated
+	return briefs.AllocIsAllocated(a.l2, a.blockCount, rel)
 }
 
 // FreeBlocksRange frees [phys, phys+length) absolute data blocks, converting

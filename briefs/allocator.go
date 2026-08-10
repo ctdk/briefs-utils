@@ -51,19 +51,7 @@ type AllocBuilder struct {
 // All blocks start free. This is used for inode allocators where no
 // block reservation is needed.
 func NewAllocBuilder(dataBlockCount uint64) *AllocBuilder {
-	l2Words := (dataBlockCount + 63) / 64
-	l1Words := (l2Words + 63) / 64
-	l0Words := (l1Words + 63) / 64
-
-	if l0Words < 1 {
-		l0Words = 1
-	}
-	if l1Words < 1 {
-		l1Words = 1
-	}
-	if l2Words < 1 {
-		l2Words = 1
-	}
+	l0Words, l1Words, l2Words := allocLevelWords(dataBlockCount)
 
 	b := &AllocBuilder{
 		L0:         make([]uint64, l0Words),
@@ -137,64 +125,12 @@ func (b *AllocBuilder) wordBlocks(words []uint64) uint64 {
 
 // MarkAllocated marks a block (data-relative, 0-based) as allocated.
 func (b *AllocBuilder) MarkAllocated(relBlock uint64) {
-	if relBlock >= b.BlockCount {
-		return
-	}
-
-	w2 := relBlock / 64
-	b2 := relBlock % 64
-	w1 := w2 / 64
-	b1 := w2 % 64
-	w0 := w1 / 64
-	b0 := w1 % 64
-
-	// Already allocated?
-	if b.L2[w2]&(1<<b2) == 0 {
-		return
-	}
-
-	wasNonZero := b.L2[w2] != 0
-
-	b.L2[w2] &^= 1 << b2
-	b.FreeCount--
-
-	if wasNonZero && b.L2[w2] == 0 {
-		b.L1[w1] &^= 1 << b1
-		if b.L1[w1] == 0 {
-			b.L0[w0] &^= 1 << b0
-		}
-	}
+	AllocMarkAllocated(b.L0, b.L1, b.L2, &b.FreeCount, b.BlockCount, relBlock)
 }
 
 // MarkFree marks a block (data-relative, 0-based) as free.
 func (b *AllocBuilder) MarkFree(relBlock uint64) {
-	if relBlock >= b.BlockCount {
-		return
-	}
-
-	w2 := relBlock / 64
-	b2 := relBlock % 64
-	w1 := w2 / 64
-	b1 := w2 % 64
-	w0 := w1 / 64
-	b0 := w1 % 64
-
-	// Already free?
-	if b.L2[w2]&(1<<b2) != 0 {
-		return
-	}
-
-	wasAllZero := b.L2[w2] == 0
-
-	b.L2[w2] |= 1 << b2
-	b.FreeCount++
-
-	if wasAllZero {
-		b.L1[w1] |= 1 << b1
-		if b.L0[w0]&(1<<b0) == 0 {
-			b.L0[w0] |= 1 << b0
-		}
-	}
+	AllocMarkFree(b.L0, b.L1, b.L2, &b.FreeCount, b.BlockCount, relBlock)
 }
 
 // IsAllocated reports whether a block (data-relative, 0-based) is currently
@@ -202,12 +138,7 @@ func (b *AllocBuilder) MarkFree(relBlock uint64) {
 // so the block is allocated when the bit is zero. Out-of-range blocks are
 // reported as not allocated.
 func (b *AllocBuilder) IsAllocated(relBlock uint64) bool {
-	if relBlock >= b.BlockCount {
-		return false
-	}
-	w2 := relBlock / 64
-	b2 := relBlock % 64
-	return b.L2[w2]&(1<<b2) == 0
+	return AllocIsAllocated(b.L2, b.BlockCount, relBlock)
 }
 
 // AllocateBlock finds a single free data-relative block and marks it allocated.
