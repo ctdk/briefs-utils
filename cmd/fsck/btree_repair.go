@@ -253,80 +253,57 @@ func rebuildBtreeFromExtents(fs *fsckState, plan *repairPlan, ino uint64, clone 
 // blocks to free (valid leaves + descended internal nodes), and whether any
 // subtree was skipped (lost). Lost subtrees warnf and contribute no extents;
 // their node blocks are NOT returned for freeing (left allocated).
+//
+// The descent skeleton (read/magic/fanout/sort/checksum + cycle guard) is
+// shared with the structural-verification walk via briefs.WalkBtree; this caller
+// only supplies the tolerant fault policy (lost + warn) and the per-node
+// accumulation (extents, confirmed node blocks, leaf count).
 func btreeCollectExtents(fs *fsckState, ino, root, blockSize uint64) (extents []briefs.Extent, oldNodeBlocks []uint64, leafCount int, lost bool) {
-	visited := make(map[uint64]bool)
-	btreeCollectSubtree(fs, ino, root, blockSize, visited, &extents, &oldNodeBlocks, &leafCount, &lost)
-	return
+	c := &btreeCollector{fs: fs, ino: ino}
+	opts := briefs.BtreeWalkOptions{
+		BlockSize: blockSize,
+		VerifyCRC: true,
+		Tolerant:  true,
+		OnFault:   c.onFault,
+	}
+	_ = briefs.WalkBtree(fs.file, root, opts, briefs.BtreeNodeVisitor{
+		VisitNode: c.visitNode,
+		VisitLeaf: c.visitLeaf,
+	})
+	return c.extents, c.oldNodeBlocks, c.leafCount, c.lost
 }
 
-// btreeCollectSubtree is the recursive worker for btreeCollectExtents.
-func btreeCollectSubtree(fs *fsckState, ino, block, blockSize uint64, visited map[uint64]bool, extents *[]briefs.Extent, oldNodeBlocks *[]uint64, leafCount *int, lost *bool) {
-	if block == 0 || visited[block] {
-		return
-	}
-	visited[block] = true
+// btreeCollector carries the accumulation state through the WalkBtree callbacks.
+// VisitNode fires for every validated node (leaf or internal) and records the
+// block as confirmed freeable; VisitLeaf additionally accumulates the leaf's
+// extents and counts it. A fault (read error, bad magic, fanout overflow,
+// within-leaf unsorted extents, or — because VerifyCRC is set — a checksum
+// mismatch) routes to onFault, which marks the walk lost; the offending subtree
+// is skipped by WalkBtree so its node blocks are NOT recorded as freeable and
+// its extents are NOT collected, matching the prior hand-rolled policy.
+type btreeCollector struct {
+	fs           *fsckState
+	ino          uint64
+	extents      []briefs.Extent
+	oldNodeBlocks []uint64
+	leafCount    int
+	lost         bool
+}
 
-	buf := make([]byte, blockSize)
-	if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
-		*lost = true
-		fs.warnf("ino %d: B-tree node %d unreadable (%v); extents in this subtree lost (data blocks left allocated)", ino, block, err)
-		return
-	}
-	hdr := briefs.UnmarshalBtreeHeader(buf)
-	if hdr.Magic != briefs.BtreeMagic {
-		*lost = true
-		fs.warnf("ino %d: B-tree node %d bad magic 0x%08X; extents in this subtree lost (data blocks left allocated)", ino, block, hdr.Magic)
-		return
-	}
+func (c *btreeCollector) onFault(block uint64, err error) {
+	c.lost = true
+	c.fs.warnf("ino %d: %v; extents in this subtree lost (data blocks left allocated)", c.ino, err)
+}
 
-	if hdr.IsLeaf() {
-		if int(hdr.NumKeys) > briefs.BtreeLeafFanout {
-			*lost = true
-			fs.warnf("ino %d: leaf node %d fanout overflow (%d > %d); subtree lost", ino, block, hdr.NumKeys, briefs.BtreeLeafFanout)
-			return
-		}
-		var prev uint64
-		for i := uint16(0); i < hdr.NumKeys; i++ {
-			ext := briefs.ReadBtreeLeafExtent(buf, int(i))
-			if i > 0 && ext.Offset <= prev {
-				*lost = true
-				fs.warnf("ino %d: leaf node %d extents unsorted (offset %d after %d); subtree lost", ino, block, ext.Offset, prev)
-				return
-			}
-			prev = ext.Offset
-		}
-		if briefs.VerifyBtreeNodeChecksum(buf, blockSize) != nil {
-			*lost = true
-			fs.warnf("ino %d: leaf node %d checksum mismatch; extents in this subtree lost (run --repair-only=btrees first, or data blocks are left allocated)", ino, block)
-			return
-		}
-		for i := uint16(0); i < hdr.NumKeys; i++ {
-			*extents = append(*extents, briefs.ReadBtreeLeafExtent(buf, int(i)))
-		}
-		*oldNodeBlocks = append(*oldNodeBlocks, block)
-		*leafCount++
-		return
-	}
+func (c *btreeCollector) visitNode(info briefs.BtreeNodeInfo) error {
+	c.oldNodeBlocks = append(c.oldNodeBlocks, info.Block)
+	return nil
+}
 
-	// Internal node.
-	if int(hdr.NumKeys) > briefs.BtreeIdxFanout {
-		*lost = true
-		fs.warnf("ino %d: internal node %d fanout overflow (%d > %d); subtree lost", ino, block, hdr.NumKeys, briefs.BtreeIdxFanout)
-		return
-	}
-	if briefs.VerifyBtreeNodeChecksum(buf, blockSize) != nil {
-		// Untrusted child pointers: do not descend or free this node.
-		*lost = true
-		fs.warnf("ino %d: internal node %d checksum mismatch; not descending (child pointers untrusted); subtree lost (data blocks left allocated)", ino, block)
-		return
-	}
-	*oldNodeBlocks = append(*oldNodeBlocks, block)
-	for i := uint16(0); i < hdr.NumKeys; i++ {
-		e := briefs.ReadBtreeIdxEntry(buf, int(i))
-		btreeCollectSubtree(fs, ino, e.Child, blockSize, visited, extents, oldNodeBlocks, leafCount, lost)
-	}
-	trailing := briefs.BtreeTrailingChild(buf)
-	btreeCollectSubtree(fs, ino, trailing, blockSize, visited, extents, oldNodeBlocks, leafCount, lost)
+func (c *btreeCollector) visitLeaf(info briefs.BtreeNodeInfo, extents []briefs.Extent) error {
+	c.extents = append(c.extents, extents...)
+	c.leafCount++
+	return nil
 }
 
 // sortDedupExtents sorts extents ascending by Offset and drops any duplicate

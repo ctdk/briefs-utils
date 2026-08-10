@@ -300,3 +300,173 @@ func btreeWalk(file *os.File, block, blockSize uint64, depth int, visited map[ui
 	trailing := BtreeTrailingChild(buf)
 	return btreeWalk(file, trailing, blockSize, depth+1, visited, v)
 }
+
+// BtreeNodeInfo describes one node visited during WalkBtree.
+type BtreeNodeInfo struct {
+	Block  uint64
+	Hdr    BtreeNodeHeader
+	Buf    []byte
+	Depth  int  // 0 at the root, increments per descent level
+	IsRoot bool // true only for the tree root
+	// ExpectedLevel is parent.Level - 1; it is meaningful only when IsRoot is
+	// false and lets a visitor enforce the "child sits one level below its
+	// parent" invariant.
+	ExpectedLevel uint16
+}
+
+// BtreeNodeVisitor receives parsed nodes during WalkBtree. VisitNode is called
+// for every node (leaf or internal) after it passes WalkBtree's structural
+// checks (magic, fanout, within-leaf sort, and checksum when VerifyCRC is set),
+// before its children are recursed (internal) or its extents yielded (leaf).
+// VisitLeaf is called for each leaf after VisitNode, with the parsed extents in
+// ascending offset order. A non-nil error from either callback aborts the walk
+// immediately, regardless of Tolerant.
+type BtreeNodeVisitor struct {
+	VisitNode func(BtreeNodeInfo) error
+	VisitLeaf func(BtreeNodeInfo, []Extent) error
+}
+
+// BtreeWalkOptions configures WalkBtree's fault policy.
+type BtreeWalkOptions struct {
+	BlockSize uint64
+
+	// VerifyCRC, when true, verifies each node's checksum and treats a mismatch
+	// as a fault. When false, checksums are not checked — use only when the tree
+	// has already been validated (e.g. a structural verify pass running after the
+	// extent-collection pass).
+	VerifyCRC bool
+
+	// NullChildIsFault, when true, treats a 0 child pointer as a fault. When
+	// false (the default), a 0 child is skipped silently, matching the basic
+	// extent walk which tolerates dangling pointers after range deletes.
+	NullChildIsFault bool
+
+	// Tolerant, when true, routes every fault to OnFault and continues walking
+	// sibling subtrees (the offending subtree is skipped) instead of aborting.
+	// When false (the default), the first fault aborts the walk and is returned.
+	Tolerant bool
+
+	// OnFault is called once per fault when Tolerant is true, with the offending
+	// block number (0 for a null child) and a wrapped error. It is never called
+	// when Tolerant is false. A nil OnFault tolerates faults silently.
+	OnFault func(block uint64, err error)
+}
+
+// WalkBtree descends the B+ tree rooted at @root, dispatching each node to the
+// visitor after it passes the structural checks selected by opts. It is the
+// shared descent behind the fsck extent-collection and structural-verification
+// walks: it centralizes the read/magic/fanout/sort/checksum skeleton and the
+// cycle guard, and lets each caller choose a fault policy (strict vs tolerant)
+// and supply the per-node checks it cares about (high-key/level ordering,
+// cross-leaf cursors, extent accumulation) via the visitor callbacks.
+//
+// The descent is bounded by BtreeMaxDepth and a visited-set cycle guard. It
+// does NOT re-implement the basic IterateInodeExtents walk, whose VisitNode
+// fires before the block is read (for used-block recording) — a different
+// contract than this post-validation visitor.
+func WalkBtree(file *os.File, root uint64, opts BtreeWalkOptions, v BtreeNodeVisitor) error {
+	visited := make(map[uint64]bool)
+	return walkBtreeNode(file, root, opts, v, visited, 0, 0, true)
+}
+
+func walkBtreeNode(file *os.File, block uint64, opts BtreeWalkOptions, v BtreeNodeVisitor, visited map[uint64]bool, depth int, expectedLevel uint16, isRoot bool) error {
+	// fault surfaces the error for @block/@err: when tolerant, report via
+	// OnFault and return nil so sibling subtrees continue; when strict, return
+	// the wrapped error to abort the whole walk.
+	fault := func(b uint64, err error) error {
+		wrapped := fmt.Errorf("btree node %d: %w", b, err)
+		if opts.Tolerant {
+			if opts.OnFault != nil {
+				opts.OnFault(b, wrapped)
+			}
+			return nil
+		}
+		return wrapped
+	}
+
+	if block == 0 {
+		if opts.NullChildIsFault {
+			return fault(block, fmt.Errorf("%w (null child pointer)", ErrBtreeBadChild))
+		}
+		return nil
+	}
+	if depth > BtreeMaxDepth {
+		return fault(block, ErrBtreeDepth)
+	}
+	if visited[block] {
+		return fault(block, ErrBtreeCycle)
+	}
+	visited[block] = true
+
+	buf := make([]byte, opts.BlockSize)
+	if _, err := file.ReadAt(buf, int64(block*opts.BlockSize)); err != nil {
+		return fault(block, fmt.Errorf("read: %w", err))
+	}
+	hdr := UnmarshalBtreeHeader(buf)
+	if hdr.Magic != BtreeMagic {
+		return fault(block, fmt.Errorf("%w (0x%08X)", ErrBtreeBadMagic, hdr.Magic))
+	}
+	if opts.VerifyCRC {
+		if err := VerifyBtreeNodeChecksum(buf, opts.BlockSize); err != nil {
+			return fault(block, err)
+		}
+	}
+
+	info := BtreeNodeInfo{
+		Block:         block,
+		Hdr:            hdr,
+		Buf:            buf,
+		Depth:          depth,
+		IsRoot:         isRoot,
+		ExpectedLevel:  expectedLevel,
+	}
+
+	if hdr.IsLeaf() {
+		if int(hdr.NumKeys) > BtreeLeafFanout {
+			return fault(block, fmt.Errorf("%w (leaf %d > %d)", ErrBtreeCountOverflow, hdr.NumKeys, BtreeLeafFanout))
+		}
+		extents := make([]Extent, 0, hdr.NumKeys)
+		var prev uint64
+		for i := uint16(0); i < hdr.NumKeys; i++ {
+			ext := ReadBtreeLeafExtent(buf, int(i))
+			if i > 0 && ext.Offset <= prev {
+				return fault(block, fmt.Errorf("%w (offset %d after %d)", ErrBtreeUnsorted, ext.Offset, prev))
+			}
+			prev = ext.Offset
+			extents = append(extents, ext)
+		}
+		if v.VisitNode != nil {
+			if err := v.VisitNode(info); err != nil {
+				return err
+			}
+		}
+		if v.VisitLeaf != nil {
+			if err := v.VisitLeaf(info, extents); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Internal node.
+	if int(hdr.NumKeys) > BtreeIdxFanout {
+		return fault(block, fmt.Errorf("%w (internal %d > %d)", ErrBtreeCountOverflow, hdr.NumKeys, BtreeIdxFanout))
+	}
+	if v.VisitNode != nil {
+		if err := v.VisitNode(info); err != nil {
+			return err
+		}
+	}
+	// Recurse into children left-to-right (idx children then the trailing
+	// child), yielding leaves in ascending key order. Each child must sit one
+	// level below this node.
+	childLevel := hdr.Level - 1
+	for i := uint16(0); i < hdr.NumKeys; i++ {
+		entry := ReadBtreeIdxEntry(buf, int(i))
+		if err := walkBtreeNode(file, entry.Child, opts, v, visited, depth+1, childLevel, false); err != nil {
+			return err
+		}
+	}
+	trailing := BtreeTrailingChild(buf)
+	return walkBtreeNode(file, trailing, opts, v, visited, depth+1, childLevel, false)
+}
