@@ -87,7 +87,7 @@ func runVerificationPass(fs *fsckState, blockSize, inodeSize uint64) int {
 	verifySuperblockFreeCounts(fs, totalInodes)
 	verifyDirEntryCrossReference(fs, allEntries)
 	verifyDuplicateNames(fs, allEntries)
-	verifyLinkCounts(fs)
+	verifyLinkCounts(fs, blockSize)
 	verifyOrphanedInodes(fs)
 	verifyExtentOverlaps(fs)
 	verifyReachability(fs, allEntries)

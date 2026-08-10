@@ -336,22 +336,11 @@ func writeCheckpoint(file *os.File, sb *briefs.SuperblockLayout, blockSize uint6
 // directories should have nlinks equal to 2 (for . and ..) plus the number of
 // subdirectories they contain.
 func repairLinkCounts(fs *fsckState, plan *repairPlan, blockSize uint64) error {
-	// Count how many subdirectory entries each directory contains.
-	subdirCount := make(map[uint64]int)
-	for _, d := range fs.dirs {
-		entries, err := collectDirectoryEntries(fs, d.ino, d.trieRoot, blockSize)
-		if err != nil {
-			return fmt.Errorf("ino %d: collect directory entries: %w", d.ino, err)
-		}
-		for _, e := range entries {
-			target, ok := fs.inodes[e.Inode]
-			if !ok {
-				continue
-			}
-			if target.IsDir() {
-				subdirCount[d.ino]++
-			}
-		}
+	// Count how many subdirectory entries each directory contains, via the
+	// shared helper used by verifyLinkCounts too.
+	subdirCount, err := computeDirSubdirCounts(fs, blockSize)
+	if err != nil {
+		return err
 	}
 
 	for ino, in := range fs.inodes {

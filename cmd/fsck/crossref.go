@@ -103,28 +103,81 @@ func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 	}
 }
 
-// verifyLinkCounts checks that each inode's nlink matches the number of
-// directory entries referencing it.
-func verifyLinkCounts(fs *fsckState) {
-	mismatches := 0
-	for ino, in := range fs.inodes {
-		expected := fs.entryCounts[ino]
-		// For directories, nlink includes . and .. which are not stored in the trie.
-		// nlink for a dir = 2 (., ..) + number of subdirectories
-		// We can't easily count subdirectories from here, so we only check files.
-		if in.IsFile() {
-			if int(in.Nlinks) != expected {
-				if mismatches < 20 {
-					fs.errorf("ino %d: nlink=%d but %d directory entries reference it", ino, in.Nlinks, expected)
-				} else if mismatches == 20 {
-					fs.errorf("(more link count errors suppressed)")
-				}
-				mismatches++
+// computeDirSubdirCounts walks each directory's trie and returns a map of
+// ino -> number of subdirectory entries it contains. A directory's nlink is
+// 2 (., ..) plus its subdirectory count, so this is the shared computation
+// behind both verifyLinkCounts (read-only check) and repairLinkCounts (fix).
+// It is strict: a collectDirectoryEntries error aborts and is returned, since
+// a partial count would make directory nlink checks wrong. Callers that may
+// run with broken tries (the verify pass) tolerate the error by skipping the
+// directory check; the repair path is gated on fs.failedTrieDirs being empty,
+// so it always gets a complete count.
+func computeDirSubdirCounts(fs *fsckState, blockSize uint64) (map[uint64]int, error) {
+	subdirCount := make(map[uint64]int)
+	for _, d := range fs.dirs {
+		entries, err := collectDirectoryEntries(fs, d.ino, d.trieRoot, blockSize)
+		if err != nil {
+			return nil, fmt.Errorf("ino %d: collect directory entries: %w", d.ino, err)
+		}
+		for _, e := range entries {
+			target, ok := fs.inodes[e.Inode]
+			if !ok {
+				continue
+			}
+			if target.IsDir() {
+				subdirCount[d.ino]++
 			}
 		}
 	}
+	return subdirCount, nil
+}
+
+// verifyLinkCounts checks that each inode's nlink matches the count derived
+// from the directory tries: directories are 2 (., ..) + subdirectory count,
+// files and symlinks are the number of directory entries referencing them.
+// This matches what repairLinkCounts would fix and what the kernel maintains,
+// so a wrong nlink is flagged instead of passing silently.
+func verifyLinkCounts(fs *fsckState, blockSize uint64) {
+	subdirCount, err := computeDirSubdirCounts(fs, blockSize)
+	if err != nil {
+		// A broken directory trie makes subdir counts unreliable, so skip the
+		// directory nlink check; the trie error itself is already reported by
+		// verifyAllDirTries. Files and symlinks can still be checked against
+		// entryCounts.
+		fs.errorf("link counts: skipping directory nlink check: %v", err)
+		subdirCount = nil
+	}
+
+	mismatches := 0
+	for ino, in := range fs.inodes {
+		var expected int
+		switch {
+		case in.IsDir():
+			if subdirCount == nil {
+				continue
+			}
+			// nlink = 2 (., ..) + number of subdirectories.
+			expected = 2 + subdirCount[ino]
+		case in.IsFile() || in.IsSymlink():
+			expected = fs.entryCounts[ino]
+		default:
+			continue
+		}
+		if int(in.Nlinks) != expected {
+			if mismatches < 20 {
+				fs.errorf("ino %d: nlink=%d but expected %d", ino, in.Nlinks, expected)
+			} else if mismatches == 20 {
+				fs.errorf("(more link count errors suppressed)")
+			}
+			mismatches++
+		}
+	}
 	if mismatches == 0 {
-		fmt.Fprintf(os.Stderr, "  link counts: all file link counts match directory entries\n")
+		if subdirCount != nil {
+			fmt.Fprintf(os.Stderr, "  link counts: all link counts match (dirs, files, symlinks)\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "  link counts: all file/symlink link counts match (dir check skipped)\n")
+		}
 	}
 }
 
