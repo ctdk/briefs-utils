@@ -201,3 +201,86 @@ func TestJournalRingWrapSkipsCheckpointBlock(t *testing.T) {
 			MagicCheckpoint, got)
 	}
 }
+
+// TestWriteCheckpointBlockLayout asserts the shared checkpoint-block framer
+// produces the exact on-disk layout the hand-rolled writers it replaced used:
+// a 16-byte journal block header, a 16-byte JRN_CHECKPOINT record header with a
+// validating CRC32C, then the 56-byte Checkpoint payload. This guards the
+// journal/fsck/mkfs checkpoint path against framing drift.
+func TestWriteCheckpointBlockLayout(t *testing.T) {
+	cp := &Checkpoint{
+		Seq:            42,
+		RecordCount:    7,
+		LogSequenceEnd: 1234,
+		TrieRootNode:   56,
+		FreeDataCount:  100,
+		FreeInodeCount: 200,
+	}
+	cpBytes, err := cp.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Checkpoint.MarshalBinary: %v", err)
+	}
+	if len(cpBytes) != CheckpointSize {
+		t.Fatalf("Checkpoint payload size: want %d, got %d", CheckpointSize, len(cpBytes))
+	}
+
+	const blockSeq uint32 = 9
+	buf := make([]byte, 4096)
+	if err := WriteCheckpointBlock(buf, blockSeq, cp); err != nil {
+		t.Fatalf("WriteCheckpointBlock: %v", err)
+	}
+
+	// Block header.
+	bh := ParseJournalBlockHeader(buf)
+	if bh.Magic != MagicCheckpoint {
+		t.Errorf("block magic: want 0x%x, got 0x%x", MagicCheckpoint, bh.Magic)
+	}
+	if bh.BlockSeq != blockSeq {
+		t.Errorf("block seq: want %d, got %d", blockSeq, bh.BlockSeq)
+	}
+	if bh.RecordCount != 1 {
+		t.Errorf("block record_count: want 1, got %d", bh.RecordCount)
+	}
+
+	// Record header at offset JournalBlockHdrSize.
+	recOff := uint64(JournalBlockHdrSize)
+	rh := ParseRecordHeader(buf[recOff:])
+	if rh.Type != JRN_CHECKPOINT {
+		t.Errorf("record type: want %d, got %d", JRN_CHECKPOINT, rh.Type)
+	}
+	if rh.Flags != JRN_FLAGS_NONE {
+		t.Errorf("record flags: want 0, got 0x%x", rh.Flags)
+	}
+	if rh.DataLen != uint32(CheckpointSize) {
+		t.Errorf("record data_len: want %d, got %d", CheckpointSize, rh.DataLen)
+	}
+	wantCksum := ComputeJournalRecordChecksum(JRN_CHECKPOINT, JRN_FLAGS_NONE, cpBytes)
+	if rh.Checksum != wantCksum {
+		t.Errorf("record checksum: want 0x%x, got 0x%x", wantCksum, rh.Checksum)
+	}
+	if !VerifyJournalRecordChecksum(JRN_CHECKPOINT, rh.Flags, cpBytes, rh.Checksum) {
+		t.Error("VerifyJournalRecordChecksum rejected the checkpoint record")
+	}
+
+	// Payload immediately after the record header must equal the marshaled
+	// Checkpoint.
+	gotPayload := buf[recOff+JournalRecordHdrSize : recOff+JournalRecordHdrSize+CheckpointSize]
+	if string(gotPayload) != string(cpBytes) {
+		t.Error("checkpoint payload bytes differ from Checkpoint.MarshalBinary")
+	}
+
+	// BlockSeq=0 path (fsck/mkfs) must differ only in the block-seq field.
+	buf0 := make([]byte, 4096)
+	if err := WriteCheckpointBlock(buf0, 0, cp); err != nil {
+		t.Fatalf("WriteCheckpointBlock(0): %v", err)
+	}
+	bh0 := ParseJournalBlockHeader(buf0)
+	if bh0.BlockSeq != 0 {
+		t.Errorf("block seq(0): want 0, got %d", bh0.BlockSeq)
+	}
+	// Record header and payload must be identical between the two seqs.
+	if string(buf0[recOff:recOff+JournalRecordHdrSize+CheckpointSize]) !=
+		string(buf[recOff:recOff+JournalRecordHdrSize+CheckpointSize]) {
+		t.Error("record header/payload changed with block_seq (should not)")
+	}
+}

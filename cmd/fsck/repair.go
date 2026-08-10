@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"math/bits"
 	"os"
@@ -314,17 +313,6 @@ func writeCheckpoint(file *os.File, sb *briefs.SuperblockLayout, blockSize uint6
 	checkpointBlock := sb.JournalOffset + sb.JournalBlocks - 1
 	buf := make([]byte, blockSize)
 
-	// Checkpoint block header (16 bytes)
-	binary.LittleEndian.PutUint32(buf[0:], briefs.MagicCheckpoint)
-	binary.LittleEndian.PutUint32(buf[4:], 0) // block_seq (unused by fsck)
-	binary.LittleEndian.PutUint32(buf[8:], 1) // record_count
-
-	// Record header at offset 16
-	const recOff = 16
-	binary.LittleEndian.PutUint32(buf[recOff:], uint32(briefs.JRN_CHECKPOINT))
-	binary.LittleEndian.PutUint32(buf[recOff+4:], 0) // flags
-	binary.LittleEndian.PutUint32(buf[recOff+8:], briefs.CheckpointSize)
-
 	cp := &briefs.Checkpoint{
 		Seq:            plan.checkpointSeq,
 		RecordCount:    1,
@@ -333,14 +321,9 @@ func writeCheckpoint(file *os.File, sb *briefs.SuperblockLayout, blockSize uint6
 		FreeDataCount:  plan.freeDataBlks,
 		FreeInodeCount: plan.freeInodes,
 	}
-	cpData, err := cp.MarshalBinary()
-	if err != nil {
-		return fmt.Errorf("marshal checkpoint: %w", err)
+	if err := briefs.WriteCheckpointBlock(buf, 0, cp); err != nil {
+		return err
 	}
-	copy(buf[recOff+16:], cpData)
-
-	checksum := briefs.ComputeJournalRecordChecksum(uint32(briefs.JRN_CHECKPOINT), 0, cpData)
-	binary.LittleEndian.PutUint32(buf[recOff+12:], checksum)
 
 	if _, err := file.WriteAt(buf, int64(checkpointBlock*blockSize)); err != nil {
 		return fmt.Errorf("write checkpoint block %d: %w", checkpointBlock, err)

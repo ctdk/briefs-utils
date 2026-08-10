@@ -441,18 +441,6 @@ func main() {
 			// (journal_offset + journal_blocks - 1).
 			checkpointBlock := journalOffset + journalBlocks - 1
 			journalBuf := make([]byte, blockSize)
-			// Checkpoint block header (16 bytes)
-			binary.LittleEndian.PutUint32(journalBuf[0:], briefs.MagicCheckpoint) // "CHPS" magic
-			binary.LittleEndian.PutUint32(journalBuf[4:], 0)          // block_seq
-			binary.LittleEndian.PutUint32(journalBuf[8:], 1)          // record_count
-			// Checkpoint record header at offset 16
-			recOff := uint64(16)
-			binary.LittleEndian.PutUint32(journalBuf[recOff:], uint32(briefs.JRN_CHECKPOINT))
-			binary.LittleEndian.PutUint32(journalBuf[recOff+4:], 0) // flags
-			binary.LittleEndian.PutUint32(journalBuf[recOff+8:], briefs.CheckpointSize)
-
-			// Checkpoint record data at offset 32 (56 bytes).
-			cpOff := recOff + 16
 			cp := &briefs.Checkpoint{
 				Seq:            1,
 				RecordCount:    1,
@@ -462,16 +450,9 @@ func main() {
 				FreeDataCount:  finalDataBlocks - 2,
 				FreeInodeCount: estInodes - 1,
 			}
-			cpData, err := cp.MarshalBinary()
-			if err != nil {
-				return fmt.Errorf("marshal checkpoint: %w", err)
+			if err := briefs.WriteCheckpointBlock(journalBuf, 0, cp); err != nil {
+				return err
 			}
-			copy(journalBuf[cpOff:], cpData)
-
-			// Compute and write the CRC32C checksum over type, flags,
-			// data_len, and the 56-byte checkpoint data.
-			checksum := briefs.ComputeJournalRecordChecksum(uint32(briefs.JRN_CHECKPOINT), briefs.JRN_FLAGS_NONE, cpData)
-			binary.LittleEndian.PutUint32(journalBuf[recOff+12:], checksum)
 			if _, err := file.WriteAt(journalBuf, int64(checkpointBlock*blockSize)); err != nil {
 				return fmt.Errorf("write journal checkpoint at block %d: %w", checkpointBlock, err)
 			}

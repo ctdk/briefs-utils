@@ -18,7 +18,6 @@
 package briefs
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
 	"sync"
@@ -348,6 +347,44 @@ func (j *Journal) Checkpoint() error {
 	return j.checkpointLocked()
 }
 
+// WriteCheckpointBlock builds a checkpoint journal block in buf: a 16-byte
+// journal block header (magic=MagicCheckpoint, the given block_seq,
+// record_count=1), a single JRN_CHECKPOINT record header carrying a CRC32C
+// over type+flags+payload, and the marshaled Checkpoint payload. The caller
+// allocates buf (at least the journal block size) and writes it to the
+// checkpoint block location (journal_offset + journal_blocks - 1).
+//
+// This is the single source of the checkpoint framing shared by the journal
+// runtime (checkpointLocked), fsck (writeCheckpoint), and mkfs. It replaces
+// the hand-rolled block/record header puts that had drifted across the three
+// callers, and routes the framing through the generated
+// JournalBlockHeader/RecordHeader marshalers so the layout cannot drift from
+// the on-disk codec.
+func WriteCheckpointBlock(buf []byte, blockSeq uint32, cp *Checkpoint) error {
+	MarshalJournalBlockHeader(buf, JournalBlockHeader{
+		Magic:       MagicCheckpoint,
+		BlockSeq:    blockSeq,
+		RecordCount: 1,
+	})
+
+	cpBytes, err := cp.MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("marshal checkpoint: %w", err)
+	}
+
+	rh := RecordHeader{
+		Type:     JRN_CHECKPOINT,
+		Flags:    JRN_FLAGS_NONE,
+		DataLen:  uint32(len(cpBytes)),
+		Checksum: ComputeJournalRecordChecksum(JRN_CHECKPOINT, JRN_FLAGS_NONE, cpBytes),
+	}
+	rhBytes, _ := rh.MarshalBinary()
+	recOff := uint64(JournalBlockHdrSize)
+	copy(buf[recOff:], rhBytes)
+	copy(buf[recOff+JournalRecordHdrSize:], cpBytes)
+	return nil
+}
+
 func (j *Journal) checkpointLocked() error {
 	// Flush any pending records first (journal.c:374).
 	if j.dirty {
@@ -379,11 +416,6 @@ func (j *Journal) checkpointLocked() error {
 
 	// Build the checkpoint record in a fresh block.
 	cpBuf := make([]byte, JournalBlockSize)
-	MarshalJournalBlockHeader(cpBuf, JournalBlockHeader{
-		Magic:       MagicCheckpoint,
-		BlockSeq:    j.blockSeq,
-		RecordCount: 1, // the checkpoint record itself
-	})
 
 	curBh := ParseJournalBlockHeader(j.curBlock)
 	cp := &Checkpoint{
@@ -394,15 +426,9 @@ func (j *Journal) checkpointLocked() error {
 		FreeDataCount:  j.sb.FreeDataBlks,
 		FreeInodeCount: j.sb.FreeInodes,
 	}
-	cpBytes, _ := cp.MarshalBinary()
-
-	recOff := uint64(JournalBlockHdrSize)
-	binary.LittleEndian.PutUint32(cpBuf[recOff+0:], JRN_CHECKPOINT)
-	binary.LittleEndian.PutUint32(cpBuf[recOff+4:], 0)
-	binary.LittleEndian.PutUint32(cpBuf[recOff+8:], uint32(len(cpBytes)))
-	binary.LittleEndian.PutUint32(cpBuf[recOff+12:],
-		ComputeJournalRecordChecksum(JRN_CHECKPOINT, 0, cpBytes))
-	copy(cpBuf[recOff+JournalRecordHdrSize:], cpBytes)
+	if err := WriteCheckpointBlock(cpBuf, j.blockSeq, cp); err != nil {
+		return err
+	}
 
 	if err := j.writeBlock(j.checkpointBlk, cpBuf); err != nil {
 		return fmt.Errorf("briefs: write checkpoint block: %w", err)
