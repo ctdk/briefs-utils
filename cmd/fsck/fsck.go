@@ -3,13 +3,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/ctdk/briefs-utils/device"
 	"github.com/ctdk/briefs-utils/briefs"
-	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v3"
 )
 
 // parseRepairOptions converts a comma-separated phase list into a repairOptions
@@ -55,20 +56,20 @@ func parseRepairOptions(list string) (*repairOptions, error) {
 }
 
 func main() {
-	app := &cli.App{
+	app := &cli.Command{
 		Name:     "fsck.briefs",
 		Usage:    "Check and repair a BrieFS filesystem",
 		ArgsUsage: "DEVICE",
 		Version:  briefs.VersionStr,
-		Before: func(c *cli.Context) error {
+		Before: func(ctx context.Context, c *cli.Command) (context.Context, error) {
 			if c.Args().Len() < 1 {
-				return fmt.Errorf("missing required argument: DEVICE")
+				return ctx, fmt.Errorf("missing required argument: DEVICE")
 			}
 			path := c.Args().First()
 			if err := device.CheckMounted(path); err != nil {
-				return fmt.Errorf("refusing to check filesystem: %w\n", err)
+				return ctx, fmt.Errorf("refusing to check filesystem: %w\n", err)
 			}
-			return nil
+			return ctx, nil
 		},
 		Flags: []cli.Flag{
 			&cli.BoolFlag{
@@ -113,7 +114,7 @@ func main() {
 				Value:   "",
 			},
 		},
-		Action: func(c *cli.Context) error {
+		Action: func(ctx context.Context, c *cli.Command) error {
 			path := c.Args().First()
 			repair := c.Bool("repair")
 			repairOnly := c.String("repair-only")
@@ -302,7 +303,7 @@ func main() {
 		},
 	}
 
-	if err := app.Run(os.Args); err != nil {
+	if err := app.Run(context.Background(), os.Args); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

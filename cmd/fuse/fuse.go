@@ -2,16 +2,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
 	"github.com/ctdk/briefs-utils/fuse"
 	"github.com/ctdk/briefs-utils/briefs"
-	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v3"
 )
 
 func main() {
-	app := &cli.App{
+	app := &cli.Command{
 		Name:  "briefs-fuse",
 		Usage: "Mount a BrieFS filesystem image via FUSE",
 		Version: briefs.VersionStr,
@@ -34,7 +35,7 @@ func main() {
 				Usage:   "enable FUSE debug output",
 			},
 		},
-		Action: func(c *cli.Context) error {
+		Action: func(ctx context.Context, c *cli.Command) error {
 			imagePath := c.String("image")
 			mountPoint := c.String("mountpoint")
 			debug := c.Bool("debug")
@@ -54,7 +55,7 @@ func main() {
 		},
 	}
 
-	if err := app.Run(os.Args); err != nil {
+	if err := app.Run(context.Background(), os.Args); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

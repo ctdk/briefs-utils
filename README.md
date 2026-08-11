@@ -19,24 +19,22 @@ NAME:
    mkfs.briefs - Create a new BrieFS filesystem
 
 USAGE:
-   mkfs.briefs [global options] command [command options] DEVICE
+   mkfs.briefs [global options] DEVICE
 
 VERSION:
    v0.9.6
 
-COMMANDS:
-   help, h  Shows a list of commands or help for one command
-
 GLOBAL OPTIONS:
-   --size value, -s value          filesystem size in blocks (default: 0)
-   --block-size value, -b value    block size in bytes (default: 4096)
-   --inode-size value              inode size in bytes (default: 512)
-   --journal-size value, -j value  journal size in blocks (default: 64)
-   --label value, -L value         filesystem label (default: "BRIEFS")
-   --inode-ratio value             blocks per inode (one inode per N blocks) (default: 8)
-   --uuid value, -U value          Specify a UUID for the new volume.
-   --help, -h                      show help
-   --version, -v                   print the version
+   --size int, -s int          filesystem size in blocks (default: 0)
+   --block-size int, -b int    block size in bytes (default: 4096)
+   --inode-size int, -I int    inode size in bytes (default: 512)
+   --journal-size int, -j int  journal size in blocks (0 = auto: scale with volume size) (default: 0)
+   --label string, -L string   filesystem label (default: "BRIEFS")
+   --inode-ratio int           blocks per inode (one inode per N blocks) (default: 8)
+   --uuid string, -U string    Specify a UUID for the new volume.
+   --force, -f                 force overwrite of an existing filesystem
+   --help, -h                  show help
+   --version, -v               print the version
 ```
 
 fsck.briefs
@@ -63,22 +61,22 @@ NAME:
    fsck.briefs - Check and repair a BrieFS filesystem
 
 USAGE:
-   fsck.briefs [global options] command [command options] DEVICE
+   fsck.briefs [global options] DEVICE
 
 VERSION:
    v0.9.6
 
-COMMANDS:
-   help, h  Shows a list of commands or help for one command
-
 GLOBAL OPTIONS:
-   --verbose, -V        verbose output (default: false)
-   --repair, -r         attempt to repair found errors (default: false)
-   --repair-only value  run only selected repair phases (comma-separated: allocator,btrees,btree-rebuild,btree-orphan,extents,trie,links; default all)
-   --optimize           safe compaction only (alias for --repair --repair-only=trie,extents) (default: false)
-   --assume-yes, -y     do not ask for confirmation before modifying the volume (default: false)
-   --help, -h           show help
-   --version, -v        print the version
+   --verbose, -V             verbose output
+   --repair, -r              attempt to repair found errors
+   --repair-only string      run only selected repair phases (comma-separated: allocator,btrees,btree-rebuild,btree-orphan,extents,trie,links; default all)
+   --optimize                safe compaction only (alias for --repair --repair-only=trie,extents)
+   --assume-yes, -y          do not ask for confirmation before modifying the volume
+   --no, -n                  read-only check; do not attempt repairs (default mode, made explicit for fsck(8) -n)
+   --preen, -p               non-interactive repair; alias for --repair --assume-yes
+   --type string, -t string  filesystem type (accepted for fsck(8) compatibility; ignored)
+   --help, -h                show help
+   --version, -v             print the version
 ```
 
 fuse.briefs
@@ -112,20 +110,17 @@ NAME:
    briefs-fuse - Mount a BrieFS filesystem image via FUSE
 
 USAGE:
-   briefs-fuse [global options] command [command options]
+   briefs-fuse [global options]
 
 VERSION:
    v0.9.6
 
-COMMANDS:
-   help, h  Shows a list of commands or help for one command
-
 GLOBAL OPTIONS:
-   --image value, -i value       filesystem image file or block device
-   --mountpoint value, -m value  mount point directory
-   --debug, -d                   enable FUSE debug output (default: false)
-   --help, -h                    show help
-   --version, -v                 print the version
+   --image string, -i string       filesystem image file or block device
+   --mountpoint string, -m string  mount point directory
+   --debug, -d                     enable FUSE debug output
+   --help, -h                      show help
+   --version, -v                   print the version
 ```
 
 On-disk format codegen

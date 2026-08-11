@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -9,7 +10,7 @@ import (
 
 	"github.com/ctdk/briefs-utils/device"
 	"github.com/ctdk/briefs-utils/briefs"
-	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v3"
 )
 
 func roundUp(value, alignment uint64) uint64 {
@@ -40,22 +41,22 @@ func calculateInodeLocation(sb *briefs.Superblock, inodeNum uint64) (blockOffset
 }
 
 func main() {
-	app := &cli.App{
+	app := &cli.Command{
 		Name:     "mkfs.briefs",
 		Usage:    "Create a new BrieFS filesystem",
 		ArgsUsage: "DEVICE",
 		Version:  briefs.VersionStr,
-		Before: func(c *cli.Context) error {
+		Before: func(ctx context.Context, c *cli.Command) (context.Context, error) {
 			if c.Args().Len() < 1 {
-				return fmt.Errorf("missing required argument: DEVICE")
+				return ctx, fmt.Errorf("missing required argument: DEVICE")
 			}
 			path := c.Args().First()
 			if err := device.CheckMounted(path); err != nil {
 				// Reformatting a mounted filesystem is incredibly
 				// dangerous. Refuse to continue.
-				return fmt.Errorf("refusing to create filesystem: %w\n", err)
+				return ctx, fmt.Errorf("refusing to create filesystem: %w\n", err)
 			}
-			return nil
+			return ctx, nil
 		},
 		Flags: []cli.Flag{
 			&cli.Int64Flag{
@@ -104,7 +105,7 @@ func main() {
 				Usage:    "force overwrite of an existing filesystem",
 			},
 		},
-		Action: func(c *cli.Context) error {
+		Action: func(ctx context.Context, c *cli.Command) error {
 			path := c.Args().First()
 			totalBlocks := c.Int64("size")
 			blockSize := uint64(c.Int("block-size"))
@@ -503,7 +504,7 @@ func main() {
 		},
 	}
 
-	if err := app.Run(os.Args); err != nil {
+	if err := app.Run(context.Background(), os.Args); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
