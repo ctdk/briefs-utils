@@ -4,8 +4,9 @@ BINDIR = $(PREFIX)/bin
 # /usr/local/sbin), so the mount.fuse.briefs helper defaults to /usr/sbin;
 # override SBINDIR for packaging.
 SBINDIR ?= /usr/sbin
+MANDIR = $(PREFIX)/share/man
 
-.PHONY: all generate mkfs fsck fuse man install clean
+.PHONY: all generate mkfs fsck fuse man install install-man clean
 
 all: mkfs fsck fuse
 
@@ -33,6 +34,12 @@ install: all
 	install -m 0755 fuse.briefs $(DESTDIR)$(BINDIR)/fuse.briefs
 	install -d $(DESTDIR)$(SBINDIR)
 	install -m 0755 mount.fuse.briefs $(DESTDIR)$(SBINDIR)/mount.fuse.briefs
+
+install-man: man
+	install -d $(DESTDIR)$(MANDIR)/man8
+	install -m 0644 man/man8/mkfs.briefs.8 $(DESTDIR)$(MANDIR)/man8/mkfs.briefs.8
+	install -m 0644 man/man8/fsck.briefs.8 $(DESTDIR)$(MANDIR)/man8/fsck.briefs.8
+	install -m 0644 man/man8/fuse.briefs.8 $(DESTDIR)$(MANDIR)/man8/fuse.briefs.8
 
 clean:
 	rm -f mkfs.briefs fsck.briefs fuse.briefs
