@@ -9,9 +9,12 @@
   record and known issues.
 * The FUSE bridge should support the same mount options as the kernel module.
 * Expand xfstests coverage for BrieFS under FUSE: the replay-sensitive subset
-  (generic/003, 029, 030, 032, 321, 322, 547, 640, 475, 011) now passes under
-  FUSE (10/10). generic/547 was fixed by porting the kernel's journal replay
-  to the FUSE bridge (mount-time recovery). Broaden to the full generic group.
+  (generic/003, 029, 030, 032, 321, 322, 547, 640, 475, 011) currently gives
+  7 PASS / 2 FAIL (generic/547, 011) / 1 NOT RUN (generic/032, fiemap
+  unsupported) under the FUSE bridge. (A prior "10/10 PASS" result was invalid
+  — the harness was mounting via the kernel module, not the FUSE bridge; see
+  the correction note in xfstests-fuse-status.md.) Broaden to the full generic
+  group.
 * Port the kernel's replay trie-block reuse pool + per-directory partial-pool
   seeding (briefs_trie_seed_pool) into the FUSE replay, so crash-replay on a
   near-full filesystem reuses JRN_TRIE_ALLOC blocks instead of allocating fresh
@@ -20,4 +23,4 @@
 * [Done for xfstests] mkfs.briefs and fsck.briefs command line flags are
   sufficiently xfstests-compatible (force flag `-f`, check-only default,
   `-r -y` repair shape). Further standards alignment may be useful.
-* Make journal size configurable.
+* [Done] Make journal size configurable.
