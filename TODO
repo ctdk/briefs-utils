@@ -1,5 +1,7 @@
 * Add more filesystem options to mkfs.briefs as they become available.
-* Make man pages.
+* [Done] Make man pages.  Each command has a hidden --generate-man-page
+  flag (wired through urfave/cli-docs/v3) that writes a section-8 man page
+  to man/man8/<name>.8; `make man` regenerates all three.
 * The codebase is starting to feel a bit hairy. It could stand another round of
   refactoring.
 * [Done] The FUSE bridge is read-write (fuse-rw-work branch): full kernel

@@ -10,6 +10,7 @@ import (
 
 	"github.com/ctdk/briefs-utils/device"
 	"github.com/ctdk/briefs-utils/briefs"
+	"github.com/ctdk/briefs-utils/manpage"
 	"github.com/urfave/cli/v3"
 )
 
@@ -60,8 +61,19 @@ func main() {
 		Name:     "fsck.briefs",
 		Usage:    "Check and repair a BrieFS filesystem",
 		ArgsUsage: "DEVICE",
+		UsageText: "fsck.briefs [global options] DEVICE",
 		Version:  briefs.VersionStr,
+		HideHelpCommand: true,
+		Description: "Check and, with --repair, fix a BrieFS filesystem on " +
+			"DEVICE.  fsck.briefs verifies journal-record and B+ tree checksums, " +
+			"validates directory-trie pages, inode extended-attribute chains, " +
+			"and inode link counts, and can rebuild the allocator bitmaps and " +
+			"B+ tree extent indexes, compact directory tries, and repair link " +
+			"counts.  Repairs are phased and selectable with --repair-only.",
 		Before: func(ctx context.Context, c *cli.Command) (context.Context, error) {
+			if c.Bool("generate-man-page") {
+				return ctx, nil
+			}
 			if c.Args().Len() < 1 {
 				return ctx, fmt.Errorf("missing required argument: DEVICE")
 			}
@@ -72,6 +84,11 @@ func main() {
 			return ctx, nil
 		},
 		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:   "generate-man-page",
+				Hidden: true,
+				Usage:  "write the section-8 man page to man/man8/fsck.briefs.8 and exit",
+			},
 			&cli.BoolFlag{
 				Name:    "verbose",
 				Aliases: []string{"V"},
@@ -115,6 +132,14 @@ func main() {
 			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
+			if c.Bool("generate-man-page") {
+				wrote, err := manpage.Generate(c, "man/man8")
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(os.Stderr, "wrote %s\n", wrote)
+				return nil
+			}
 			path := c.Args().First()
 			repair := c.Bool("repair")
 			repairOnly := c.String("repair-only")

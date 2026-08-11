@@ -10,6 +10,7 @@ import (
 
 	"github.com/ctdk/briefs-utils/device"
 	"github.com/ctdk/briefs-utils/briefs"
+	"github.com/ctdk/briefs-utils/manpage"
 	"github.com/urfave/cli/v3"
 )
 
@@ -45,8 +46,19 @@ func main() {
 		Name:     "mkfs.briefs",
 		Usage:    "Create a new BrieFS filesystem",
 		ArgsUsage: "DEVICE",
+		UsageText: "mkfs.briefs [global options] DEVICE",
 		Version:  briefs.VersionStr,
+		HideHelpCommand: true,
+		Description: "Create a new BrieFS filesystem on DEVICE.  BrieFS is an " +
+			"extents-and-tries Linux filesystem.  mkfs.briefs writes the on-disk " +
+			"v0.9.0 format: a packed directory-trie layout, a B+ tree extent " +
+			"index for files with more than eight extents, and a user_flags " +
+			"inode field exposing chattr/lsattr flags (sync, dirsync, immutable, " +
+			"append-only, nodump, noatime).",
 		Before: func(ctx context.Context, c *cli.Command) (context.Context, error) {
+			if c.Bool("generate-man-page") {
+				return ctx, nil
+			}
 			if c.Args().Len() < 1 {
 				return ctx, fmt.Errorf("missing required argument: DEVICE")
 			}
@@ -59,6 +71,11 @@ func main() {
 			return ctx, nil
 		},
 		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:   "generate-man-page",
+				Hidden: true,
+				Usage:  "write the section-8 man page to man/man8/mkfs.briefs.8 and exit",
+			},
 			&cli.Int64Flag{
 				Name:     "size",
 				Aliases:  []string{"s"},
@@ -106,6 +123,14 @@ func main() {
 			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
+			if c.Bool("generate-man-page") {
+				wrote, err := manpage.Generate(c, "man/man8")
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(os.Stderr, "wrote %s\n", wrote)
+				return nil
+			}
 			path := c.Args().First()
 			totalBlocks := c.Int64("size")
 			blockSize := uint64(c.Int("block-size"))

@@ -24,6 +24,9 @@ USAGE:
 VERSION:
    v0.9.6
 
+DESCRIPTION:
+   Create a new BrieFS filesystem on DEVICE.  BrieFS is an extents-and-tries Linux filesystem.  mkfs.briefs writes the on-disk v0.9.0 format: a packed directory-trie layout, a B+ tree extent index for files with more than eight extents, and a user_flags inode field exposing chattr/lsattr flags (sync, dirsync, immutable, append-only, nodump, noatime).
+
 GLOBAL OPTIONS:
    --size int, -s int          filesystem size in blocks (default: 0)
    --block-size int, -b int    block size in bytes (default: 4096)
@@ -66,6 +69,9 @@ USAGE:
 VERSION:
    v0.9.6
 
+DESCRIPTION:
+   Check and, with --repair, fix a BrieFS filesystem on DEVICE.  fsck.briefs verifies journal-record and B+ tree checksums, validates directory-trie pages, inode extended-attribute chains, and inode link counts, and can rebuild the allocator bitmaps and B+ tree extent indexes, compact directory tries, and repair link counts.  Repairs are phased and selectable with --repair-only.
+
 GLOBAL OPTIONS:
    --verbose, -V             verbose output
    --repair, -r              attempt to repair found errors
@@ -107,13 +113,16 @@ pure userspace mount; the BrieFS kernel module need not be loaded.)
 
 ```
 NAME:
-   briefs-fuse - Mount a BrieFS filesystem image via FUSE
+   fuse.briefs - Mount a BrieFS filesystem image via FUSE
 
 USAGE:
-   briefs-fuse [global options]
+   fuse.briefs [global options]
 
 VERSION:
    v0.9.6
+
+DESCRIPTION:
+   Mount a BrieFS filesystem image as a FUSE filesystem.  The bridge is read-write with full kernel parity: all directory and file operations, extended attributes, chattr/fileattr, renameat2 (EXCHANGE/WHITEOUT), fallocate, setattr, and killpriv.  It ports the kernel journal to Go and replays it on mount, so FUSE-written volumes are crash-consistent and kernel-mountable.  The bridge is experimental; see xfstests-fuse-status.md for the xfstests pass/fail record.
 
 GLOBAL OPTIONS:
    --image string, -i string       filesystem image file or block device

@@ -5,7 +5,7 @@ BINDIR = $(PREFIX)/bin
 # override SBINDIR for packaging.
 SBINDIR ?= /usr/sbin
 
-.PHONY: all generate mkfs fsck fuse install clean
+.PHONY: all generate mkfs fsck fuse man install clean
 
 all: mkfs fsck fuse
 
@@ -20,6 +20,11 @@ fsck: generate cmd/fsck/fsck.go
 
 fuse: generate cmd/fuse/fuse.go
 	go build -o fuse.briefs ./cmd/fuse
+
+man: all
+	./mkfs.briefs --generate-man-page
+	./fsck.briefs --generate-man-page
+	./fuse.briefs --generate-man-page
 
 install: all
 	install -d $(DESTDIR)$(BINDIR)
