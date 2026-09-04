@@ -51,7 +51,7 @@ func compactDirectoryTries(fs *fsckState, plan *repairPlan, blockSize uint64) er
 			return fmt.Errorf("ino %d: collect directory entries: %w", d.ino, err)
 		}
 
-		oldBlocks, err := collectDirectoryTrieBlocks(fs, d.ino, d.trieRoot, blockSize)
+		oldBlocks, err := collectDirectoryTrieBlocks(fs, d.trieRoot, blockSize)
 		if err != nil {
 			return fmt.Errorf("ino %d: collect old trie blocks: %w", d.ino, err)
 		}
