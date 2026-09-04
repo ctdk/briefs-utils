@@ -5,11 +5,13 @@
 // 3-level free-block bitmap pyramid but differ in everything around it. This
 // file holds only the divergence-free bit math they share — clear/set an L2
 // bit, propagate the change up through the L1/L0 summary words, test a bit,
-// and compute the per-level word counts — so the two consumers cannot drift on
-// the core invariant. The divergent search (AllocBlock's stale-summary repair
-// vs AllocateBlock's plain scan), FreeBlock/Sync, and mutex/dirty handling
-// stay on their respective types.
+// pack words into on-disk blocks, and compute the per-level word counts — so
+// the two consumers cannot drift on the core invariant. The divergent search
+// (AllocBlock's stale-summary repair vs AllocateBlock's plain scan),
+// FreeBlock/Sync, and mutex/dirty handling stay on their respective types.
 package briefs
+
+import "encoding/binary"
 
 // AllocMarkAllocated clears the L2 bit for relBlock, decrementing *freeCount,
 // and propagates a now-empty word up through the L1 and L0 summaries. It is
@@ -77,6 +79,30 @@ func AllocMarkFree(l0, l1, l2 []uint64, freeCount *uint64, blockCount, relBlock 
 		}
 	}
 	return true
+}
+
+// PackAllocWords packs 64-bit allocator words into little-endian blocks of
+// blockSize bytes, zero-padding the tail of the last block. It is the shared
+// on-disk packer behind AllocBuilder.packWords (whole pool images for
+// mkfs/fsck) and the FUSE Allocator's Sync (one pyramid level at a time);
+// the matching unpack loop lives in ReadAllocatorHeader. An empty word
+// list packs to no blocks.
+func PackAllocWords(words []uint64, blockSize uint64) [][]byte {
+	wordsPerBlock := blockSize / 8
+	nBlocks := (uint64(len(words)) + wordsPerBlock - 1) / wordsPerBlock
+	blocks := make([][]byte, nBlocks)
+	for i := uint64(0); i < nBlocks; i++ {
+		buf := make([]byte, blockSize)
+		n := wordsPerBlock
+		if start := i * wordsPerBlock; start+n > uint64(len(words)) {
+			n = uint64(len(words)) - start
+		}
+		for j := uint64(0); j < n; j++ {
+			binary.LittleEndian.PutUint64(buf[j*8:], words[i*wordsPerBlock+j])
+		}
+		blocks[i] = buf
+	}
+	return blocks
 }
 
 // AllocIsAllocated reports whether relBlock is marked allocated (its L2 bit is

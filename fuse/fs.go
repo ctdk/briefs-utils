@@ -2,7 +2,6 @@
 package fuse
 
 import (
-	"encoding/binary"
 	"fmt"
 	"math/bits"
 	"sync"
@@ -24,8 +23,6 @@ type Allocator struct {
 	l0, l1, l2       []uint64
 	dirty            bool
 }
-
-const wordsPerBlock = 4096 / 8 // 512
 
 // OpenAllocator reads the allocator pool from disk and initializes the in-memory bitmap.
 func OpenAllocator(dev *BlockDevice, poolStart uint64) (*Allocator, error) {
@@ -190,22 +187,18 @@ func (a *Allocator) Sync() error {
 
 	blockSize := a.dev.BlockSize()
 
-	l0Blocks := (a.l0Words + wordsPerBlock - 1) / wordsPerBlock
-	l1Blocks := (a.l1Words + wordsPerBlock - 1) / wordsPerBlock
+	// The position advance must match the block count PackAllocWords
+	// produces for the same level (blockSize-based, like the packer).
+	wpb := blockSize / 8
+	l0Blocks := (a.l0Words + wpb - 1) / wpb
+	l1Blocks := (a.l1Words + wpb - 1) / wpb
 
 	writeDirty := func(offset uint64, words []uint64, nWords uint64) error {
-		nBlks := (nWords + wordsPerBlock - 1) / wordsPerBlock
-		for i := uint64(0); i < nBlks; i++ {
-			buf := make([]byte, blockSize)
-			start := i * wordsPerBlock
-			n := nWords - start
-			if n > wordsPerBlock {
-				n = wordsPerBlock
-			}
-			for j := uint64(0); j < n; j++ {
-				binary.LittleEndian.PutUint64(buf[j*8:], words[start+j])
-			}
-			if err := a.dev.WriteBlock(offset+i, buf); err != nil {
+		if nWords > uint64(len(words)) {
+			nWords = uint64(len(words))
+		}
+		for i, buf := range briefs.PackAllocWords(words[:nWords], blockSize) {
+			if err := a.dev.WriteBlock(offset+uint64(i), buf); err != nil {
 				return err
 			}
 		}

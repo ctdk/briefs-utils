@@ -1,6 +1,7 @@
 package briefs
 
 import (
+	"encoding/binary"
 	"math/rand"
 	"testing"
 )
@@ -94,5 +95,59 @@ func TestAllocLevelWords(t *testing.T) {
 			t.Fatalf("allocLevelWords(%d): got (%d,%d,%d), want (%d,%d,%d)",
 				c.blockCount, l0, l1, l2, c.l0, c.l1, c.l2)
 		}
+	}
+}
+// TestPackAllocWords pins the shared word packer: block count, little-endian
+// layout, and zero padding of the tail block. Both AllocBuilder.packWords
+// (whole pool images) and the FUSE Allocator's Sync (single levels) round-trip
+// through this, so the byte layout is the on-disk allocator format.
+func TestPackAllocWords(t *testing.T) {
+	words := make([]uint64, 1030) // 2 full blocks of 512 + a 6-word tail
+	for i := range words {
+		words[i] = uint64(i)*0x0101010101010101 + 7
+	}
+
+	blocks := PackAllocWords(words, 4096)
+	if len(blocks) != 3 {
+		t.Fatalf("packed %d blocks, want 3 (2 full + 1 tail)", len(blocks))
+	}
+	for i, buf := range blocks {
+		if len(buf) != 4096 {
+			t.Fatalf("block %d is %d bytes, want 4096", i, len(buf))
+		}
+	}
+	// Full blocks: word j sits at byte j*8, little-endian.
+	for j := 0; j < 512; j++ {
+		if got := binary.LittleEndian.Uint64(blocks[0][j*8:]); got != words[j] {
+			t.Fatalf("block 0 word %d = %#x, want %#x", j, got, words[j])
+		}
+		if got := binary.LittleEndian.Uint64(blocks[1][j*8:]); got != words[512+j] {
+			t.Fatalf("block 1 word %d = %#x, want %#x", j, got, words[512+j])
+		}
+	}
+	// Tail block: 6 words then zero padding.
+	for j := 0; j < 6; j++ {
+		if got := binary.LittleEndian.Uint64(blocks[2][j*8:]); got != words[1024+j] {
+			t.Fatalf("tail word %d = %#x, want %#x", j, got, words[1024+j])
+		}
+	}
+	for k, b := range blocks[2][48:64] {
+		if b != 0 {
+			t.Fatalf("tail padding byte %d = %#x, want zero", 48+k, b)
+		}
+	}
+
+	// Empty word list packs to no blocks, at any block size.
+	if got := PackAllocWords(nil, 512); len(got) != 0 {
+		t.Errorf("PackAllocWords(nil) = %v, want no blocks", got)
+	}
+	// Block size other than 4096: wordsPerBlock follows the block size
+	// (64 words per 512-byte block).
+	b512 := PackAllocWords(words[:70], 512)
+	if len(b512) != 2 || len(b512[0]) != 512 {
+		t.Fatalf("512-byte packing: %d blocks of len %d, want 2 blocks of 512", len(b512), len(b512[0]))
+	}
+	if got := binary.LittleEndian.Uint64(b512[0][0:]); got != words[0] {
+		t.Errorf("512-byte packing word 0 = %#x, want %#x", got, words[0])
 	}
 }

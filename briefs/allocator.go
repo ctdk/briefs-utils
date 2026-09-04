@@ -218,17 +218,8 @@ func (b *AllocBuilder) WriteBlocks() [][]byte {
 }
 
 func (b *AllocBuilder) packWords(blocks [][]byte, words []uint64, startBlock uint64) {
-	wordsPerBlock := uint64(4096 / 8) // 512
-	for i := uint64(0); i < uint64(len(words)); i += wordsPerBlock {
-		end := i + wordsPerBlock
-		if end > uint64(len(words)) {
-			end = uint64(len(words))
-		}
-		buf := make([]byte, 4096)
-		for j := i; j < end; j++ {
-			binary.LittleEndian.PutUint64(buf[(j-i)*8:], words[j])
-		}
-		blocks[startBlock+i/wordsPerBlock] = buf
+	for i, buf := range PackAllocWords(words, 4096) {
+		blocks[startBlock+uint64(i)] = buf
 	}
 }
 
