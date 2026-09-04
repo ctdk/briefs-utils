@@ -194,6 +194,21 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 				if in.IsFile() && in.FileSize > 0 && in.NumExtentsTotal == 0 && in.Flags&briefs.InodeFlagInlineData == 0 {
 					fs.warnf("ino %d: file with size %d but no extents (not inline)", ino, in.FileSize)
 				}
+				// Unknown user_flags bits: the kernel stores the UAPI FS_*_FL
+				// values verbatim and masks writes to BRIEFS_USER_FLAG_ALL
+				// (briefs.h:391), so bits outside that mask cannot have been
+				// written by the kernel. A later chattr would silently drop
+				// them; report them so the divergence is visible.
+				if unknown := in.UserFlags &^ briefs.UserFlagAll; unknown != 0 {
+					fs.warnf("ino %d: user_flags 0x%08X has unknown bits 0x%08X", ino, in.UserFlags, unknown)
+				}
+				// Generation must fit a u32: the kernel stamps
+				// get_random_u32() and reads i_generation back as (u32),
+				// so upper bits would be silently truncated — weakening the
+				// NFS file-handle check and the 536 replay guard.
+				if in.Generation > 0xFFFFFFFF {
+					fs.warnf("ino %d: generation %d does not fit the kernel's 32-bit i_generation", ino, in.Generation)
+				}
 			}
 			ino++
 		}

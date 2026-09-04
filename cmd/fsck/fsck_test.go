@@ -1989,7 +1989,9 @@ func TestFsckRepairBtreeChecksums(t *testing.T) {
 	t.Run("torn_leaf_checksum_fixed", func(t *testing.T) {
 		imgPath := prepareBtree2Fixture(t)
 
-		// Zero leaf0's checksum field -> torn CRC, structure intact. btreeWalk
+		// Store a WRONG non-zero checksum on leaf0 -> torn CRC, structure intact.
+		// (A zero checksum is legacy and always verifies, matching the kernel's
+		// briefs_verify_chain_checksum, so it must NOT count as torn.) btreeWalk
 		// fails on the bad checksum -> failedBtreeInos{2}. --repair-only=btrees
 		// (RebuildAllocator=false) bypasses the Phase 1 guard and runs the CRC
 		// repair.
@@ -2001,7 +2003,7 @@ func TestFsckRepairBtreeChecksums(t *testing.T) {
 		if _, err := f.ReadAt(buf, int64(210*4096)); err != nil {
 			t.Fatalf("read leaf0: %v", err)
 		}
-		binary.LittleEndian.PutUint64(buf[briefs.BtreeChecksumOffset:], 0)
+		binary.LittleEndian.PutUint64(buf[briefs.BtreeChecksumOffset:], 0xDEADBEEF)
 		if _, err := f.WriteAt(buf, int64(210*4096)); err != nil {
 			t.Fatalf("write leaf0: %v", err)
 		}

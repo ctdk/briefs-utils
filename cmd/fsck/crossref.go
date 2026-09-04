@@ -299,41 +299,49 @@ func verifyExtentOverlaps(fs *fsckState) {
 		}
 	}
 
+	// Metadata regions an extent must not touch. Bounds come from the
+	// superblock (and, for the inode table, the inode allocator header) —
+	// NOT from the number of inodes found during the scan: an extent
+	// squatting in the tail of the inode table beyond the last in-use slot
+	// would otherwise go unflagged.
+	type region struct {
+		name  string
+		start uint64
+		end   uint64
+	}
+	regions := []region{
+		{"superblock", 0, 1},
+		{"inode bitmap", fs.sb.InodeBMOffset, fs.sb.InodeBMOffset + fs.sb.InodeBMBlocks},
+		{"extent allocation table", fs.sb.EATOffset, fs.sb.EATOffset + fs.sb.EATBlocks},
+		{"trie node pool / allocator pool", fs.sb.TrieNodePoolStart, fs.sb.TrieNodePoolStart + fs.sb.TrieNodePoolSize},
+		{"journal", fs.sb.JournalOffset, fs.sb.JournalOffset + fs.sb.JournalBlocks},
+	}
+	// Inode table: capacity from the inode allocator header (BlockCount is
+	// the number of inode slots the table was built for), the same bound
+	// verifyInodeTable scans with.
+	itStart := fs.sb.InodeTableOffset
+	itEnd := itStart
+	if hdr, err := briefs.ReadAllocatorHeader(fs.file, fs.sb.InodeBMOffset, fs.sb.BlockSize); err == nil {
+		itEnd = itStart + (hdr.BlockCount*fs.sb.InodeSize+fs.sb.BlockSize-1)/fs.sb.BlockSize
+	}
+	regions = append(regions, region{"inode table", itStart, itEnd})
+
 	overlaps := 0
 	for i := 0; i < len(allExtents); i++ {
 		ei := allExtents[i]
 		eiEnd := ei.phys + ei.len
 
-		// Check against metadata regions
-		// Superblock: block 0
-		if ei.phys == 0 || (ei.phys < 1 && eiEnd > 0) {
-			if overlaps < 20 {
-				fs.errorf("ino %d: extent at phys=%d len=%d overlaps with superblock (block 0)",
-					ei.ino, ei.phys, ei.len)
+		for _, r := range regions {
+			if r.end <= r.start {
+				continue // degenerate/unknown bound: nothing to check
 			}
-			overlaps++
-		}
-
-		// Check against journal
-		journalStart := fs.sb.JournalOffset
-		journalEnd := journalStart + fs.sb.JournalBlocks
-		if ei.phys < journalEnd && eiEnd > journalStart {
-			if overlaps < 20 {
-				fs.errorf("ino %d: extent at phys=%d len=%d overlaps with journal (blocks %d-%d)",
-					ei.ino, ei.phys, ei.len, journalStart, journalEnd-1)
+			if ei.phys < r.end && eiEnd > r.start {
+				if overlaps < 20 {
+					fs.errorf("ino %d: extent at phys=%d len=%d overlaps with %s (blocks %d-%d)",
+						ei.ino, ei.phys, ei.len, r.name, r.start, r.end-1)
+				}
+				overlaps++
 			}
-			overlaps++
-		}
-
-		// Check against inode table
-		itStart := fs.sb.InodeTableOffset
-		itEnd := itStart + (uint64(len(fs.inodes))*fs.sb.InodeSize+fs.sb.BlockSize-1)/fs.sb.BlockSize
-		if ei.phys < itEnd && eiEnd > itStart {
-			if overlaps < 20 {
-				fs.errorf("ino %d: extent at phys=%d len=%d overlaps with inode table (blocks %d-%d)",
-					ei.ino, ei.phys, ei.len, itStart, itEnd-1)
-			}
-			overlaps++
 		}
 
 		// Check against other extents

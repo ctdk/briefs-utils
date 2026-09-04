@@ -116,15 +116,23 @@ func (s *btreeVerifyState) visitNode(info briefs.BtreeNodeInfo) error {
 			info.Block, briefs.ErrBtreeBadChild, hdr.Level, info.ExpectedLevel)
 	}
 
-	// Separator high_keys must be strictly ascending and > 0. Separators are
-	// real extent offsets (the first offset of each right sibling), so a
-	// non-ascending or zero separator is corruption.
+	// Separator high_keys must be strictly ascending. Separators are real
+	// extent offsets (the first offset of each right sibling), so a
+	// non-ascending separator is corruption. A high_key of 0 is documented
+	// on disk as +inf for the rightmost separator (kernel briefs.h struct
+	// briefs_btree_idx_entry: "0 => +inf (rightmost)"), so it is accepted as
+	// the final entry, ending the ascending chain; anywhere else it is a
+	// fault (the kernel's lookup compares key < high_key, so a mid-array
+	// zero separator makes that child unreachable).
 	var prevHigh uint64
 	for i := uint16(0); i < hdr.NumKeys; i++ {
 		e := briefs.ReadBtreeIdxEntry(info.Buf, int(i))
 		if e.HighKey == 0 {
-			return fmt.Errorf("btree node %d: %w (idx[%d].high_key=0; separators must be > 0)",
-				info.Block, briefs.ErrBtreeBadHighKey, i)
+			if i != hdr.NumKeys-1 {
+				return fmt.Errorf("btree node %d: %w (idx[%d].high_key=0 before the last separator; +inf is only valid rightmost)",
+					info.Block, briefs.ErrBtreeBadHighKey, i)
+			}
+			break // +inf rightmost separator; ascending chain ends here
 		}
 		if i > 0 && e.HighKey <= prevHigh {
 			return fmt.Errorf("btree node %d: %w (idx[%d].high_key=%d after %d)",

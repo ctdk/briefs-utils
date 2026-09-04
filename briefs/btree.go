@@ -168,15 +168,19 @@ func WriteBtreeNode(file *os.File, block, blockSize uint64, buf []byte) error {
 	return err
 }
 
-// VerifyBtreeNodeChecksum checks a B-tree node's checksum (no legacy zero
-// exemption: a B-tree node always carries a real checksum). Returns nil if OK.
+// VerifyBtreeNodeChecksum checks a B-tree node's checksum.  A stored
+// checksum of 0 is treated as legacy (no checksum) and always verifies,
+// matching the kernel's briefs_verify_chain_checksum (briefs.h:631-638),
+// which the B-tree read path uses verbatim (btree.c:145) — the same
+// exemption the xattr block path keeps (VerifyChainChecksum).  A non-zero
+// stored value that does not match is a real fault. Returns nil if OK.
 func VerifyBtreeNodeChecksum(buf []byte, blockSize uint64) error {
 	if uint64(len(buf)) < blockSize || blockSize < BtreeChecksumOffset {
 		return ErrBtreeChecksum
 	}
 	stored := ReadChainChecksum(buf, blockSize)
 	if stored == 0 {
-		return ErrBtreeChecksum
+		return nil // legacy block with no checksum
 	}
 	if stored != ComputeChainChecksum(buf, blockSize) {
 		return ErrBtreeChecksum

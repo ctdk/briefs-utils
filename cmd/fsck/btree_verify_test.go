@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -131,6 +132,90 @@ func TestVerifyBtreeStructuresBadHighKey(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected ErrBtreeBadHighKey from zero separator, got nil")
+	}
+}
+
+// TestVerifyBtreeNodeChecksumZeroLegacy pins the kernel-parity legacy
+// exemption: a stored checksum of 0 verifies (briefs_verify_chain_checksum,
+// briefs.h:631-638, used verbatim by the kernel's B-tree read path,
+// btree.c:145) while a wrong non-zero checksum is a real fault.  The zero
+// case is also exercised end-to-end through the leaf extent walk below.
+func TestVerifyBtreeNodeChecksumZeroLegacy(t *testing.T) {
+	const blockSize = uint64(4096)
+	f, _, leafBlocks, _ := buildMultiLevelTree(t)
+
+	buf := make([]byte, blockSize)
+	if _, err := f.ReadAt(buf, int64(leafBlocks[0]*blockSize)); err != nil {
+		t.Fatalf("read leaf0: %v", err)
+	}
+	if err := briefs.VerifyBtreeNodeChecksum(buf, blockSize); err != nil {
+		t.Fatalf("healthy leaf: %v", err)
+	}
+	binary.LittleEndian.PutUint64(buf[briefs.BtreeChecksumOffset:], 0)
+	if err := briefs.VerifyBtreeNodeChecksum(buf, blockSize); err != nil {
+		t.Fatalf("zero checksum must verify as legacy: %v", err)
+	}
+	binary.LittleEndian.PutUint64(buf[briefs.BtreeChecksumOffset:], 0xDEADBEEF)
+	if err := briefs.VerifyBtreeNodeChecksum(buf, blockSize); err == nil {
+		t.Fatal("wrong non-zero checksum must not verify")
+	}
+
+	// The extent walk (VerifyCRC path) accepts the zero-checksum node the
+	// same way the kernel accepts it.
+	binary.LittleEndian.PutUint64(buf[briefs.BtreeChecksumOffset:], 0)
+	if _, err := f.WriteAt(buf, int64(leafBlocks[0]*blockSize)); err != nil {
+		t.Fatalf("write leaf0: %v", err)
+	}
+	if err := briefs.WalkBtree(f, leafBlocks[0], briefs.BtreeWalkOptions{
+		BlockSize:        blockSize,
+		VerifyCRC:        true,
+		NullChildIsFault: true,
+	}, briefs.BtreeNodeVisitor{}); err != nil {
+		t.Fatalf("walk with legacy zero checksum: %v", err)
+	}
+}
+
+// TestVerifyBtreeStructuresHighKeyInfinity pins the documented high_key==0
+// convention (kernel briefs.h struct briefs_btree_idx_entry: "0 => +inf
+// (rightmost)"): the final separator may be +inf, a mid-array zero separator
+// is still a fault (TestVerifyBtreeStructuresBadHighKey covers that one).
+func TestVerifyBtreeStructuresHighKeyInfinity(t *testing.T) {
+	const blockSize = uint64(4096)
+	f, root, _, idxBlocks := buildMultiLevelTree(t)
+
+	// The idx root has 2 separators (3 leaves); zero the LAST one's HighKey
+	// (idx entry i: child at +0, high_key at +8).
+	idxRoot := idxBlocks[0]
+	buf := make([]byte, blockSize)
+	if _, err := f.ReadAt(buf, int64(idxRoot*blockSize)); err != nil {
+		t.Fatalf("read idx root: %v", err)
+	}
+	off := briefs.BtreeHeaderSize + 1*16 + 8
+	binary.LittleEndian.PutUint64(buf[off:], 0)
+	// Recompute the checksum so the structural accept/reject is the only
+	// thing under test.
+	briefs.SetBtreeNodeChecksum(buf, blockSize)
+	if _, err := f.WriteAt(buf, int64(idxRoot*blockSize)); err != nil {
+		t.Fatalf("write idx root: %v", err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	s := &btreeVerifyState{}
+	err := briefs.WalkBtree(f, root, briefs.BtreeWalkOptions{
+		BlockSize:        blockSize,
+		VerifyCRC:        true,
+		NullChildIsFault: true,
+	}, briefs.BtreeNodeVisitor{
+		VisitNode: s.visitNode,
+		VisitLeaf: s.visitLeaf,
+	})
+	if err != nil {
+		t.Fatalf("rightmost +inf separator must verify: %v", err)
+	}
+	if s.count != 300 {
+		t.Fatalf("extent tally: got %d, want 300", s.count)
 	}
 }
 

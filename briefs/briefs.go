@@ -104,6 +104,20 @@ const (
 	InodeFlagIndexed     = 0x00000004
 	InodeFlagInlineData  = 0x00000008
 
+	// User-visible inode flags stored in disk_inode.user_flags — mirrors
+	// the kernel's BRIEFS_USER_FLAG_* (briefs.h:383-393), which are the UAPI
+	// FS_*_FL values stored verbatim (so chattr/lsattr see them without
+	// translation). Fuse's fileattr layer keeps FS_*_FL-named aliases for
+	// the ioctl paths; the values are pinned here as the on-disk truth.
+	UserFlagSync      uint32 = 0x00000008 // FS_SYNC_FL
+	UserFlagImmutable uint32 = 0x00000010 // FS_IMMUTABLE_FL
+	UserFlagAppend    uint32 = 0x00000020 // FS_APPEND_FL
+	UserFlagNodump    uint32 = 0x00000040 // FS_NODUMP_FL
+	UserFlagNoatime   uint32 = 0x00000080 // FS_NOATIME_FL
+	UserFlagDirsync   uint32 = 0x00010000 // FS_DIRSYNC_FL
+	UserFlagAll       uint32 = UserFlagSync | UserFlagImmutable | UserFlagAppend |
+		UserFlagNodump | UserFlagNoatime | UserFlagDirsync
+
 	// Extent flags — mirrors briefs.h BRIEFS_EXT_*.
 	// A hole is indicated by Phys == 0, not by a flag.  BRIEFS_EXT_UNWRITTEN
 	// marks fallocate()-allocated extents that have not yet been written to;

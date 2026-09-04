@@ -22,14 +22,17 @@ import (
 )
 
 // FS_*_FL user flags (include/uapi/linux/fs.h), stored verbatim in UserFlags.
+// The values are pinned in the briefs package (UserFlag*, mirroring the
+// kernel's BRIEFS_USER_FLAG_*, briefs.h:383-393); these UAPI-named aliases
+// carry the individual bits for the ioctl decode paths.
 const (
-	fsSyncFl      uint32 = 0x00000008
-	fsImmutableFl uint32 = 0x00000010
-	fsAppendFl    uint32 = 0x00000020
-	fsNodumpFl    uint32 = 0x00000040
-	fsNoatimeFl   uint32 = 0x00000080
-	fsDirsyncFl   uint32 = 0x00010000
-	fsCommonFl            = fsSyncFl | fsImmutableFl | fsAppendFl | fsNodumpFl | fsNoatimeFl | fsDirsyncFl
+	fsSyncFl      uint32 = briefs.UserFlagSync
+	fsImmutableFl uint32 = briefs.UserFlagImmutable
+	fsAppendFl    uint32 = briefs.UserFlagAppend
+	fsNodumpFl    uint32 = briefs.UserFlagNodump
+	fsNoatimeFl   uint32 = briefs.UserFlagNoatime
+	fsDirsyncFl   uint32 = briefs.UserFlagDirsync
+	fsCommonFl           = briefs.UserFlagAll
 )
 
 // FS_XFLAG_* (struct fsxattr.fsx_xflags). Note these differ from FS_*_FL.
