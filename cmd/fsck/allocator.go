@@ -170,12 +170,12 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize, sbExpectedFree u
 }
 
 // readAllocatorL2 reads the L2 bitmap words from an allocator pool.
-func readAllocatorL2(file *os.File, poolBlock, blockSize uint64) (l2 []uint64, l2w uint64, blockCount uint64, err error) {
+func readAllocatorL2(file *os.File, poolBlock, blockSize uint64) (l2 []uint64, blockCount uint64, err error) {
 	_, _, l2, hdr, err := briefs.ReadAllocatorBitmap(file, poolBlock, blockSize)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, 0, err
 	}
-	return l2, hdr.L2Words, hdr.BlockCount, nil
+	return l2, hdr.BlockCount, nil
 }
 
 // verifyInodeBitmapCrossReference checks that every allocated inode bitmap slot
@@ -191,7 +191,7 @@ func verifyInodeBitmapCrossReference(fs *fsckState, blockSize, inodeSize uint64)
 	inodeTableStart := fs.sb.InodeTableOffset
 	inodesPerBlock := blockSize / inodeSize
 
-	l2, _, blockCount, err := readAllocatorL2(fs.file, fs.sb.InodeBMOffset, blockSize)
+	l2, blockCount, err := readAllocatorL2(fs.file, fs.sb.InodeBMOffset, blockSize)
 	if err != nil {
 		fs.errorf("inode bitmap cross-ref: %v", err)
 		return
@@ -215,9 +215,7 @@ func verifyInodeBitmapCrossReference(fs *fsckState, blockSize, inodeSize uint64)
 			offset := j * inodeSize
 			magic := binary.LittleEndian.Uint64(buf[offset+bytesPerWord:])
 
-			w := (ino - 1) / wordBits
-			b := (ino - 1) % wordBits
-			allocated := w < uint64(len(l2)) && (l2[w]&(1<<b)) == 0
+			allocated := briefs.AllocIsAllocated(l2, blockCount, ino-1)
 
 			hasMagic := magic == briefs.MagicInode
 
@@ -257,10 +255,8 @@ func verifySuperblockFreeCounts(fs *fsckState, totalInodesFound int) {
 	}
 
 	// Cross-check: total inodes = (blockCount - inodeFree), should be totalInodesFound
-	inodeHeader := make([]byte, fs.sb.BlockSize)
-	if _, err := fs.file.ReadAt(inodeHeader, int64(fs.sb.InodeBMOffset*fs.sb.BlockSize)); err == nil {
-		inodeBlockCount := binary.LittleEndian.Uint64(inodeHeader[32:])
-		expectedInodes := int(inodeBlockCount - inodeFree)
+	if inoHdr, err := briefs.ReadAllocatorHeader(fs.file, fs.sb.InodeBMOffset, fs.sb.BlockSize); err == nil {
+		expectedInodes := int(inoHdr.BlockCount - inodeFree)
 		if expectedInodes != totalInodesFound {
 			fs.errorf("inode count mismatch: bitmap says %d in-use, inode table scan found %d",
 				expectedInodes, totalInodesFound)

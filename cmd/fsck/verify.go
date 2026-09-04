@@ -1,9 +1,10 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
+
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 // runVerificationPass runs the read-only checks and populates fsckState.
@@ -34,14 +35,10 @@ func runVerificationPass(fs *fsckState, blockSize, inodeSize uint64) int {
 	// 3. Inode table
 	inodeTableStart := sb.InodeTableOffset
 	var inodeTableBlocks uint64
-	{
-		inodeHeader := make([]byte, blockSize)
-		if _, err := file.ReadAt(inodeHeader, int64(sb.InodeBMOffset*blockSize)); err != nil {
-			fs.errorf("read inode allocator header: %v", err)
-		} else {
-			numInodes := binary.LittleEndian.Uint64(inodeHeader[32:])
-			inodeTableBlocks = (numInodes*sb.InodeSize + blockSize - 1) / blockSize
-		}
+	if inoHdr, err := briefs.ReadAllocatorHeader(file, sb.InodeBMOffset, blockSize); err != nil {
+		fs.errorf("read inode allocator header: %v", err)
+	} else {
+		inodeTableBlocks = (inoHdr.BlockCount*sb.InodeSize + blockSize - 1) / blockSize
 	}
 	fmt.Fprintf(os.Stderr, "\nInode table:\n")
 	fmt.Fprintf(os.Stderr, "  start block: %d\n", inodeTableStart)

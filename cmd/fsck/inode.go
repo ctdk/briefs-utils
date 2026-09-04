@@ -117,7 +117,7 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 	// pass still flags an allocated slot whose magic is missing/invalid.  If
 	// the bitmap read fails, fall back to the legacy behavior of validating
 	// every non-zero-magic slot.
-	l2, _, _, bitmapErr := readAllocatorL2(fs.file, fs.sb.InodeBMOffset, blockSize)
+	l2, bitmapBlockCount, bitmapErr := readAllocatorL2(fs.file, fs.sb.InodeBMOffset, blockSize)
 	haveBitmap := bitmapErr == nil
 	if !haveBitmap {
 		fs.errorf("read inode bitmap for table scan: %v (will scan all slots)", bitmapErr)
@@ -136,13 +136,9 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 
 			// Skip slots the inode bitmap marks free.  "allocated" mirrors
 			// verifyInodeBitmapCrossReference: bit clear in the L2 word.
-			if haveBitmap {
-				w := (ino - 1) / wordBits
-				b := (ino - 1) % wordBits
-				if w >= uint64(len(l2)) || (l2[w]&(1<<b)) != 0 {
-					ino++
-					continue
-				}
+			if haveBitmap && !briefs.AllocIsAllocated(l2, bitmapBlockCount, ino-1) {
+				ino++
+				continue
 			}
 
 			magic := binary.LittleEndian.Uint64(buf[offset+8:])

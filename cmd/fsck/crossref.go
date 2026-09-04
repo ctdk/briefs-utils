@@ -17,7 +17,7 @@ import (
 func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 	dataRegionStart := fs.sb.TrieNodePoolStart + fs.sb.TrieNodePoolSize
 
-	l2, dataL2w, dataBlockCount, err := readAllocatorL2(fs.file, fs.sb.TrieNodePoolStart, blockSize)
+	l2, dataBlockCount, err := readAllocatorL2(fs.file, fs.sb.TrieNodePoolStart, blockSize)
 	if err != nil {
 		fs.errorf("block cross-ref: %v", err)
 		return
@@ -26,9 +26,7 @@ func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 	// Build a set of data-relative blocks that the allocator says are allocated
 	allocAllocated := make(map[uint64]bool)
 	for i := uint64(0); i < dataBlockCount; i++ {
-		w := i / 64
-		b := i % 64
-		if w < dataL2w && (l2[w]&(1<<b)) == 0 {
+		if briefs.AllocIsAllocated(l2, dataBlockCount, i) {
 			allocAllocated[i] = true
 		}
 	}

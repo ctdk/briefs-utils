@@ -106,13 +106,20 @@ func PackAllocWords(words []uint64, blockSize uint64) [][]byte {
 }
 
 // AllocIsAllocated reports whether relBlock is marked allocated (its L2 bit is
-// clear). Out-of-range blocks report false. It is the bit test behind
-// AllocBuilder.IsAllocated and fuse.Allocator.Allocated.
+// clear). Out-of-range blocks, and blocks whose L2 word is missing (a corrupt
+// L2Words count), report false — the same answer the fsck hand-rolled tests
+// gave, and the safe one for a diagnostic tool. It is the bit test behind
+// AllocBuilder.IsAllocated, fuse.Allocator.Allocated, and fsck's bitmap
+// cross-checks.
 func AllocIsAllocated(l2 []uint64, blockCount, rel uint64) bool {
 	if rel >= blockCount {
 		return false
 	}
-	return l2[rel/64]&(1<<(rel%64)) == 0
+	w := rel / 64
+	if w >= uint64(len(l2)) {
+		return false
+	}
+	return l2[w]&(1<<(rel%64)) == 0
 }
 
 // allocLevelWords returns the L0/L1/L2 word counts for a 3-level bitmap pyramid
