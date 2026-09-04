@@ -189,10 +189,11 @@ func VerifyBtreeNodeChecksum(buf []byte, blockSize uint64) error {
 }
 
 // InodeExtentVisitor is called by IterateInodeExtents. VisitNode is invoked
-// for every B-tree node block read (leaf or internal) so the caller can record
-// it as a used metadata block; VisitExtent is invoked once per leaf extent in
-// ascending offset order. For inline-only inodes only VisitExtent is called
-// (no nodes). A non-nil error from either aborts the walk.
+// for every B-tree node block that passes the structural checks (leaf or
+// internal) so the caller can record it as a used metadata block;
+// VisitExtent is invoked once per leaf extent in ascending offset order. For
+// inline-only inodes only VisitExtent is called (no nodes). A non-nil error
+// from either aborts the walk.
 type InodeExtentVisitor struct {
 	VisitNode   func(block uint64) error
 	VisitExtent func(ext Extent) error
@@ -229,80 +230,35 @@ func IterateInodeExtents(file *os.File, in *Inode, blockSize uint64, v InodeExte
 		return nil
 	}
 
-	// Tree-backed.
+	// Tree-backed: descend through WalkBtree, the same engine fsck's
+	// structural pass uses, with the strict fault policy (first fault
+	// aborts), checksums on, and a silent skip for null children. Fault
+	// messages keep the "btree node %d: ..." shape this walk always had.
 	root := in.ExtentInlineBase
 	if root == 0 {
 		return nil
 	}
-	visited := make(map[uint64]bool)
-	return btreeWalk(file, root, blockSize, 0, visited, v)
-}
-
-// btreeWalk recursively descends the subtree rooted at @block, yielding leaf
-// extents. @depth bounds recursion; @visited guards against cycles.
-func btreeWalk(file *os.File, block, blockSize uint64, depth int, visited map[uint64]bool, v InodeExtentVisitor) error {
-	if block == 0 {
-		return nil
-	}
-	if depth > BtreeMaxDepth {
-		return fmt.Errorf("btree node %d: %w", block, ErrBtreeDepth)
-	}
-	if visited[block] {
-		return fmt.Errorf("btree node %d: %w", block, ErrBtreeCycle)
-	}
-	visited[block] = true
-
-	if v.VisitNode != nil {
-		if err := v.VisitNode(block); err != nil {
-			return err
-		}
-	}
-
-	buf := make([]byte, blockSize)
-	if _, err := file.ReadAt(buf, int64(block*blockSize)); err != nil {
-		return fmt.Errorf("btree node %d: read: %w", block, err)
-	}
-
-	hdr := UnmarshalBtreeHeader(buf)
-	if hdr.Magic != BtreeMagic {
-		return fmt.Errorf("btree node %d: %w (0x%08X)", block, ErrBtreeBadMagic, hdr.Magic)
-	}
-	if err := VerifyBtreeNodeChecksum(buf, blockSize); err != nil {
-		return fmt.Errorf("btree node %d: %w", block, err)
-	}
-
-	if hdr.IsLeaf() {
-		if int(hdr.NumKeys) > BtreeLeafFanout {
-			return fmt.Errorf("btree node %d: %w (leaf %d > %d)", block, ErrBtreeCountOverflow, hdr.NumKeys, BtreeLeafFanout)
-		}
-		var prevOffset uint64
-		for i := uint16(0); i < hdr.NumKeys; i++ {
-			ext := ReadBtreeLeafExtent(buf, int(i))
-			if i > 0 && ext.Offset <= prevOffset {
-				return fmt.Errorf("btree node %d: %w (offset %d after %d)", block, ErrBtreeUnsorted, ext.Offset, prevOffset)
+	return WalkBtree(file, root, BtreeWalkOptions{
+		BlockSize: blockSize,
+		VerifyCRC: true,
+	}, BtreeNodeVisitor{
+		VisitNode: func(info BtreeNodeInfo) error {
+			if v.VisitNode != nil {
+				return v.VisitNode(info.Block)
 			}
-			prevOffset = ext.Offset
+			return nil
+		},
+		VisitLeaf: func(info BtreeNodeInfo, extents []Extent) error {
 			if v.VisitExtent != nil {
-				if err := v.VisitExtent(ext); err != nil {
-					return err
+				for _, ext := range extents {
+					if err := v.VisitExtent(ext); err != nil {
+						return err
+					}
 				}
 			}
-		}
-		return nil
-	}
-
-	// Internal node.
-	if int(hdr.NumKeys) > BtreeIdxFanout {
-		return fmt.Errorf("btree node %d: %w (internal %d > %d)", block, ErrBtreeCountOverflow, hdr.NumKeys, BtreeIdxFanout)
-	}
-	for i := uint16(0); i < hdr.NumKeys; i++ {
-		entry := ReadBtreeIdxEntry(buf, int(i))
-		if err := btreeWalk(file, entry.Child, blockSize, depth+1, visited, v); err != nil {
-			return err
-		}
-	}
-	trailing := BtreeTrailingChild(buf)
-	return btreeWalk(file, trailing, blockSize, depth+1, visited, v)
+			return nil
+		},
+	})
 }
 
 // BtreeNodeInfo describes one node visited during WalkBtree.
@@ -364,10 +320,11 @@ type BtreeWalkOptions struct {
 // and supply the per-node checks it cares about (high-key/level ordering,
 // cross-leaf cursors, extent accumulation) via the visitor callbacks.
 //
-// The descent is bounded by BtreeMaxDepth and a visited-set cycle guard. It
-// does NOT re-implement the basic IterateInodeExtents walk, whose VisitNode
-// fires before the block is read (for used-block recording) — a different
-// contract than this post-validation visitor.
+// The descent is bounded by BtreeMaxDepth and a visited-set cycle guard.
+// IterateInodeExtents is a thin adapter over this walk; the one contract
+// difference is that its VisitNode now fires after a node passes the
+// structural checks (it used to fire before the block was read), so a
+// caller recording used metadata blocks only sees real, readable nodes.
 func WalkBtree(file *os.File, root uint64, opts BtreeWalkOptions, v BtreeNodeVisitor) error {
 	visited := make(map[uint64]bool)
 	return walkBtreeNode(file, root, opts, v, visited, 0, 0, true)
