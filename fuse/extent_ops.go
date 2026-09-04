@@ -207,15 +207,7 @@ func (b *BrieFS) zeroEofTailBlock(exts []briefs.Extent, size uint64) error {
 		return nil
 	}
 	abs := ext.Phys + (blk - ext.Offset)
-	buf, err := b.dev.ReadBlock(abs)
-	if err != nil {
-		return err
-	}
-	tail := size % bs
-	for i := tail; i < bs; i++ {
-		buf[i] = 0
-	}
-	if err := b.dev.WriteBlock(abs, buf); err != nil {
+	if err := b.zeroBlockTail(abs, size%bs); err != nil {
 		return err
 	}
 	return b.dev.Fdatasync()
