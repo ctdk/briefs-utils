@@ -72,3 +72,85 @@ func TestCheckpointMarshalLayout(t *testing.T) {
 		t.Errorf("layout mismatch:\n got %x\nwant %x", data, want)
 	}
 }
+
+// TestInodeUpdateRecordLayout pins jrn_inode_update to the kernel's 96-byte
+// layout with the trailing generation field (kernel commit 33e4019,
+// BUILD_BUG_ON briefs.h:1910): 88 bytes of pre-existing fields, generation at
+// offset 88.
+func TestInodeUpdateRecordLayout(t *testing.T) {
+	if JrnInodeUpdateSize != 96 {
+		t.Fatalf("JrnInodeUpdateSize: got %d, want 96", JrnInodeUpdateSize)
+	}
+	if JrnInodeUpdateLegacySize != 88 {
+		t.Fatalf("JrnInodeUpdateLegacySize: got %d, want 88", JrnInodeUpdateLegacySize)
+	}
+	r := &JrnInodeUpdate{
+		Ino:        0x0102030405060708,
+		Mode:       0x11121314,
+		Nlink:      0x15161718,
+		Uid:        0x191a1b1c,
+		Gid:        0x1d1e1f20,
+		FileSize:   0x2122232425262728,
+		ATimeSec:   0x3132333435363738,
+		ATimeNsec:  0x4142434445464748,
+		MTimeSec:   0x5152535455565758,
+		MTimeNsec:  0x6162636465666768,
+		CTimeSec:   0x7172737475767778,
+		CTimeNsec:  0x8182838485868788,
+		Flags:      0x91929394,
+		Reserved:   0x95969798,
+		Generation: 0xa1a2a3a4a5a6a7a8,
+	}
+	data, err := r.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+	if len(data) != 96 {
+		t.Fatalf("marshal size: got %d, want 96", len(data))
+	}
+	if got := data[88:96]; !bytes.Equal(got, []byte{0xa8, 0xa7, 0xa6, 0xa5, 0xa4, 0xa3, 0xa2, 0xa1}) {
+		t.Errorf("generation not at offset 88: %x", got)
+	}
+
+	var back JrnInodeUpdate
+	if err := back.UnmarshalBinary(data); err != nil {
+		t.Fatalf("UnmarshalBinary: %v", err)
+	}
+	if back != *r {
+		t.Errorf("round-trip mismatch: got %+v, want %+v", back, *r)
+	}
+}
+
+// TestUnmarshalInodeUpdateLegacy verifies the legacy 88-byte payload (no
+// generation field, pre-33e4019 records) parses with Generation == 0 so the
+// replay caller can gate the generation guard on payload length, mirroring
+// the kernel's rec_data_len check (journal.c:1047).
+func TestUnmarshalInodeUpdateLegacy(t *testing.T) {
+	r := &JrnInodeUpdate{
+		Ino:      42,
+		Mode:     0o644,
+		Nlink:    1,
+		FileSize: 100,
+	}
+	data, err := r.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+	legacy := data[:JrnInodeUpdateLegacySize]
+	got := UnmarshalInodeUpdate(legacy)
+	if got == nil {
+		t.Fatal("UnmarshalInodeUpdate(legacy): nil")
+	}
+	if got.Ino != 42 || got.Mode != 0o644 || got.Nlink != 1 || got.FileSize != 100 {
+		t.Errorf("legacy parse mismatch: %+v", got)
+	}
+	if got.Generation != 0 {
+		t.Errorf("legacy parse: Generation = %d, want 0", got.Generation)
+	}
+
+	// The full 96-byte payload still parses with its generation.
+	full := UnmarshalInodeUpdate(data)
+	if full == nil || full.Generation != 0 {
+		t.Fatalf("full parse: %+v", full)
+	}
+}

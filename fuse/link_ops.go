@@ -678,6 +678,14 @@ func (b *BrieFS) renameWhiteout(oldParentIno uint64, oldName string, newParentIn
 		b.cacheAbort()
 		return err
 	}
+	// Arm the fresh whiteout slot (with its new generation) in the page
+	// cache before its snapshot is committed, so replay's generation guard
+	// finds it (see writeThroughFreshInodeSlot).
+	if err := b.writeThroughFreshInodeSlot(whiteout); err != nil {
+		_ = b.FreeInode(whiteout.InodeNumber)
+		b.cacheAbort()
+		return err
+	}
 	if err := b.journalInodeFull(whiteout); err != nil {
 		_ = b.FreeInode(whiteout.InodeNumber)
 		b.cacheAbort()

@@ -21,6 +21,15 @@
 // allocations with a stale allocator bitmap.  So each op ends with
 // journal.Sync(false) then flushCache.
 //
+// One write-through exception: the inode-allocation paths persist the fresh
+// inode's slot to the device page cache BEFORE its JRN_INODE_FULL is committed
+// (writeThroughFreshInodeSlot, cache.go).  Replay's generation guard (kernel
+// 33e4019, generic/536) skips a snapshot whose generation does not match the
+// slot, so the slot must already carry the snapshot's own generation when the
+// record commits.  A mid-op crash in that window leaves a bitmap-free slot
+// holding an armed inode — the state fsck's table scan already tolerates on
+// reused devices, and the next allocation overwrites.
+//
 // Journal record ordering matches the kernel's intent (the generic/640
 // fix): when a directory's trie root is freshly created, JRN_INODE_FULL of the
 // parent (carrying the new root) is written BEFORE the JRN_DIR_UPDATE that
@@ -67,8 +76,10 @@ func (b *BrieFS) journalInodeFull(in *briefs.Inode) error {
 }
 
 // journalInodeUpdate writes a JRN_INODE_UPDATE record carrying the inode's
-// metadata (mode/nlink/uid/gid/size/times/flags).  Mirrors
-// briefs_journal_inode_update (journal.c).
+// metadata (mode/nlink/uid/gid/size/times/flags/generation).  Mirrors
+// briefs_journal_inode_update (journal.c:2380): the generation lets replay
+// skip the record when the slot has since been freed and reallocated
+// (kernel commit 33e4019, generic/536).
 func (b *BrieFS) journalInodeUpdate(in *briefs.Inode) error {
 	rec := &briefs.JrnInodeUpdate{
 		Ino:       in.InodeNumber,
@@ -83,7 +94,8 @@ func (b *BrieFS) journalInodeUpdate(in *briefs.Inode) error {
 		MTimeNsec: in.MtimeNsec,
 		CTimeSec:  in.CtimeSec,
 		CTimeNsec: in.CtimeNsec,
-		Flags:     in.Flags,
+		Flags:      in.Flags,
+		Generation: in.Generation,
 	}
 	return b.journal.WriteRecord(briefs.JRN_INODE_UPDATE, rec.Marshal())
 }
@@ -342,6 +354,16 @@ func (b *BrieFS) createNamedInode(parentIno uint64, name string, mode, uid, gid 
 
 	// addDirEntry pins the parent's trie root (if new) and inserts the entry.
 	if err := b.addDirEntry(parent, child.InodeNumber, name, ftype); err != nil {
+		abort()
+		return nil, err
+	}
+
+	// Make the fresh slot (with its new generation) durable in the page
+	// cache BEFORE its JRN_INODE_FULL is committed — the bridge analogue of
+	// the kernel pinning the inode buffer with its journal record.  Replay's
+	// generation guard then always finds the snapshot's own generation in the
+	// slot (see writeThroughFreshInodeSlot and replayInodeFull).
+	if err := b.writeThroughFreshInodeSlot(child); err != nil {
 		abort()
 		return nil, err
 	}

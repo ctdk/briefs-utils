@@ -13,8 +13,10 @@
 // short-lived per-operation map of block -> working buffer.  loadBlock returns
 // the cached buffer (loading from disk on first touch); saveBlock marks it
 // dirty.  flushCache writes every dirty block and fdatasyncs once, so all
-// metadata for an operation lands on disk together, before the journal
-// commits the records that reference it (the drain-before-snapshot rule).
+// metadata for an operation lands on disk together after the journal commits
+// the records that reference it (commit-before-flush; replay re-derives any
+// metadata that did not reach disk — see the durability-ordering comment in
+// dir_ops.go).
 
 package fuse
 
@@ -59,8 +61,9 @@ func (b *BrieFS) saveBlock(block uint64, buf []byte) error {
 }
 
 // flushCache writes every dirty cached block to the device and fdatasyncs
-// once, then drops the cache.  Call before journal.Sync so metadata is
-// durable before the journal commits the records that reference it.
+// once, then drops the cache.  Ops call it AFTER journal.Sync (commit-
+// before-flush): the committed records let replay re-derive any metadata that
+// a mid-op crash kept from reaching the page cache.
 func (b *BrieFS) flushCache() error {
 	for block, buf := range b.cache {
 		if !b.cacheDirty[block] {
@@ -170,4 +173,36 @@ func (b *BrieFS) zeroInodeCached(ino uint64) error {
 	}
 	b.saveBlock(blk, buf)
 	return nil
+}
+
+// writeThroughFreshInodeSlot persists a freshly allocated inode's slot to the
+// device page cache immediately, bypassing the per-op cache flush.  The
+// inode-allocation paths call it right before journaling the fresh inode's
+// JRN_INODE_FULL: the kernel pins the inode buffer with its journal record
+// (journal-owned bh lifetimes), so a committed snapshot record implies its
+// slot — carrying the new generation — is already on disk.  Replay's
+// generation guard (kernel 33e4019, generic/536) relies on that invariant;
+// without the write-through, a mid-op crash (records committed, flushCache
+// not yet run) would make the guard skip restoring the fresh inode.  Under
+// the FUSE crash model (kill -9; the page cache survives) a plain WriteBlock
+// is as durable as the journal block itself.
+//
+// Only the fresh inode's slot is patched in: the block is read straight from
+// the device, not from the per-op cache, because the cache may hold mid-op
+// mutations of OTHER inodes sharing this block (e.g. a rename target
+// mid-removal) that must not reach the page cache before the journal
+// commits the records justifying them.  The op cache is untouched; flushCache
+// writes the full block (fresh slot + everything else) after the commit.
+func (b *BrieFS) writeThroughFreshInodeSlot(in *briefs.Inode) error {
+	blk, off := b.inodes.inodeLocation(in.InodeNumber)
+	buf, err := b.dev.ReadBlock(blk)
+	if err != nil {
+		return err
+	}
+	data, err := in.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	copy(buf[off:], data)
+	return b.dev.WriteBlock(blk, buf)
 }

@@ -238,7 +238,10 @@ func (b *BrieFS) applyRecord(rtype uint32, data []byte, reserveOnly bool) error 
 		if reserveOnly {
 			return nil
 		}
-		return b.replayInodeUpdate(briefs.UnmarshalInodeUpdate(data))
+		// Generation guard applies only to current 96-byte records; legacy
+		// 88-byte records carry no generation (kernel journal.c:1047).
+		hasGen := len(data) >= briefs.JrnInodeUpdateSize
+		return b.replayInodeUpdate(briefs.UnmarshalInodeUpdate(data), hasGen)
 
 	case briefs.JRN_EXTENT_ALLOC:
 		return b.replayExtentAlloc(briefs.UnmarshalExtentAlloc(data))
@@ -295,6 +298,20 @@ func (b *BrieFS) applyRecord(rtype uint32, data []byte, reserveOnly bool) error 
 var offXattrOffset = func() uint64 {
 	// Compute from a marshaled sentinel inode to avoid hardcoding the layout.
 	in := &briefs.Inode{InodeNumber: 0x1122334455667788, XattrOffset: 0xdeadbeefcafebabe}
+	raw, _ := in.MarshalBinary()
+	for i := uint64(0); i+8 <= uint64(len(raw)); i++ {
+		if binary.LittleEndian.Uint64(raw[i:]) == 0xdeadbeefcafebabe {
+			return i
+		}
+	}
+	return 0
+}()
+
+// offGeneration is the byte offset of the generation field within the 512-byte
+// on-disk inode, computed the same way as offXattrOffset. Replay reads it
+// directly from raw snapshots (kernel 432; kernel commit 33e4019).
+var offGeneration = func() uint64 {
+	in := &briefs.Inode{InodeNumber: 0x1122334455667788, Generation: 0xdeadbeefcafebabe}
 	raw, _ := in.MarshalBinary()
 	for i := uint64(0); i+8 <= uint64(len(raw)); i++ {
 		if binary.LittleEndian.Uint64(raw[i:]) == 0xdeadbeefcafebabe {
@@ -390,8 +407,18 @@ func (b *BrieFS) replayDirUpdate(rec *briefs.JrnDirUpdate) error {
 	return nil
 }
 
-// replayInodeFull restores a 512-byte inode snapshot verbatim into the inode
-// table. Mirrors replay_inode_full() (journal.c:859).
+// replayInodeFull restores a 512-byte inode snapshot into the inode table,
+// guarded against stale snapshots on reused slots. Mirrors
+// replay_inode_full() (journal.c:1234, kernel commit 33e4019 / generic/536):
+//
+//   - A slot without the inode magic is a freed/empty slot; the kernel's
+//     briefs_read_inode_block returns -EINVAL and the record is skipped. The
+//     allocation paths arm the fresh slot in the page cache before committing
+//     its snapshot (writeThroughFreshInodeSlot), so a committed INODE_FULL
+//     always finds an armed slot for a live inode.
+//   - If the snapshot's generation differs from the slot's, the slot has been
+//     freed and reallocated to a different inode since this record was
+//     written; restoring the stale snapshot would clobber the new owner.
 func (b *BrieFS) replayInodeFull(ino uint64, data []byte) error {
 	raw := briefs.InodeFullRawData(data)
 	if raw == nil {
@@ -408,6 +435,23 @@ func (b *BrieFS) replayInodeFull(ino uint64, data []byte) error {
 	if err != nil {
 		return err
 	}
+	// Freed/empty slot: skip (kernel -EINVAL path).
+	if binary.LittleEndian.Uint64(buf[off+8:]) != briefs.MagicInode {
+		rlog("  inode-full ino=%d skipped: slot not armed", ino)
+		return nil
+	}
+	// Stale snapshot on a reused slot: skip (generation guard).
+	var snapGen, slotGen uint64
+	if len(raw) >= int(offGeneration)+8 {
+		snapGen = binary.LittleEndian.Uint64(raw[offGeneration:])
+	}
+	if offGeneration+8 <= b.inodes.sb.InodeSize {
+		slotGen = binary.LittleEndian.Uint64(buf[off+offGeneration:])
+	}
+	if snapGen != slotGen {
+		rlog("  inode-full ino=%d skipped: stale snapshot (snap gen %d != slot gen %d)", ino, snapGen, slotGen)
+		return nil
+	}
 	copy(buf[off:off+512], raw)
 	b.saveBlock(blk, buf)
 	return nil
@@ -415,8 +459,13 @@ func (b *BrieFS) replayInodeFull(ino uint64, data []byte) error {
 
 // replayInodeUpdate applies a partial inode metadata update (mode/nlink/uid/
 // gid/size/times/flags) to the on-disk inode, preserving extent/trie/xattr
-// fields. Mirrors replay_inode_update() (journal.c:657).
-func (b *BrieFS) replayInodeUpdate(rec *briefs.JrnInodeUpdate) error {
+// fields. Mirrors replay_inode_update() (journal.c:1024, kernel commit
+// 33e4019): when the record carries a generation (96-byte records; legacy
+// 88-byte records are applied unguarded, matching the kernel's
+// rec_data_len-gated guard) and it differs from the slot's, the slot has been
+// freed and reallocated since this record was written and applying the stale
+// metadata would clobber the new owner.
+func (b *BrieFS) replayInodeUpdate(rec *briefs.JrnInodeUpdate, hasGeneration bool) error {
 	if rec == nil {
 		return nil
 	}
@@ -427,6 +476,16 @@ func (b *BrieFS) replayInodeUpdate(rec *briefs.JrnInodeUpdate) error {
 	}
 	if binary.LittleEndian.Uint64(buf[off+8:]) != briefs.MagicInode {
 		return nil // freed inode, skip
+	}
+	if hasGeneration {
+		if offGeneration+8 > b.inodes.sb.InodeSize {
+			return nil // layout mismatch, skip conservatively
+		}
+		slotGen := binary.LittleEndian.Uint64(buf[off+offGeneration:])
+		if rec.Generation != slotGen {
+			rlog("  inode-update ino=%d skipped: stale record (rec gen %d != slot gen %d)", rec.Ino, rec.Generation, slotGen)
+			return nil
+		}
 	}
 	di, err := briefs.UnmarshalInode(buf[off : off+b.inodes.sb.InodeSize])
 	if err != nil {

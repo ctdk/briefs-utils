@@ -511,6 +511,7 @@ func (s *JrnInodeUpdate) MarshalBinary() ([]byte, error) {
 	binary.LittleEndian.PutUint64(data[pos:], s.CTimeNsec); pos += 8
 	binary.LittleEndian.PutUint32(data[pos:], s.Flags); pos += 4
 	binary.LittleEndian.PutUint32(data[pos:], s.Reserved); pos += 4
+	binary.LittleEndian.PutUint64(data[pos:], s.Generation); pos += 8
 	return data, nil
 }
 
@@ -534,11 +535,12 @@ func (s *JrnInodeUpdate) UnmarshalBinary(data []byte) error {
 	s.CTimeNsec = binary.LittleEndian.Uint64(data[pos:]); pos += 8
 	s.Flags = binary.LittleEndian.Uint32(data[pos:]); pos += 4
 	s.Reserved = binary.LittleEndian.Uint32(data[pos:]); pos += 4
+	s.Generation = binary.LittleEndian.Uint64(data[pos:]); pos += 8
 	return nil
 }
 
 // Compile-time size assertion for JrnInodeUpdate.
-var _ = [1]struct{}{}[unsafe.Sizeof(JrnInodeUpdate{}) - 88]
+var _ = [1]struct{}{}[unsafe.Sizeof(JrnInodeUpdate{}) - 96]
 
 // Size returns the on-disk size of JrnSymlinkPrefix. Packed structs have
 // unaligned on-disk fields that Go's struct alignment cannot represent, so

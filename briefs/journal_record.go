@@ -1,12 +1,12 @@
 // Package briefs: journal record payloads.
 //
-// These mirror the kernel's struct jrn_* (briefs.h:136-257) with byte-exact,
+// These mirror the kernel's struct jrn_* (briefs.h:152+) with byte-exact,
 // little-endian on-disk layout.  Sizes are pinned by the kernel's
-// BUILD_BUG_ON() checks (briefs.h:1552+):
+// BUILD_BUG_ON() checks (briefs.h:1894-1926):
 //
 //	jrn_extent_alloc   = 80
 //	jrn_extent_free    = 80
-//	jrn_inode_update   = 88
+//	jrn_inode_update   = 96
 //	jrn_inode_alloc    = 40
 //	jrn_inode_free     = 32
 //	jrn_trie_alloc     = 16
@@ -34,13 +34,20 @@ const JournalBlockHdrSize = 16
 const (
 	JrnExtentAllocSize = 80
 	JrnExtentFreeSize  = 80
-	JrnInodeUpdateSize = 88
+	JrnInodeUpdateSize = 96
 	JrnInodeAllocSize  = 40
 	JrnInodeFreeSize   = 32
 	JrnTrieAllocSize   = 16
 	JrnDirUpdateSize   = 280
 	JrnInodeFullSize   = 560
 )
+
+// JrnInodeUpdateLegacySize is the pre-generation jrn_inode_update size (88
+// bytes), written before the trailing Generation field was added (kernel
+// commit 33e4019, generic/536). Journal records are length-prefixed, so
+// legacy 88-byte records coexist with current 96-byte ones; replay applies
+// legacy records without the generation guard.
+const JrnInodeUpdateLegacySize = 88
 
 // Prefix offsets for the variable-length records (offset of the trailing
 // variable array).
@@ -82,24 +89,31 @@ func (r *JrnExtentFree) Marshal() []byte {
 	return b
 }
 
-// JrnInodeUpdate mirrors struct jrn_inode_update (88 bytes).
+// JrnInodeUpdate mirrors struct jrn_inode_update (96 bytes).
 //
-//go:briefs-disk size=88
+// Generation guards replay against a stale record landing on a reused inode
+// slot (kernel commit 33e4019, generic/536): the slot has been freed and
+// reallocated since this record was written when the generations differ.
+// Legacy 88-byte records (JrnInodeUpdateLegacySize) carry no generation and
+// are applied unguarded.
+//
+//go:briefs-disk size=96
 type JrnInodeUpdate struct {
-	Ino       uint64
-	Mode      uint32
-	Nlink     uint32
-	Uid       uint32
-	Gid       uint32
-	FileSize  uint64
-	ATimeSec  uint64
-	ATimeNsec uint64
-	MTimeSec  uint64
-	MTimeNsec uint64
-	CTimeSec  uint64
-	CTimeNsec uint64
-	Flags     uint32
-	Reserved  uint32
+	Ino        uint64
+	Mode       uint32
+	Nlink      uint32
+	Uid        uint32
+	Gid        uint32
+	FileSize   uint64
+	ATimeSec   uint64
+	ATimeNsec  uint64
+	MTimeSec   uint64
+	MTimeNsec  uint64
+	CTimeSec   uint64
+	CTimeNsec  uint64
+	Flags      uint32
+	Reserved   uint32
+	Generation uint64
 }
 
 func (r *JrnInodeUpdate) Marshal() []byte {
@@ -318,8 +332,18 @@ func UnmarshalExtentFree(b []byte) *JrnExtentFree {
 	return r
 }
 
-// UnmarshalInodeUpdate parses an 88-byte JRN_INODE_UPDATE payload.
+// UnmarshalInodeUpdate parses a JRN_INODE_UPDATE payload. Both the current
+// 96-byte layout and the legacy 88-byte layout (no Generation field) are
+// accepted; a legacy payload parses with Generation == 0, and the caller
+// gates the replay generation guard on payload length, mirroring the
+// kernel's rec_data_len guard (journal.c:1047: legacy records are applied
+// unchanged).
 func UnmarshalInodeUpdate(b []byte) *JrnInodeUpdate {
+	if len(b) == JrnInodeUpdateLegacySize {
+		padded := make([]byte, JrnInodeUpdateSize)
+		copy(padded, b)
+		b = padded
+	}
 	r := &JrnInodeUpdate{}
 	if err := r.UnmarshalBinary(b); err != nil {
 		return nil
