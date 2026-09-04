@@ -61,15 +61,6 @@ func verifyJournal(file *os.File, journalOffset, journalBlocks, checkpointSeq, l
 	return nil
 }
 
-// nextJournalBlock returns the next block in the circular journal.
-func nextJournalBlock(block, journalOffset, journalBlocks uint64) uint64 {
-	next := block + 1
-	if next >= journalOffset+journalBlocks {
-		return journalOffset
-	}
-	return next
-}
-
 // verifyJournalRecords verifies the CRC32C checksum of journal records.
 // For a clean filesystem only the checkpoint block is checked. For a dirty
 // filesystem the recorded log range is walked. A zero checksum is treated
@@ -117,8 +108,8 @@ func verifyJournalRecords(fs *fsckState, journalOffset, journalBlocks, logStart,
 			break
 		}
 
-		magic := binary.LittleEndian.Uint32(buf[0:])
-		if magic != briefs.MagicJournal && magic != briefs.MagicCheckpoint {
+		bh := briefs.ParseJournalBlockHeader(buf)
+		if bh.Magic != briefs.MagicJournal && bh.Magic != briefs.MagicCheckpoint {
 			if logStart == logEnd && !fallbackClean && cur == journalOffset+journalBlocks-1 {
 				// Old mkfs.briefs images have the initial checkpoint in the
 				// first journal block. Try that as a fallback once.
@@ -126,19 +117,20 @@ func verifyJournalRecords(fs *fsckState, journalOffset, journalBlocks, logStart,
 				cur = journalOffset
 				continue
 			}
-			fs.errorf("journal block %d: bad magic 0x%08X", cur, magic)
+			fs.errorf("journal block %d: bad magic 0x%08X", cur, bh.Magic)
 			break
 		}
 
-		recordCount := binary.LittleEndian.Uint32(buf[8:])
-		recOff := uint64(16)
-		for i := uint32(0); i < recordCount && recOff+16 <= blockSize; i++ {
-			recType := binary.LittleEndian.Uint32(buf[recOff:])
-			recFlags := binary.LittleEndian.Uint32(buf[recOff+4:])
-			dataLen := binary.LittleEndian.Uint32(buf[recOff+8:])
-			storedChecksum := binary.LittleEndian.Uint32(buf[recOff+12:])
+		recordCount := bh.RecordCount
+		recOff := uint64(briefs.JournalBlockHdrSize)
+		for i := uint32(0); i < recordCount && recOff+briefs.JournalRecordHdrSize <= blockSize; i++ {
+			hdr := briefs.ParseRecordHeader(buf[recOff:])
+			recType := hdr.Type
+			recFlags := hdr.Flags
+			dataLen := hdr.DataLen
+			storedChecksum := hdr.Checksum
 
-			if recOff+16+uint64(dataLen) > blockSize {
+			if recOff+briefs.JournalRecordHdrSize+uint64(dataLen) > blockSize {
 				fs.errorf("journal block %d record %d: record overflows block (data_len=%d)",
 					cur, i, dataLen)
 				badRecords++
@@ -146,7 +138,7 @@ func verifyJournalRecords(fs *fsckState, journalOffset, journalBlocks, logStart,
 			}
 
 			recordsChecked++
-			recData := buf[recOff+16 : recOff+16+uint64(dataLen)]
+			recData := buf[recOff+briefs.JournalRecordHdrSize : recOff+briefs.JournalRecordHdrSize+uint64(dataLen)]
 			if storedChecksum == 0 {
 				if !legacyWarned {
 					fs.warnf("journal: legacy record with no checksum at block %d record %d; skipping CRC verification",
@@ -205,13 +197,13 @@ func verifyJournalRecords(fs *fsckState, journalOffset, journalBlocks, logStart,
 				}
 			}
 
-			recOff += 16 + uint64(dataLen)
+			recOff += briefs.JournalRecordHdrSize + uint64(dataLen)
 		}
 
 		if logStart == logEnd {
 			break
 		}
-		cur = nextJournalBlock(cur, journalOffset, journalBlocks)
+		cur = briefs.NextRingBlock(cur, journalOffset, journalBlocks)
 		if cur == end {
 			break
 		}

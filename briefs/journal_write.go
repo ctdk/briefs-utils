@@ -153,11 +153,7 @@ func (j *Journal) initCurBlock(seq uint32) {
 
 // nextBlock advances a journal block number, wrapping at journalEnd.
 func (j *Journal) nextBlock(cur uint64) uint64 {
-	next := cur + 1
-	if next >= j.journalEnd {
-		return j.journalStart
-	}
-	return next
+	return NextRingBlock(cur, j.journalStart, j.journalEnd-j.journalStart)
 }
 
 // writeBlock writes a 4096-byte block at the given journal block number

@@ -160,13 +160,13 @@ func (b *BrieFS) walkJournal(reserveOnly bool) error {
 			return fmt.Errorf("read journal block %d: %w", cur, err)
 		}
 
-		magic := binary.LittleEndian.Uint32(buf[0:])
-		if magic != briefs.MagicJournal && magic != briefs.MagicCheckpoint {
+		bh := briefs.ParseJournalBlockHeader(buf)
+		if bh.Magic != briefs.MagicJournal && bh.Magic != briefs.MagicCheckpoint {
 			// Stale/garbage block at the tail: stop (don't fail the mount).
 			break
 		}
 
-		recCount := binary.LittleEndian.Uint32(buf[8:])
+		recCount := bh.RecordCount
 		off := uint64(briefs.JournalBlockHdrSize)
 		for i := uint32(0); i < recCount && off+briefs.JournalRecordHdrSize <= blockSize; i++ {
 			hdr := briefs.ParseRecordHeader(buf[off:])

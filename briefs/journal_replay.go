@@ -49,6 +49,18 @@ func (j *Journal) NextJournalBlock(cur uint64) uint64 {
 	return j.nextBlock(cur)
 }
 
+// NextRingBlock advances a journal block number, wrapping at
+// journalStart+journalBlocks. It is the geometry-free form of
+// Journal.NextJournalBlock for callers (fsck) that hold the raw superblock
+// geometry rather than a Journal instance.
+func NextRingBlock(cur, journalStart, journalBlocks uint64) uint64 {
+	next := cur + 1
+	if next >= journalStart+journalBlocks {
+		return journalStart
+	}
+	return next
+}
+
 // ReadJournalBlock reads a 4096-byte journal block at the given absolute block
 // number. It range-checks against [journalStart, journalEnd). Returns the raw
 // block (a fresh copy the caller may inspect).
