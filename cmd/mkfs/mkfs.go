@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -414,22 +413,23 @@ func main() {
 			// goes at data-relative block 1 (absolute: dataRegionStart + 1).
 			rootTrieBlock := dataRegionStart + 1
 			trieBlock := make([]byte, blockSize)
-			// Page header (16 bytes)
-			binary.LittleEndian.PutUint32(trieBlock[0:], briefs.MagicTriePage) // "TRNP" magic
-			binary.LittleEndian.PutUint32(trieBlock[4:], briefs.TriePageVersion)
-			binary.LittleEndian.PutUint16(trieBlock[8:], 1)   // live_count = 1
-			binary.LittleEndian.PutUint16(trieBlock[10:], 0)  // free_name_off = 0
-			// free_slots: slot 0 allocated, rest free -> bitmap = ~1
-			binary.LittleEndian.PutUint64(trieBlock[12:], ^uint64(1))
-			// Slot 0 at offset 20.  Fields are little-endian:
-			//   first_child (8), next_sibling (8), inode (8),
-			//   name_len (2), name_offset (2), depth (1), node_type (1),
-			//   byte_val (1), f_type (1), flags (2), child_count (2)
-			slotOff := uint64(20)
-			trieBlock[slotOff+28] = 0                       // depth = 0
-			trieBlock[slotOff+29] = byte(briefs.NodeTypeInterm) // node_type
-			// first_child, next_sibling, inode, name_len, name_offset,
-			// byte_val, f_type, flags, child_count all default to 0.
+			// Page header, via the shared codec (TriePageHeaderSize = 20 bytes).
+			if err := briefs.WriteTriePage(trieBlock, &briefs.TriePage{
+				Magic:      briefs.MagicTriePage,
+				Version:    briefs.TriePageVersion,
+				LiveCount:  1,
+				FreeSlots:  ^uint64(1), // slot 0 allocated, rest free
+				FreeNameOff: 0,
+			}); err != nil {
+				return fmt.Errorf("build root trie page: %w", err)
+			}
+			// Slot 0 is the root INTERM node; every field except node_type
+			// defaults to zero.
+			if err := briefs.WriteTrieSlot(trieBlock, 0, &briefs.TrieSlot{
+				NodeType: briefs.NodeTypeInterm,
+			}); err != nil {
+				return fmt.Errorf("build root trie node: %w", err)
+			}
 
 			if _, err := file.WriteAt(trieBlock, int64(rootTrieBlock*blockSize)); err != nil {
 				return fmt.Errorf("write root trie page at %d: %w", rootTrieBlock, err)
