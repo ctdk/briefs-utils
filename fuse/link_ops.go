@@ -202,6 +202,99 @@ func newInodeGetter(b *BrieFS) *inodeGetter {
 	return &inodeGetter{b: b, m: map[uint64]*briefs.Inode{}}
 }
 
+// removeRenameTarget removes an existing destination entry and retires the
+// inode it pointed at, mirroring the target-replacement half of
+// briefs_rename (dir.c:1210): the removal is journaled first so a crash
+// leaves the old pointer in place, then the target's nlink drop + ctime
+// are persisted and journaled, and a target that reaches nlink 0 loses its
+// trie root, data blocks and inode slot.
+func (b *BrieFS) removeRenameTarget(newParent *briefs.Inode, newParentIno uint64, newName string, targetIno uint64, target *briefs.Inode) error {
+	if err := b.removeDirEntry(newParent, newName); err != nil {
+		return err
+	}
+	if err := b.journalDirUpdate(newParentIno, 0, newName, 1, 0); err != nil {
+		return err
+	}
+	if target.IsDir() {
+		newParent.Nlinks--
+		target.Nlinks = 0
+	} else {
+		target.Nlinks--
+	}
+	sec, nsec := nowTime()
+	target.CtimeSec, target.CtimeNsec = sec, nsec
+	if err := b.writeInodeCached(target); err != nil {
+		return err
+	}
+	if err := b.journalInodeFull(target); err != nil {
+		return err
+	}
+	if target.Nlinks == 0 {
+		if target.IsDir() && target.DirTrieRoot != 0 {
+			if err := b.trieFreeNode(target.DirTrieRoot); err != nil {
+				return err
+			}
+			target.DirTrieRoot = 0
+		}
+		if err := b.freeInodeData(target); err != nil {
+			return err
+		}
+		if err := b.FreeInode(targetIno); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// finishCrossDirMove applies the inode-side effects shared by the plain and
+// whiteout rename paths (briefs_rename, dir.c:1346-1395): a cross-directory
+// directory move repoints the moved inode's parent_inode, the parents'
+// mtime/ctime (and nlink, for that move) advance, and the moved inode's
+// ctime is stamped.  The kernel stamps the moved inode's ctime
+// unconditionally, so the old "(already journaled above)" skip dropped the
+// ctime update on cross-dir directory renames.
+func (b *BrieFS) finishCrossDirMove(oldParent, newParent *briefs.Inode, oldParentIno, newParentIno uint64, moved *briefs.Inode) error {
+	cross := oldParentIno != newParentIno
+	dirMove := cross && moved.IsDir()
+
+	if dirMove {
+		moved.ParentInode = newParentIno
+		if err := b.writeInodeCached(moved); err != nil {
+			return err
+		}
+		if err := b.journalInodeFull(moved); err != nil {
+			return err
+		}
+	}
+
+	// Parent mtime/ctime (+ nlink for a cross-dir dir move).  Dir size is not
+	// updated for rename, matching the kernel (briefs_update_parent_dir 0,0).
+	oldLinkDelta, newLinkDelta := 0, 0
+	if dirMove {
+		oldLinkDelta, newLinkDelta = -1, 1
+	}
+	if err := b.updateParentDir(oldParent, 0, oldLinkDelta); err != nil {
+		return err
+	}
+	if cross {
+		if err := b.updateParentDir(newParent, 0, newLinkDelta); err != nil {
+			return err
+		}
+	}
+
+	// The moved inode's ctime advances unconditionally (POSIX; kernel
+	// dir.c:1379 stamps it after the cross-dir block).
+	sec, nsec := nowTime()
+	moved.CtimeSec, moved.CtimeNsec = sec, nsec
+	if err := b.writeInodeCached(moved); err != nil {
+		return err
+	}
+	if err := b.journalInodeFull(moved); err != nil {
+		return err
+	}
+	return nil
+}
+
 // renameInDir renames @oldName in @oldParentIno to @newName in @newParentIno,
 // dispatching on the renameat2 flags. Mirrors briefs_rename (dir.c:1162).
 func (b *BrieFS) renameInDir(oldParentIno uint64, oldName string, newParentIno uint64, newName string, flags uint32) error {
@@ -286,46 +379,9 @@ func (b *BrieFS) renamePlain(oldParentIno uint64, oldName string, newParentIno u
 			b.cacheAbort()
 			return err
 		}
-		if err := b.removeDirEntry(newParent, newName); err != nil {
+		if err := b.removeRenameTarget(newParent, newParentIno, newName, targetIno, target); err != nil {
 			b.cacheAbort()
 			return err
-		}
-		if err := b.journalDirUpdate(newParentIno, 0, newName, 1, 0); err != nil {
-			b.cacheAbort()
-			return err
-		}
-		if target.IsDir() {
-			newParent.Nlinks--
-			target.Nlinks = 0
-		} else {
-			target.Nlinks--
-		}
-		sec, nsec := nowTime()
-		target.CtimeSec, target.CtimeNsec = sec, nsec
-		if err := b.writeInodeCached(target); err != nil {
-			b.cacheAbort()
-			return err
-		}
-		if err := b.journalInodeFull(target); err != nil {
-			b.cacheAbort()
-			return err
-		}
-		if target.Nlinks == 0 {
-			if target.IsDir() && target.DirTrieRoot != 0 {
-				if err := b.trieFreeNode(target.DirTrieRoot); err != nil {
-					b.cacheAbort()
-					return err
-				}
-				target.DirTrieRoot = 0
-			}
-			if err := b.freeInodeData(target); err != nil {
-				b.cacheAbort()
-				return err
-			}
-			if err := b.FreeInode(targetIno); err != nil {
-				b.cacheAbort()
-				return err
-			}
 		}
 	}
 
@@ -347,51 +403,11 @@ func (b *BrieFS) renamePlain(oldParentIno uint64, oldName string, newParentIno u
 		return err
 	}
 
-	// 3. Cross-directory directory move: adjust parent nlinks + parent_inode.
-	cross := oldParentIno != newParentIno
-	if cross && moved.IsDir() {
-		moved.ParentInode = newParentIno
-		if err := b.writeInodeCached(moved); err != nil {
-			b.cacheAbort()
-			return err
-		}
-		if err := b.journalInodeFull(moved); err != nil {
-			b.cacheAbort()
-			return err
-		}
-	}
-
-	// 4. Parent mtime/ctime (+ nlink for cross-dir dir move). Dir size is not
-	// updated for rename, matching the kernel (briefs_update_parent_dir 0,0).
-	oldLinkDelta := 0
-	newLinkDelta := 0
-	if cross && moved.IsDir() {
-		oldLinkDelta = -1
-		newLinkDelta = 1
-	}
-	if err := b.updateParentDir(oldParent, 0, oldLinkDelta); err != nil {
+	// 3. Cross-dir dir move (parent_inode + parent nlinks), parent
+	// mtime/ctime, and the moved inode's ctime.
+	if err := b.finishCrossDirMove(oldParent, newParent, oldParentIno, newParentIno, moved); err != nil {
 		b.cacheAbort()
 		return err
-	}
-	if cross {
-		if err := b.updateParentDir(newParent, 0, newLinkDelta); err != nil {
-			b.cacheAbort()
-			return err
-		}
-	}
-
-	// 5. ctime on the moved inode.
-	if !(cross && moved.IsDir()) { // already journaled above for the cross-dir case
-		sec, nsec := nowTime()
-		moved.CtimeSec, moved.CtimeNsec = sec, nsec
-		if err := b.writeInodeCached(moved); err != nil {
-			b.cacheAbort()
-			return err
-		}
-		if err := b.journalInodeFull(moved); err != nil {
-			b.cacheAbort()
-			return err
-		}
 	}
 
 	if err := b.journal.Sync(false); err != nil {
@@ -617,46 +633,9 @@ func (b *BrieFS) renameWhiteout(oldParentIno uint64, oldName string, newParentIn
 			b.cacheAbort()
 			return err
 		}
-		if err := b.removeDirEntry(newParent, newName); err != nil {
+		if err := b.removeRenameTarget(newParent, newParentIno, newName, targetIno, target); err != nil {
 			b.cacheAbort()
 			return err
-		}
-		if err := b.journalDirUpdate(newParentIno, 0, newName, 1, 0); err != nil {
-			b.cacheAbort()
-			return err
-		}
-		if target.IsDir() {
-			newParent.Nlinks--
-			target.Nlinks = 0
-		} else {
-			target.Nlinks--
-		}
-		sec, nsec := nowTime()
-		target.CtimeSec, target.CtimeNsec = sec, nsec
-		if err := b.writeInodeCached(target); err != nil {
-			b.cacheAbort()
-			return err
-		}
-		if err := b.journalInodeFull(target); err != nil {
-			b.cacheAbort()
-			return err
-		}
-		if target.Nlinks == 0 {
-			if target.IsDir() && target.DirTrieRoot != 0 {
-				if err := b.trieFreeNode(target.DirTrieRoot); err != nil {
-					b.cacheAbort()
-					return err
-				}
-				target.DirTrieRoot = 0
-			}
-			if err := b.freeInodeData(target); err != nil {
-				b.cacheAbort()
-				return err
-			}
-			if err := b.FreeInode(targetIno); err != nil {
-				b.cacheAbort()
-				return err
-			}
 		}
 	}
 
@@ -718,47 +697,11 @@ func (b *BrieFS) renameWhiteout(oldParentIno uint64, oldName string, newParentIn
 		return err
 	}
 
-	// 5. Cross-directory directory move.
-	cross := oldParentIno != newParentIno
-	if cross && moved.IsDir() {
-		moved.ParentInode = newParentIno
-		if err := b.writeInodeCached(moved); err != nil {
-			b.cacheAbort()
-			return err
-		}
-		if err := b.journalInodeFull(moved); err != nil {
-			b.cacheAbort()
-			return err
-		}
-	}
-	sec, nsec := nowTime()
-	moved.CtimeSec, moved.CtimeNsec = sec, nsec
-	if !(cross && moved.IsDir()) {
-		if err := b.writeInodeCached(moved); err != nil {
-			b.cacheAbort()
-			return err
-		}
-		if err := b.journalInodeFull(moved); err != nil {
-			b.cacheAbort()
-			return err
-		}
-	}
-
-	oldLinkDelta := 0
-	newLinkDelta := 0
-	if cross && moved.IsDir() {
-		oldLinkDelta = -1
-		newLinkDelta = 1
-	}
-	if err := b.updateParentDir(oldParent, 0, oldLinkDelta); err != nil {
+	// 5. Cross-dir dir move (parent_inode + parent nlinks), parent
+	// mtime/ctime, and the moved inode's ctime.
+	if err := b.finishCrossDirMove(oldParent, newParent, oldParentIno, newParentIno, moved); err != nil {
 		b.cacheAbort()
 		return err
-	}
-	if cross {
-		if err := b.updateParentDir(newParent, 0, newLinkDelta); err != nil {
-			b.cacheAbort()
-			return err
-		}
 	}
 
 	if err := b.journal.Sync(false); err != nil {

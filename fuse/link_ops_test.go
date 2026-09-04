@@ -193,6 +193,13 @@ func TestRename(t *testing.T) {
 	if subAfter.Nlinks != subBefore.Nlinks+1 {
 		t.Fatalf("sub nlink after dir move: want %d, got %d", subBefore.Nlinks+1, subAfter.Nlinks)
 	}
+	// The moved dir's ctime must advance too: the kernel stamps it
+	// unconditionally (dir.c:1379, the generic/003 ctime check), and the
+	// bridge used to skip it for cross-dir dir moves.
+	if moved.CtimeSec < d.CtimeSec || (moved.CtimeSec == d.CtimeSec && moved.CtimeNsec <= d.CtimeNsec) {
+		t.Fatalf("moved dir ctime did not advance: %d.%d -> %d.%d",
+			d.CtimeSec, d.CtimeNsec, moved.CtimeSec, moved.CtimeNsec)
+	}
 
 	// Rename over an existing target replaces it (and frees the old target).
 	tgt, _ := b.createInDir(1, "tgt", briefs.ModeFile|0o644, 1000, 1000, false)
