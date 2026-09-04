@@ -172,6 +172,12 @@ func collectInodeExtents(file *os.File, in *briefs.Inode, blockSize uint64) ([]b
 	return exts, err
 }
 
+// collectExtents is the per-BrieFS bound form of collectInodeExtents, used by
+// the FUSE attr fillers (fuse.go).
+func (b *BrieFS) collectExtents(in *briefs.Inode) ([]briefs.Extent, error) {
+	return collectInodeExtents(b.dev.File(), in, b.blockSize)
+}
+
 // writeFileData writes data at off, mirroring briefs_write_iter. It selects the
 // inline-data path (small files) or the extent-backed path, journals the
 // change, and makes it durable. The file-write path takes NO global dir lock:
@@ -554,9 +560,28 @@ func (b *BrieFS) collectExtentsAndNodes(in *briefs.Inode) (exts []briefs.Extent,
 	return
 }
 
+// zeroBlockTail reads the block at abs, zeroes [from, blockSize), and writes
+// it back. The physical half of briefs_zero_eof_tail (file.c:61): BrieFS
+// zeroes freshly allocated blocks, so the tail is normally already zero; this
+// covers blocks left dirty by paths that did not zero the tail. The two
+// EOF-tail zeroers below differ only in which blocks they guard on and how the
+// write is made durable, so they share this.
+func (b *BrieFS) zeroBlockTail(abs uint64, from uint64) error {
+	buf, err := b.dev.ReadBlock(abs)
+	if err != nil {
+		return err
+	}
+	for i := from; i < b.blockSize; i++ {
+		buf[i] = 0
+	}
+	return b.dev.WriteBlock(abs, buf)
+}
+
 // zeroEofTail zeroes [oldSize, block_end) of the block containing oldSize,
 // mirroring briefs_zero_eof_tail (file.c:61). Defensive: BrieFS zeroes freshly
 // allocated blocks, so the tail is already zero unless a prior writer left it.
+// The written block is added to the caller's drain list (fdatasynced with the
+// rest of the operation's data).
 func (b *BrieFS) zeroEofTail(exts []briefs.Extent, oldSize int64, drain *[]uint64) error {
 	blockSize := int64(b.blockSize)
 	eofBlock := uint64((oldSize - 1) / blockSize)
@@ -565,15 +590,7 @@ func (b *BrieFS) zeroEofTail(exts []briefs.Extent, oldSize int64, drain *[]uint6
 		return nil // nothing mapped at EOF
 	}
 	abs := ext.Phys + (eofBlock - ext.Offset)
-	buf, err := b.dev.ReadBlock(abs)
-	if err != nil {
-		return err
-	}
-	tailStart := int(oldSize % blockSize)
-	for i := tailStart; i < int(blockSize); i++ {
-		buf[i] = 0
-	}
-	if err := b.dev.WriteBlock(abs, buf); err != nil {
+	if err := b.zeroBlockTail(abs, uint64(oldSize%blockSize)); err != nil {
 		return err
 	}
 	*drain = append(*drain, abs)

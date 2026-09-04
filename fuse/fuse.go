@@ -326,15 +326,7 @@ var _ = (fs.NodeSetattrer)((*brieFSNode)(nil))
 // extents for inline-data inodes). Replaces the old chain-block walk; the chain
 // format no longer exists on v0.9 images.
 func (n *brieFSNode) collectExtents(diskInode *briefs.Inode) ([]briefs.Extent, error) {
-	var exts []briefs.Extent
-	err := briefs.IterateInodeExtents(n.bfs.dev.File(), diskInode, n.bfs.blockSize,
-		briefs.InodeExtentVisitor{
-			VisitExtent: func(ext briefs.Extent) error {
-				exts = append(exts, ext)
-				return nil
-			},
-		})
-	return exts, err
+	return n.bfs.collectExtents(diskInode)
 }
 
 func (n *brieFSNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
