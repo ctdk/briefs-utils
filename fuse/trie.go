@@ -98,36 +98,45 @@ func trieReadNode(dev *BlockDevice, nodeRef uint64) ([]byte, *briefs.TrieSlot, e
 	return buf, node, nil
 }
 
+// trieScanSiblings walks a parent's child chain looking for the child with
+// byte_val == byteVal, returning that child and its previous sibling (0 if
+// it is the first child). The walk is capped at briefs.TrieSiblingMax hops:
+// a next_sibling back-edge (corrupt/stale trie) errors out instead of
+// spinning forever, mirroring kernel trie.c's briefs_trie_find_child and
+// trie_find_child_with_prev. readNode fetches and parses one child slot;
+// the uncached (device) and cached (BrieFS) sibling scans share this core
+// through it.
+func trieScanSiblings(parentRef, firstChild uint64, byteVal uint8, readNode func(ref uint64) (*briefs.TrieSlot, error)) (child, prev uint64, err error) {
+	cur := firstChild
+	for hops := 0; !briefs.TrieRefIsNull(cur); hops++ {
+		if hops >= briefs.TrieSiblingMax {
+			return 0, 0, fmt.Errorf("trie sibling walk exceeded %d nodes from parent ref %d (corrupt/cyclic trie)",
+				briefs.TrieSiblingMax, parentRef)
+		}
+		cnode, rerr := readNode(cur)
+		if rerr != nil {
+			return 0, 0, rerr
+		}
+		if cnode.ByteVal == byteVal {
+			return cur, prev, nil
+		}
+		prev = cur
+		cur = cnode.NextSibling
+	}
+	return 0, 0, nil
+}
+
 // TrieFindChild finds a child node by byte value in the sibling chain.
-// The walk is capped at briefs.TrieSiblingMax hops: a back-edge in
-// next_sibling (corrupt/stale trie) aborts with an error instead of
-// spinning forever (kernel trie.c briefs_trie_find_child).
 func TrieFindChild(dev *BlockDevice, parentRef uint64, byteVal byte) (uint64, error) {
 	_, pnode, err := trieReadNode(dev, parentRef)
 	if err != nil {
 		return 0, err
 	}
-
-	child := pnode.FirstChild
-	visited := 0
-	for !briefs.TrieRefIsNull(child) {
-		visited++
-		if visited > briefs.TrieSiblingMax {
-			return 0, fmt.Errorf("trie sibling walk exceeded %d nodes from parent ref %d (corrupt/cyclic trie)",
-				briefs.TrieSiblingMax, parentRef)
-		}
-		cbuf, cnode, err := trieReadNode(dev, child)
-		if err != nil {
-			return 0, err
-		}
-		if cnode.ByteVal == byteVal {
-			return child, nil
-		}
-		child = cnode.NextSibling
-		_ = cbuf
-	}
-
-	return 0, nil
+	child, _, err := trieScanSiblings(parentRef, pnode.FirstChild, byteVal, func(ref uint64) (*briefs.TrieSlot, error) {
+		_, cnode, rerr := trieReadNode(dev, ref)
+		return cnode, rerr
+	})
+	return child, err
 }
 
 // TrieIterator provides a depth-first walk of a directory trie for

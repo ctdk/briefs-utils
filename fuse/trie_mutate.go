@@ -438,34 +438,17 @@ func (b *BrieFS) trieFindOrCreateChild(parent uint64, depth, byteVal uint8) (uin
 
 // trieFindChildWithPrev finds a child by byte_val, returning the child and its
 // previous sibling (0 if it is the first child).  Mirrors
-// trie_find_child_with_prev (trie.c:127).  The sibling walk is capped at
-// briefs.TrieSiblingMax so a next_sibling back-edge aborts with an error
-// instead of spinning forever.
+// trie_find_child_with_prev (trie.c:127).
 func (b *BrieFS) trieFindChildWithPrev(parent uint64, byteVal uint8) (child, prev uint64, found bool, err error) {
 	_, pnode, err := b.trieRead(parent)
 	if err != nil {
 		return 0, 0, false, err
 	}
-	cur := pnode.FirstChild
-	var prevRef uint64
-	visited := 0
-	for !briefs.TrieRefIsNull(cur) {
-		visited++
-		if visited > briefs.TrieSiblingMax {
-			return 0, 0, false, fmt.Errorf("trie sibling walk exceeded %d nodes from parent ref %d (corrupt/cyclic trie)",
-				briefs.TrieSiblingMax, parent)
-		}
-		_, cnode, err := b.trieRead(cur)
-		if err != nil {
-			return 0, 0, false, err
-		}
-		if cnode.ByteVal == byteVal {
-			return cur, prevRef, true, nil
-		}
-		prevRef = cur
-		cur = cnode.NextSibling
-	}
-	return 0, 0, false, nil
+	child, prev, err = trieScanSiblings(parent, pnode.FirstChild, byteVal, func(ref uint64) (*briefs.TrieSlot, error) {
+		_, cnode, rerr := b.trieRead(ref)
+		return cnode, rerr
+	})
+	return child, prev, !briefs.TrieRefIsNull(child), err
 }
 
 // trieUnlinkChild unlinks a child from the parent's sibling chain and decrements
