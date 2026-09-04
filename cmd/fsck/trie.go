@@ -177,7 +177,15 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootRef uint64, blockS
 		if node.FirstChild != 0 {
 			var siblings []uint64
 			child := node.FirstChild
+			visited := 0
 			for child != 0 {
+				visited++
+				if visited > briefs.TrieSiblingMax {
+					fs.errorf("ino %d dir trie: sibling chain from ref %d exceeds %d nodes (corrupt/cyclic trie)",
+						parentIno, ref, briefs.TrieSiblingMax)
+					fs.failedTrieDirs[parentIno] = true
+					break
+				}
 				siblings = append(siblings, child)
 				childBlock := briefs.TrieRefBlock(child)
 				childSlot := briefs.TrieRefSlot(child)
@@ -303,7 +311,14 @@ func pushChildren(stack []uint64, leafEmitted []bool, file *os.File, node *brief
 	}
 	var siblings []uint64
 	child := node.FirstChild
+	visited := 0
 	for child != 0 {
+		visited++
+		if visited > briefs.TrieSiblingMax {
+			// Corrupt/cyclic sibling chain: stop collecting rather than
+			// spin forever.
+			break
+		}
 		siblings = append(siblings, child)
 		cbuf := make([]byte, blockSize)
 		if _, err := file.ReadAt(cbuf, int64(briefs.TrieRefBlock(child)*blockSize)); err != nil {
@@ -358,7 +373,13 @@ func collectDirectoryTrieBlocks(fs *fsckState, parentIno uint64, rootRef uint64,
 		}
 
 		child := node.FirstChild
+		visitedChain := 0
 		for child != 0 {
+			visitedChain++
+			if visitedChain > briefs.TrieSiblingMax {
+				return nil, fmt.Errorf("sibling chain from ref %d exceeds %d nodes (corrupt/cyclic trie)",
+					ref, briefs.TrieSiblingMax)
+			}
 			if !visited[child] {
 				stack = append(stack, child)
 			}

@@ -126,6 +126,13 @@ const (
 	// to 255.
 	BrieFSMaxNameLen = 255
 
+	// TrieSiblingMax caps every sibling-chain walk (kernel
+	// BRIEFS_TRIE_SIBLING_MAX, briefs.h:744).  A healthy chain (children of
+	// one node, at most 256 by byte_val) is far shorter, but a stale trie
+	// with a back-edge in next_sibling would otherwise loop forever
+	// reading pages with no way out; walkers abort instead.
+	TrieSiblingMax = 1024
+
 	// BrieFS xattr block version. Matches BRIEFS_XATTR_VERSION in the kernel.
 	BrieFSXattrVersion = 2
 

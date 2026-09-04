@@ -24,6 +24,7 @@
 package fuse
 
 import (
+	"fmt"
 	"syscall"
 
 	"github.com/ctdk/briefs-utils/briefs"
@@ -364,9 +365,17 @@ func (b *BrieFS) trieLinkChild(parent, child uint64) error {
 		putSlot(pbuf, uint(briefs.TrieRefSlot(parent)), pnode)
 		return b.saveBlock(briefs.TrieRefBlock(parent), pbuf)
 	}
-	// Walk to the last sibling.
+	// Walk to the last sibling (capped at briefs.TrieSiblingMax: a
+	// next_sibling back-edge aborts with an error instead of spinning
+	// forever, kernel trie.c trie_link_child).
 	last := pnode.FirstChild
+	visited := 0
 	for {
+		visited++
+		if visited > briefs.TrieSiblingMax {
+			return fmt.Errorf("trie link sibling walk exceeded %d nodes from parent ref %d (corrupt/cyclic trie)",
+				briefs.TrieSiblingMax, parent)
+		}
 		lbuf, lnode, err := b.trieRead(last)
 		if err != nil {
 			return err
@@ -429,7 +438,9 @@ func (b *BrieFS) trieFindOrCreateChild(parent uint64, depth, byteVal uint8) (uin
 
 // trieFindChildWithPrev finds a child by byte_val, returning the child and its
 // previous sibling (0 if it is the first child).  Mirrors
-// trie_find_child_with_prev (trie.c:127).
+// trie_find_child_with_prev (trie.c:127).  The sibling walk is capped at
+// briefs.TrieSiblingMax so a next_sibling back-edge aborts with an error
+// instead of spinning forever.
 func (b *BrieFS) trieFindChildWithPrev(parent uint64, byteVal uint8) (child, prev uint64, found bool, err error) {
 	_, pnode, err := b.trieRead(parent)
 	if err != nil {
@@ -437,7 +448,13 @@ func (b *BrieFS) trieFindChildWithPrev(parent uint64, byteVal uint8) (child, pre
 	}
 	cur := pnode.FirstChild
 	var prevRef uint64
+	visited := 0
 	for !briefs.TrieRefIsNull(cur) {
+		visited++
+		if visited > briefs.TrieSiblingMax {
+			return 0, 0, false, fmt.Errorf("trie sibling walk exceeded %d nodes from parent ref %d (corrupt/cyclic trie)",
+				briefs.TrieSiblingMax, parent)
+		}
 		_, cnode, err := b.trieRead(cur)
 		if err != nil {
 			return 0, 0, false, err
@@ -516,8 +533,15 @@ func (b *BrieFS) trieSplitLeaf(cur, child uint64, pos int, bval uint8, name stri
 	if gnode.FirstChild == child {
 		gnode.FirstChild = internal
 	} else {
+		// Capped at briefs.TrieSiblingMax: on a corrupt/cyclic chain the
+		// relink is abandoned (kernel trie.c:597 breaks).
 		w := gnode.FirstChild
+		visited := 0
 		for !briefs.TrieRefIsNull(w) {
+			visited++
+			if visited > briefs.TrieSiblingMax {
+				break
+			}
 			wbuf, wnode, err := b.trieRead(w)
 			if err != nil {
 				break
@@ -812,8 +836,15 @@ func (b *BrieFS) collapseAncestry(di *briefs.Inode, ancestry []uint64, anc int) 
 		if pnode.FirstChild == check {
 			pnode.FirstChild = cnode.NextSibling
 		} else {
+			// Capped at briefs.TrieSiblingMax: on a corrupt/cyclic chain
+			// the relink is abandoned (kernel trie.c:1042 breaks).
 			w := pnode.FirstChild
+			visited := 0
 			for !briefs.TrieRefIsNull(w) {
+				visited++
+				if visited > briefs.TrieSiblingMax {
+					break
+				}
 				wbuf, wnode, err := b.trieRead(w)
 				if err != nil {
 					break
@@ -853,4 +884,3 @@ func (b *BrieFS) collapseAncestry(di *briefs.Inode, ancestry []uint64, anc int) 
 	}
 	return nil
 }
-

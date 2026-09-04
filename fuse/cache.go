@@ -113,14 +113,22 @@ func (b *BrieFS) trieRead(ref uint64) ([]byte, *briefs.TrieSlot, error) {
 	return buf, node, nil
 }
 
-// trieFindChild is the cached write-path version of TrieFindChild.
+// trieFindChild is the cached write-path version of TrieFindChild. The
+// sibling walk is capped at briefs.TrieSiblingMax so a next_sibling
+// back-edge aborts with an error instead of spinning forever.
 func (b *BrieFS) trieFindChild(parent uint64, byteVal byte) (uint64, error) {
 	_, pnode, err := b.trieRead(parent)
 	if err != nil {
 		return 0, err
 	}
 	child := pnode.FirstChild
+	visited := 0
 	for !briefs.TrieRefIsNull(child) {
+		visited++
+		if visited > briefs.TrieSiblingMax {
+			return 0, fmt.Errorf("trie sibling walk exceeded %d nodes from parent ref %d (corrupt/cyclic trie)",
+				briefs.TrieSiblingMax, parent)
+		}
 		_, cnode, err := b.trieRead(child)
 		if err != nil {
 			return 0, err

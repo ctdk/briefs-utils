@@ -99,6 +99,9 @@ func trieReadNode(dev *BlockDevice, nodeRef uint64) ([]byte, *briefs.TrieSlot, e
 }
 
 // TrieFindChild finds a child node by byte value in the sibling chain.
+// The walk is capped at briefs.TrieSiblingMax hops: a back-edge in
+// next_sibling (corrupt/stale trie) aborts with an error instead of
+// spinning forever (kernel trie.c briefs_trie_find_child).
 func TrieFindChild(dev *BlockDevice, parentRef uint64, byteVal byte) (uint64, error) {
 	_, pnode, err := trieReadNode(dev, parentRef)
 	if err != nil {
@@ -106,7 +109,13 @@ func TrieFindChild(dev *BlockDevice, parentRef uint64, byteVal byte) (uint64, er
 	}
 
 	child := pnode.FirstChild
+	visited := 0
 	for !briefs.TrieRefIsNull(child) {
+		visited++
+		if visited > briefs.TrieSiblingMax {
+			return 0, fmt.Errorf("trie sibling walk exceeded %d nodes from parent ref %d (corrupt/cyclic trie)",
+				briefs.TrieSiblingMax, parentRef)
+		}
 		cbuf, cnode, err := trieReadNode(dev, child)
 		if err != nil {
 			return 0, err
@@ -143,12 +152,21 @@ func TrieGetChildren(dev *BlockDevice, parentRef uint64) ([]uint64, error) {
 }
 
 // TrieIterator provides a depth-first walk of a directory trie for readdir.
+//
+// The walk stack is dynamic: a trie whose names approach the 255-byte
+// limit pushes up to 256 siblings per level, which overflows any fixed
+// array and used to silently drop entries from readdir.  The walk also
+// caps every sibling chain at briefs.TrieSiblingMax and tracks visited
+// nodes (fsck's cycle semantics: a node may legitimately reappear once,
+// re-pushed with leafEmitted=true to emit its children), so a
+// first_child/next_sibling back-edge in a stale trie ends the walk
+// instead of spinning forever (kernel trie.c cap comments).
 type TrieIterator struct {
 	dev         *BlockDevice
 	blockSize   uint64
-	stack       [256]uint64
-	leafEmitted [256]bool
-	sp          int
+	stack       []uint64
+	leafEmitted []bool
+	visited     map[uint64]bool
 	pending     bool
 	pendingIno  uint64
 	pendingType uint8
@@ -162,13 +180,57 @@ func NewTrieIterator(dev *BlockDevice, dirTrieRoot uint64) *TrieIterator {
 		dev:         dev,
 		blockSize:   dev.BlockSize(),
 		dirTrieRoot: dirTrieRoot,
+		visited:     make(map[uint64]bool),
 	}
 	if !briefs.TrieRefIsNull(dirTrieRoot) {
-		ti.stack[0] = dirTrieRoot
-		ti.sp = 1
-		ti.leafEmitted[0] = false
+		ti.stack = append(ti.stack, dirTrieRoot)
+		ti.leafEmitted = append(ti.leafEmitted, false)
 	}
 	return ti
+}
+
+// pop removes and returns the top of the walk stack.
+func (ti *TrieIterator) pop() (ref uint64, emitted bool, ok bool) {
+	if len(ti.stack) == 0 {
+		return 0, false, false
+	}
+	n := len(ti.stack) - 1
+	ref = ti.stack[n]
+	emitted = ti.leafEmitted[n]
+	ti.stack = ti.stack[:n]
+	ti.leafEmitted = ti.leafEmitted[:n]
+	return ref, emitted, true
+}
+
+// push pushes refs onto the walk stack in reverse so the first ref pops
+// first.
+func (ti *TrieIterator) push(refs []uint64, emitted bool) {
+	for i := len(refs) - 1; i >= 0; i-- {
+		ti.stack = append(ti.stack, refs[i])
+		ti.leafEmitted = append(ti.leafEmitted, emitted)
+	}
+}
+
+// collectChildren gathers a node's child refs in sibling-chain order. The
+// walk is capped at briefs.TrieSiblingMax; on a corrupt/cyclic chain the
+// refs gathered so far are returned.
+func (ti *TrieIterator) collectChildren(node *briefs.TrieSlot) []uint64 {
+	var children []uint64
+	child := node.FirstChild
+	visited := 0
+	for !briefs.TrieRefIsNull(child) {
+		visited++
+		if visited > briefs.TrieSiblingMax {
+			return children
+		}
+		children = append(children, child)
+		_, cnode, err := trieReadNode(ti.dev, child)
+		if err != nil {
+			break
+		}
+		child = cnode.NextSibling
+	}
+	return children
 }
 
 // Next returns the next directory entry from the trie.
@@ -178,10 +240,20 @@ func (ti *TrieIterator) Next() (uint64, uint8, string, error) {
 		return ti.pendingIno, ti.pendingType, ti.pendingName, nil
 	}
 
-	for ti.sp > 0 {
-		ref := ti.stack[ti.sp-1]
-		emitted := ti.leafEmitted[ti.sp-1]
-		ti.sp--
+	for {
+		ref, emitted, ok := ti.pop()
+		if !ok {
+			break
+		}
+
+		if ti.visited[ref] && !emitted {
+			// first_child back-edge: skip it and drain the rest of the
+			// stack (fsck's cycle semantics).
+			continue
+		}
+		if !emitted {
+			ti.visited[ref] = true
+		}
 
 		buf, node, err := trieReadNode(ti.dev, ref)
 		if err != nil {
@@ -189,24 +261,7 @@ func (ti *TrieIterator) Next() (uint64, uint8, string, error) {
 		}
 
 		if emitted {
-			child := node.FirstChild
-			var pushed []uint64
-			for !briefs.TrieRefIsNull(child) {
-				pushed = append(pushed, child)
-				cbuf, cnode, err := trieReadNode(ti.dev, child)
-				if err != nil {
-					break
-				}
-				child = cnode.NextSibling
-				_ = cbuf
-			}
-			for i := len(pushed) - 1; i >= 0; i-- {
-				if ti.sp < 256 {
-					ti.stack[ti.sp] = pushed[i]
-					ti.leafEmitted[ti.sp] = false
-					ti.sp++
-				}
-			}
+			ti.push(ti.collectChildren(node), false)
 			continue
 		}
 
@@ -218,34 +273,15 @@ func (ti *TrieIterator) Next() (uint64, uint8, string, error) {
 			ino := node.Inode
 			ftype := node.FType
 
-			if !briefs.TrieRefIsNull(node.FirstChild) && ti.sp < 256 {
-				ti.stack[ti.sp] = ref
-				ti.leafEmitted[ti.sp] = true
-				ti.sp++
+			if !briefs.TrieRefIsNull(node.FirstChild) {
+				ti.push([]uint64{ref}, true)
 			}
 
 			return ino, ftype, leafName, nil
 		}
 
 		// Pure INTERM node: push children.
-		child := node.FirstChild
-		var children []uint64
-		for !briefs.TrieRefIsNull(child) {
-			children = append(children, child)
-			cbuf, cnode, err := trieReadNode(ti.dev, child)
-			if err != nil {
-				break
-			}
-			child = cnode.NextSibling
-			_ = cbuf
-		}
-		for i := len(children) - 1; i >= 0; i-- {
-			if ti.sp < 256 {
-				ti.stack[ti.sp] = children[i]
-				ti.leafEmitted[ti.sp] = false
-				ti.sp++
-			}
-		}
+		ti.push(ti.collectChildren(node), false)
 	}
 
 	return 0, 0, "", nil
