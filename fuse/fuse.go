@@ -342,30 +342,9 @@ func (n *brieFSNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.Att
 	if err != nil {
 		return syscall.EIO
 	}
-
-	out.Mode = diskInode.Filemode
-	out.Size = diskInode.FileSize
-	out.Uid = diskInode.Uid
-	out.Gid = diskInode.Gid
-	out.Nlink = diskInode.Nlinks
-	out.Atime = diskInode.AtimeSec
-	out.Atimensec = uint32(diskInode.AtimeNsec)
-	out.Mtime = diskInode.MtimeSec
-	out.Mtimensec = uint32(diskInode.MtimeNsec)
-	out.Ctime = diskInode.CtimeSec
-	out.Ctimensec = uint32(diskInode.CtimeNsec)
-
-	totalBlocks := uint64(0)
-	exts, err := n.collectExtents(diskInode)
-	if err != nil {
+	if err := n.fillAttrOut(out, diskInode); err != nil {
 		return syscall.EIO
 	}
-	for _, ext := range exts {
-		totalBlocks += ext.Len
-	}
-	out.Blocks = totalBlocks * (n.bfs.blockSize / 512)
-	out.Blksize = uint32(n.bfs.blockSize)
-
 	return 0
 }
 
@@ -385,28 +364,9 @@ func (n *brieFSNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 		return nil, syscall.EIO
 	}
 
-	out.Mode = childInode.Filemode
-	out.Size = childInode.FileSize
-	out.Uid = childInode.Uid
-	out.Gid = childInode.Gid
-	out.Nlink = childInode.Nlinks
-	out.Atime = childInode.AtimeSec
-	out.Atimensec = uint32(childInode.AtimeNsec)
-	out.Mtime = childInode.MtimeSec
-	out.Mtimensec = uint32(childInode.MtimeNsec)
-	out.Ctime = childInode.CtimeSec
-	out.Ctimensec = uint32(childInode.CtimeNsec)
-
-	totalBlocks := uint64(0)
-	childExts, err := n.collectExtents(childInode)
-	if err != nil {
+	if err := n.fillEntryOut(out, childInode); err != nil {
 		return nil, syscall.EIO
 	}
-	for _, ext := range childExts {
-		totalBlocks += ext.Len
-	}
-	out.Blocks = totalBlocks * (n.bfs.blockSize / 512)
-	out.Blksize = uint32(n.bfs.blockSize)
 
 	var childMode uint32
 	switch ftype {
@@ -538,8 +498,11 @@ func callerCreds(ctx context.Context) (uid, gid uint32) {
 }
 
 // fillEntryOut populates a FUSE EntryOut from an on-disk inode, including the
-// block count derived from its extents.
-func (n *brieFSNode) fillEntryOut(out *fuse.EntryOut, in *briefs.Inode) {
+// block count derived from its extents. The returned error is the extent-walk
+// failure, if any: read-only callers propagate it (EIO); post-mutation
+// callers ignore it deliberately — the on-disk change already happened, so
+// the entry is reported with a best-effort block count.
+func (n *brieFSNode) fillEntryOut(out *fuse.EntryOut, in *briefs.Inode) error {
 	out.Mode = in.Filemode
 	out.Size = in.FileSize
 	out.Uid = in.Uid
@@ -561,6 +524,7 @@ func (n *brieFSNode) fillEntryOut(out *fuse.EntryOut, in *briefs.Inode) {
 	}
 	out.Blocks = totalBlocks * (n.bfs.blockSize / 512)
 	out.Blksize = uint32(n.bfs.blockSize)
+	return err
 }
 
 // newChildNode wraps a freshly created inode in a go-fuse Inode linked to its
@@ -753,8 +717,9 @@ func (n *brieFSNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 }
 
 // fillAttrOut populates a FUSE AttrOut from an on-disk inode, including the
-// block count derived from its extents. Shared by Getattr and Setattr.
-func (n *brieFSNode) fillAttrOut(out *fuse.AttrOut, in *briefs.Inode) {
+// block count derived from its extents. Shared by Getattr and Setattr; the
+// returned error is the extent-walk failure, if any (callers return EIO).
+func (n *brieFSNode) fillAttrOut(out *fuse.AttrOut, in *briefs.Inode) error {
 	out.Mode = in.Filemode
 	out.Size = in.FileSize
 	out.Uid = in.Uid
@@ -775,6 +740,7 @@ func (n *brieFSNode) fillAttrOut(out *fuse.AttrOut, in *briefs.Inode) {
 	}
 	out.Blocks = totalBlocks * (n.bfs.blockSize / 512)
 	out.Blksize = uint32(n.bfs.blockSize)
+	return err
 }
 
 // Setattr handles chmod/chown/utimes/truncate. Mirrors briefs_setattr
@@ -800,7 +766,9 @@ func (n *brieFSNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetA
 	if err != nil {
 		return syscall.EIO
 	}
-	n.fillAttrOut(out, di)
+	if err := n.fillAttrOut(out, di); err != nil {
+		return syscall.EIO
+	}
 	return 0
 }
 
