@@ -214,6 +214,24 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 		}
 	}
 
+	if fs.verbose {
+		dirs, files, symlinks, other := 0, 0, 0, 0
+		for _, in := range fs.inodes {
+			switch {
+			case in.IsDir():
+				dirs++
+			case in.IsFile():
+				files++
+			case in.IsSymlink():
+				symlinks++
+			default:
+				other++
+			}
+		}
+		fs.verbosef("inode table: %d allocated inode(s) scanned: %d dir(s), %d file(s), %d symlink(s), %d other",
+			totalInodes, dirs, files, symlinks, other)
+	}
+
 	return
 }
 

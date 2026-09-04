@@ -297,11 +297,9 @@ func (b *BrieFS) commitXattrOp(in *briefs.Inode, absBlocks []uint64, bufs [][]by
 			return err
 		}
 	}
-	// Drain the new xattr blocks to disk (re-derivable via XATTR_DATA on crash,
-	// but flush now so the non-crash path sees them without waiting for replay).
-	for _, abs := range absBlocks {
-		_ = abs // written above; Fdatasync below flushes the whole file.
-	}
+	// The new xattr blocks were written above (re-derivable via XATTR_DATA on
+	// crash, but flushed now so the non-crash path sees them without waiting
+	// for replay); Fdatasync below flushes the whole file.
 	if err := b.dev.Fdatasync(); err != nil {
 		b.failWrite()
 		return err

@@ -139,17 +139,6 @@ func UnmarshalInode(data []byte) (*Inode, error) {
 	return in, nil
 }
 
-// Write writes the inode to a file at the given offset (in 512-byte units).
-// Deprecated: Use WriteAt with byte offsets instead.
-func (in *Inode) Write(file *os.File, offset uint64) error {
-	return in.WriteAt(file, int64(offset*512))
-}
-
-// ValidateInode checks if the inode magic is correct.
-func (in *Inode) ValidateInode() bool {
-	return in.Magic == MagicInode
-}
-
 // Extent helpers
 
 // SetInlineExtent sets one of the 8 inline extents on an inode.

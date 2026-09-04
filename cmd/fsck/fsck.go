@@ -92,7 +92,7 @@ func main() {
 			&cli.BoolFlag{
 				Name:    "verbose",
 				Aliases: []string{"V"},
-				Usage:   "verbose output",
+				Usage:   "report every diagnostic (lifts the per-check caps) and print extra scan detail",
 			},
 			&cli.BoolFlag{
 				Name:    "repair",
@@ -141,6 +141,7 @@ func main() {
 				return nil
 			}
 			path := c.Args().First()
+			verbose := c.Bool("verbose")
 			repair := c.Bool("repair")
 			repairOnly := c.String("repair-only")
 			optimize := c.Bool("optimize")
@@ -195,8 +196,8 @@ func main() {
 			deviceSize := bd.Bytes()
 
 			fs := &fsckState{
-				file:   file,
-				repair: repair,
+				file:    file,
+				verbose: verbose,
 			}
 
 			fmt.Fprintf(os.Stderr, "BrieFS filesystem check, version %s\n", briefs.VersionStr)

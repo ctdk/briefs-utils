@@ -42,13 +42,9 @@ func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 		}
 		relBlk := absBlk - dataRegionStart
 		if !allocAllocated[relBlk] {
-			if orphans < 20 {
-				fs.errorf("block %d (data-relative %d): used by inode/trie but NOT marked allocated in bitmap",
-					absBlk, relBlk)
-			} else if orphans == 20 {
-				fs.errorf("(more orphan block errors suppressed)")
-			}
-			orphans++
+			fs.reportLimited(&orphans, 20, fs.errorf, "(more orphan block errors suppressed)",
+				"block %d (data-relative %d): used by inode/trie but NOT marked allocated in bitmap",
+				absBlk, relBlk)
 		}
 	}
 	if orphans > 0 {
@@ -72,22 +68,17 @@ func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 		}
 		absBlk := dataRegionStart + relBlk
 		if !fs.usedBlocks[absBlk] {
-			if leaked < 20 {
-				if hasFailedTries || hasFailedBtrees {
-					fs.warnf("block %d (data-relative %d): marked allocated but not found during trie/btree walk (may be from a failed traversal)",
-						absBlk, relBlk)
-				} else {
-					fs.errorf("block %d (data-relative %d): marked allocated in bitmap but NOT referenced by any inode/trie",
-						absBlk, relBlk)
-				}
-			} else if leaked == 20 {
-				if hasFailedTries || hasFailedBtrees {
-					fs.warnf("(more unverifiable block warnings suppressed)")
-				} else {
-					fs.errorf("(more leaked block errors suppressed)")
-				}
+			if hasFailedTries || hasFailedBtrees {
+				fs.reportLimited(&leaked, 20, fs.warnf,
+					"(more unverifiable block warnings suppressed)",
+					"block %d (data-relative %d): marked allocated but not found during trie/btree walk (may be from a failed traversal)",
+					absBlk, relBlk)
+			} else {
+				fs.reportLimited(&leaked, 20, fs.errorf,
+					"(more leaked block errors suppressed)",
+					"block %d (data-relative %d): marked allocated in bitmap but NOT referenced by any inode/trie",
+					absBlk, relBlk)
 			}
-			leaked++
 		}
 	}
 	if leaked > 0 {
@@ -97,6 +88,9 @@ func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 			fmt.Fprintf(os.Stderr, "  block cross-ref: %d block(s) allocated but not referenced\n", leaked)
 		}
 	}
+
+	fs.verbosef("block cross-ref: %d block(s) marked allocated, %d block(s) referenced by inodes/tries",
+		len(allocAllocated), len(fs.usedBlocks))
 
 	if orphans == 0 && leaked == 0 {
 		fmt.Fprintf(os.Stderr, "  block cross-ref: all used blocks match allocator bitmap\n")
@@ -164,12 +158,9 @@ func verifyLinkCounts(fs *fsckState, blockSize uint64) {
 			continue
 		}
 		if int(in.Nlinks) != expected {
-			if mismatches < 20 {
-				fs.errorf("ino %d: nlink=%d but expected %d", ino, in.Nlinks, expected)
-			} else if mismatches == 20 {
-				fs.errorf("(more link count errors suppressed)")
-			}
-			mismatches++
+			fs.reportLimited(&mismatches, 20, fs.errorf,
+				"(more link count errors suppressed)",
+				"ino %d: nlink=%d but expected %d", ino, in.Nlinks, expected)
 		}
 	}
 	if mismatches == 0 {
@@ -191,13 +182,10 @@ func verifyDirEntryCrossReference(fs *fsckState, entries []trieEntry) {
 		// Check inode exists
 		in, ok := fs.inodes[e.Inode]
 		if !ok {
-			if badInos < 20 {
-				fs.errorf("dir entry '%s' in ino %d: references ino %d which does not exist",
-					e.Name, e.Parent, e.Inode)
-			} else if badInos == 20 {
-				fs.errorf("(more bad inode reference errors suppressed)")
-			}
-			badInos++
+			fs.reportLimited(&badInos, 20, fs.errorf,
+				"(more bad inode reference errors suppressed)",
+				"dir entry '%s' in ino %d: references ino %d which does not exist",
+				e.Name, e.Parent, e.Inode)
 			continue
 		}
 
@@ -214,13 +202,10 @@ func verifyDirEntryCrossReference(fs *fsckState, entries []trieEntry) {
 			expectedFType = 10 // S_IFLNK >> 12
 		}
 		if expectedFType != 0 && e.FType != expectedFType {
-			if badTypes < 20 {
-				fs.errorf("dir entry '%s' in ino %d: ftype=%d but inode %d has mode 0x%04X (expected %d)",
-					e.Name, e.Parent, e.FType, e.Inode, in.Filemode, expectedFType)
-			} else if badTypes == 20 {
-				fs.errorf("(more type mismatch errors suppressed)")
-			}
-			badTypes++
+			fs.reportLimited(&badTypes, 20, fs.errorf,
+				"(more type mismatch errors suppressed)",
+				"dir entry '%s' in ino %d: ftype=%d but inode %d has mode 0x%04X (expected %d)",
+				e.Name, e.Parent, e.FType, e.Inode, in.Filemode, expectedFType)
 		}
 	}
 
@@ -239,12 +224,9 @@ func verifyOrphanedInodes(fs *fsckState) {
 			continue // root is special
 		}
 		if in.Nlinks > 0 && fs.entryCounts[ino] == 0 {
-			if orphans < 20 {
-				fs.errorf("ino %d: nlink=%d but no directory entries reference it (orphaned)", ino, in.Nlinks)
-			} else if orphans == 20 {
-				fs.errorf("(more orphaned inode errors suppressed)")
-			}
-			orphans++
+			fs.reportLimited(&orphans, 20, fs.errorf,
+				"(more orphaned inode errors suppressed)",
+				"ino %d: nlink=%d but no directory entries reference it (orphaned)", ino, in.Nlinks)
 		}
 	}
 	if orphans == 0 {
@@ -336,11 +318,10 @@ func verifyExtentOverlaps(fs *fsckState) {
 				continue // degenerate/unknown bound: nothing to check
 			}
 			if ei.phys < r.end && eiEnd > r.start {
-				if overlaps < 20 {
-					fs.errorf("ino %d: extent at phys=%d len=%d overlaps with %s (blocks %d-%d)",
-						ei.ino, ei.phys, ei.len, r.name, r.start, r.end-1)
-				}
-				overlaps++
+				fs.reportLimited(&overlaps, 20, fs.errorf,
+					"(more extent overlap errors suppressed)",
+					"ino %d: extent at phys=%d len=%d overlaps with %s (blocks %d-%d)",
+					ei.ino, ei.phys, ei.len, r.name, r.start, r.end-1)
 			}
 		}
 
@@ -349,16 +330,15 @@ func verifyExtentOverlaps(fs *fsckState) {
 			ej := allExtents[j]
 			ejEnd := ej.phys + ej.len
 			if ei.phys < ejEnd && eiEnd > ej.phys {
-				if overlaps < 20 {
-					fs.errorf("ino %d extent and ino %d extent overlap: [%d,%d) vs [%d,%d)",
-						ei.ino, ej.ino, ei.phys, eiEnd, ej.phys, ejEnd)
-				} else if overlaps == 20 {
-					fs.errorf("(more extent overlap errors suppressed)")
-				}
-				overlaps++
+				fs.reportLimited(&overlaps, 20, fs.errorf,
+					"(more extent overlap errors suppressed)",
+					"ino %d extent and ino %d extent overlap: [%d,%d) vs [%d,%d)",
+					ei.ino, ej.ino, ei.phys, eiEnd, ej.phys, ejEnd)
 			}
 		}
 	}
+
+	fs.verbosef("extent overlap: checked %d extent(s) across %d inode(s)", len(allExtents), len(fs.inodes))
 
 	if overlaps == 0 {
 		fmt.Fprintf(os.Stderr, "  extent overlap: no overlapping extents found\n")
@@ -401,12 +381,9 @@ func verifyReachability(fs *fsckState, entries []trieEntry) {
 			continue
 		}
 		if !reachable[ino] {
-			if unreachable < 20 {
-				fs.errorf("ino %d: not reachable from root directory", ino)
-			} else if unreachable == 20 {
-				fs.errorf("(more unreachable inode errors suppressed)")
-			}
-			unreachable++
+			fs.reportLimited(&unreachable, 20, fs.errorf,
+				"(more unreachable inode errors suppressed)",
+				"ino %d: not reachable from root directory", ino)
 		}
 	}
 
@@ -430,13 +407,10 @@ func verifyDuplicateNames(fs *fsckState, entries []trieEntry) {
 		for _, e := range ents {
 			if firstIno, ok := seen[e.Name]; ok {
 				if firstIno != e.Inode {
-					if dups < 20 {
-						fs.errorf("ino %d: duplicate name '%s' (inodes %d and %d)",
-							parent, e.Name, firstIno, e.Inode)
-					} else if dups == 20 {
-						fs.errorf("(more duplicate name errors suppressed)")
-					}
-					dups++
+					fs.reportLimited(&dups, 20, fs.errorf,
+						"(more duplicate name errors suppressed)",
+						"ino %d: duplicate name '%s' (inodes %d and %d)",
+						parent, e.Name, firstIno, e.Inode)
 				}
 			} else {
 				seen[e.Name] = e.Inode

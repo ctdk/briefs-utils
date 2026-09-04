@@ -209,21 +209,6 @@ func TrieRefIsNull(ref uint64) bool {
 	return ref == 0
 }
 
-// nextPowerOf2 returns the smallest power of 2 >= n.
-func nextPowerOf2(n uint64) uint64 {
-	if n <= 1 {
-		return 1
-	}
-	n--
-	n |= n >> 1
-	n |= n >> 2
-	n |= n >> 4
-	n |= n >> 8
-	n |= n >> 16
-	n |= n >> 32
-	return n + 1
-}
-
 // DefaultJournalBlocks returns the default journal size for a volume with
 // totalBlocks blocks.  The journal scales as max(64, totalBlocks / 4096),
 // capped at DefaultJournalMaxBlocks (4096 = 16 MiB).  This keeps the journal
@@ -258,9 +243,6 @@ type Extent struct {
 // ExtentChainHeaderSize is the size of the header in an extent chain block
 // (next_overflow_block + num_extents_in_block + pad).
 const ExtentChainHeaderSize = 16
-
-// ExtentChainChecksumSize is the checksum field size.
-const ExtentChainChecksumSize = 8
 
 // ExtentChainChecksumOffset is the byte offset of the checksum field within a
 // 4096-byte metadata block (chain block historically; now also the B+ tree

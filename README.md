@@ -73,7 +73,7 @@ DESCRIPTION:
    Check and, with --repair, fix a BrieFS filesystem on DEVICE.  fsck.briefs verifies journal-record and B+ tree checksums, validates directory-trie pages, inode extended-attribute chains, and inode link counts, and can rebuild the allocator bitmaps and B+ tree extent indexes, compact directory tries, and repair link counts.  Repairs are phased and selectable with --repair-only.
 
 GLOBAL OPTIONS:
-   --verbose, -V             verbose output
+   --verbose, -V             report every diagnostic (lifts the per-check caps) and print extra scan detail
    --repair, -r              attempt to repair found errors
    --repair-only string      run only selected repair phases (comma-separated: allocator,btrees,btree-rebuild,btree-orphan,extents,trie,links; default all)
    --optimize                safe compaction only (alias for --repair --repair-only=trie,extents)

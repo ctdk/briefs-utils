@@ -107,9 +107,6 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootRef uint64, blockS
 		if node.Flags&uint16(briefs.NodeFlagDeleted) != 0 {
 			fs.warnf("ino %d dir trie: ref %d: NODE_FLAG_DELETED set (pending cleanup)", parentIno, ref)
 		}
-		if ref == rootRef && node.Flags&uint16(briefs.NodeFlagRoot) != 0 {
-			// NODE_FLAG_ROOT defined but unused.
-		}
 		if ref != rootRef && node.Flags&uint16(briefs.NodeFlagRoot) != 0 {
 			fs.errorf("ino %d dir trie: ref %d: NODE_FLAG_ROOT set on non-root node", parentIno, ref)
 		}

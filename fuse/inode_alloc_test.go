@@ -144,7 +144,7 @@ func TestInodeAllocFree(t *testing.T) {
 	if err := bfs.flushCache(); err != nil {
 		t.Fatalf("flushCache: %v", err)
 	}
-	// A freed inode must read back with magic 0 (ZeroInode).
+	// A freed inode must read back with magic 0 (zeroInodeCached).
 	rt2, err := bfs.inodes.ReadInode(in1.InodeNumber)
 	if err != nil {
 		t.Fatalf("ReadInode after free: %v", err)

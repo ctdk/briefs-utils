@@ -12,6 +12,9 @@ type fsckState struct {
 	errors int
 	file   *os.File
 	sb     *briefs.SuperblockLayout
+	// --verbose: lift the per-check report caps and print extra scan
+	// detail. The default output is unchanged.
+	verbose bool
 	// Collected during inode table scan for cross-referencing
 	inodes      map[uint64]*briefs.Inode // ino -> inode
 	dirs        []dirInfo               // directories with trie roots
@@ -27,8 +30,6 @@ type fsckState struct {
 	// The repair gate refuses --repair when this set is non-empty and the
 	// allocator rebuild phase is active (repairOpts.RebuildAllocator).
 	failedBtreeInos map[uint64]bool // ino -> true if B-tree extent index walk had unrecoverable errors
-	// Set when the caller requested repair/optimization.
-	repair bool
 }
 
 // repairPlan holds the intended state after repair/optimization. All changes
@@ -65,4 +66,27 @@ func (fs *fsckState) errorf(format string, args ...interface{}) {
 
 func (fs *fsckState) warnf(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "  WARNING: "+format+"\n", args...)
+}
+
+// reportLimited emits one capped diagnostic.  Normally the first @limit
+// occurrences of a check report via @report (fs.errorf or fs.warnf — or a
+// closure choosing between them), then a single @suppressNotice goes out
+// the same channel and the rest stay silent.  --verbose lifts the cap:
+// every occurrence reports.  @counter tracks the caller's running total
+// and is incremented even when the report is suppressed, so summary
+// counts at the end of the check stay complete.
+func (fs *fsckState) reportLimited(counter *int, limit int, report func(string, ...interface{}), suppressNotice, format string, args ...interface{}) {
+	if fs.verbose || *counter < limit {
+		report(format, args...)
+	} else if *counter == limit {
+		report("%s", suppressNotice)
+	}
+	*counter++
+}
+
+// verbosef prints an informational line only under --verbose.
+func (fs *fsckState) verbosef(format string, args ...interface{}) {
+	if fs.verbose {
+		fmt.Fprintf(os.Stderr, "  "+format+"\n", args...)
+	}
 }

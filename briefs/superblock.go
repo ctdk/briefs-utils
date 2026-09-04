@@ -70,14 +70,6 @@ type Superblock struct {
 	Lay SuperblockLayout
 }
 
-// Getters for easy access to superblock fields
-func (sb *Superblock) TotalBlocks() uint64 { return sb.Lay.TotalBlocks }
-func (sb *Superblock) BlockSize() uint64 { return sb.Lay.BlockSize }
-func (sb *Superblock) InodeSize() uint64 { return sb.Lay.InodeSize }
-func (sb *Superblock) JournalBlocks() uint64 { return sb.Lay.JournalBlocks }
-func (sb *Superblock) DataBlocks() uint64 { return sb.Lay.DataBlocks }
-func (sb *Superblock) TotalInodes() uint64 { return sb.Lay.FreeInodes + 100 } // rough estimate
-
 // NewSuperblock creates a new superblock with the given metadata.
 // mkfs.briefs will set the layout fields (bitmap offsets, etc.) after creation.
 func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, label string, uuidStr string) (*Superblock, error) {

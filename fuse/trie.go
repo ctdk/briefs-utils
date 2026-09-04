@@ -130,27 +130,6 @@ func TrieFindChild(dev *BlockDevice, parentRef uint64, byteVal byte) (uint64, er
 	return 0, nil
 }
 
-// TrieGetChildren returns all children of a trie node.
-func TrieGetChildren(dev *BlockDevice, parentRef uint64) ([]uint64, error) {
-	_, pnode, err := trieReadNode(dev, parentRef)
-	if err != nil {
-		return nil, err
-	}
-
-	var children []uint64
-	child := pnode.FirstChild
-	for !briefs.TrieRefIsNull(child) {
-		children = append(children, child)
-		cbuf, cnode, err := trieReadNode(dev, child)
-		if err != nil {
-			return nil, err
-		}
-		child = cnode.NextSibling
-		_ = cbuf
-	}
-	return children, nil
-}
-
 // TrieIterator provides a depth-first walk of a directory trie for readdir.
 //
 // The walk stack is dynamic: a trie whose names approach the 255-byte

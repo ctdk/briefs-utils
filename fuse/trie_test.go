@@ -139,10 +139,6 @@ func TestTrieFindChild(t *testing.T) {
 	_ = TrieFindChild
 }
 
-func TestTrieGetChildren(t *testing.T) {
-	_ = TrieGetChildren
-}
-
 func TestTrieLookup(t *testing.T) {
 	_ = TrieLookup
 }

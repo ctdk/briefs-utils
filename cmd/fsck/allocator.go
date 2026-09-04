@@ -128,12 +128,9 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize, sbExpectedFree u
 			}
 		}
 		if l1[i] != expected {
-			if l1Errors < errorReportLimit {
-				fs.errorf("%s: L1 word %d mismatch: on-disk 0x%016X, computed 0x%016X", label, i, l1[i], expected)
-			} else if l1Errors == errorReportLimit {
-				fs.errorf("%s: (more L1 errors suppressed)", label)
-			}
-			l1Errors++
+			fs.reportLimited(&l1Errors, errorReportLimit, fs.errorf,
+				"%s: (more L1 errors suppressed)", "%s: L1 word %d mismatch: on-disk 0x%016X, computed 0x%016X",
+				label, i, l1[i], expected)
 		}
 	}
 
@@ -148,12 +145,9 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize, sbExpectedFree u
 			}
 		}
 		if l0[i] != expected {
-			if l0Errors < errorReportLimit {
-				fs.errorf("%s: L0 word %d mismatch: on-disk 0x%016X, computed 0x%016X", label, i, l0[i], expected)
-			} else if l0Errors == errorReportLimit {
-				fs.errorf("%s: (more L0 errors suppressed)", label)
-			}
-			l0Errors++
+			fs.reportLimited(&l0Errors, errorReportLimit, fs.errorf,
+				"%s: (more L0 errors suppressed)", "%s: L0 word %d mismatch: on-disk 0x%016X, computed 0x%016X",
+				label, i, l0[i], expected)
 		}
 	}
 
@@ -228,12 +222,9 @@ func verifyInodeBitmapCrossReference(fs *fsckState, blockSize, inodeSize uint64)
 			hasMagic := magic == briefs.MagicInode
 
 			if allocated && !hasMagic {
-				if badAllocated < errorReportLimit {
-					fs.errorf("ino %d: bitmap says allocated but inode has no valid magic (0x%016X)", ino, magic)
-				} else if badAllocated == errorReportLimit {
-					fs.errorf("(more inode bitmap/table mismatch errors suppressed)")
-				}
-				badAllocated++
+				fs.reportLimited(&badAllocated, errorReportLimit, fs.errorf,
+					"(more inode bitmap/table mismatch errors suppressed)",
+					"ino %d: bitmap says allocated but inode has no valid magic (0x%016X)", ino, magic)
 			}
 			ino++
 		}
