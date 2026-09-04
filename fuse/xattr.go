@@ -322,6 +322,46 @@ func (b *BrieFS) removeXattr(ino uint64, name string) error {
 
 // --- read path ---
 
+// walkXattrChain loads every block of the xattr chain starting at head, in
+// chain order, guarded against loops and over-long chains (the kernel's
+// BRIEFS_XATTR_MAX_CHAIN). verifyCRC additionally checks each block's chain
+// checksum: the value-assembly walk acts on block contents and must not trust
+// a torn block, while the free-block walk only follows next pointers.
+// Returns (nil, nil, nil, nil) for a null head.
+func (b *BrieFS) walkXattrChain(head uint64, verifyCRC bool) (blocks [][]byte, headers []*briefs.XattrHeader, abs []uint64, err error) {
+	if head == 0 {
+		return nil, nil, nil, nil
+	}
+	visited := make(map[uint64]bool)
+	for block := head; block != 0; {
+		if visited[block] {
+			return nil, nil, nil, fmt.Errorf("briefs: xattr chain loop at %d", block)
+		}
+		if len(visited) > briefs.XattrMaxChain {
+			return nil, nil, nil, fmt.Errorf("briefs: xattr chain too long")
+		}
+		visited[block] = true
+		buf, rerr := b.dev.ReadBlock(block)
+		if rerr != nil {
+			return nil, nil, nil, rerr
+		}
+		h, rerr := briefs.ReadXattrHeader(buf)
+		if rerr != nil {
+			return nil, nil, nil, fmt.Errorf("briefs: xattr block %d: %w", block, rerr)
+		}
+		if verifyCRC {
+			if rerr = briefs.VerifyChainChecksum(buf, b.blockSize); rerr != nil {
+				return nil, nil, nil, fmt.Errorf("briefs: xattr block %d CRC: %w", block, rerr)
+			}
+		}
+		blocks = append(blocks, buf)
+		headers = append(headers, h)
+		abs = append(abs, block)
+		block = h.NextBlock
+	}
+	return blocks, headers, abs, nil
+}
+
 // loadXattrEntries walks the inode's xattr chain and returns the assembled
 // key/value set plus the chain's absolute block numbers (for freeing). Returns
 // (nil, nil, nil) if the inode has no xattr block.
@@ -330,34 +370,9 @@ func (b *BrieFS) loadXattrEntries(in *briefs.Inode) ([]xattrKV, []uint64, error)
 		return nil, nil, nil
 	}
 	// Pass 1: load the whole chain into memory.
-	var blocks [][]byte
-	var headers []*briefs.XattrHeader
-	var abs []uint64
-	block := in.XattrOffset
-	visited := make(map[uint64]bool)
-	for block != 0 {
-		if visited[block] {
-			return nil, nil, fmt.Errorf("briefs: xattr chain loop at %d", block)
-		}
-		if len(visited) > briefs.XattrMaxChain {
-			return nil, nil, fmt.Errorf("briefs: xattr chain too long")
-		}
-		visited[block] = true
-		buf, err := b.dev.ReadBlock(block)
-		if err != nil {
-			return nil, nil, err
-		}
-		h, err := briefs.ReadXattrHeader(buf)
-		if err != nil {
-			return nil, nil, fmt.Errorf("briefs: xattr block %d: %w", block, err)
-		}
-		if err := briefs.VerifyChainChecksum(buf, b.blockSize); err != nil {
-			return nil, nil, fmt.Errorf("briefs: xattr block %d CRC: %w", block, err)
-		}
-		blocks = append(blocks, buf)
-		headers = append(headers, h)
-		abs = append(abs, block)
-		block = h.NextBlock
+	blocks, headers, abs, err := b.walkXattrChain(in.XattrOffset, true)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Pass 2: parse entry blocks and assemble split values from the following
@@ -425,32 +440,8 @@ func (b *BrieFS) loadXattrEntries(in *briefs.Inode) ([]xattrKV, []uint64, error)
 // walkXattrChainBlocks returns the absolute block numbers of a chain starting
 // at head, without assembling values. Used to free the old chain.
 func (b *BrieFS) walkXattrChainBlocks(head uint64) ([]uint64, error) {
-	if head == 0 {
-		return nil, nil
-	}
-	var out []uint64
-	block := head
-	visited := make(map[uint64]bool)
-	for block != 0 {
-		if visited[block] {
-			return nil, fmt.Errorf("briefs: xattr free loop at %d", block)
-		}
-		if len(visited) > briefs.XattrMaxChain {
-			return nil, fmt.Errorf("briefs: xattr chain too long")
-		}
-		visited[block] = true
-		out = append(out, block)
-		buf, err := b.dev.ReadBlock(block)
-		if err != nil {
-			return nil, err
-		}
-		h, err := briefs.ReadXattrHeader(buf)
-		if err != nil {
-			return nil, fmt.Errorf("briefs: xattr block %d: %w", block, err)
-		}
-		block = h.NextBlock
-	}
-	return out, nil
+	_, _, abs, err := b.walkXattrChain(head, false)
+	return abs, err
 }
 
 // --- chain build / serialize ---

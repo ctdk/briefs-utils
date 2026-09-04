@@ -389,13 +389,11 @@ func main() {
 
 			// --- Write metadata blocks ---
 
-			// 1. Superblock (block 0)
-			sbData := make([]byte, blockSize)
-			copy(sbData, sb.MarshalBinary())
-			if _, err := file.WriteAt(sbData, 0); err != nil {
-				return fmt.Errorf("write superblock: %w", err)
-			}
-
+			// 1. Superblock (block 0): written once, after all metadata is on
+			// disk, with the final free counts and checkpoint sequence. An
+			// intermediate write here would be immediately overwritten and
+			// could leave a stale-count superblock behind if a later step
+			// failed mid-run.
 			// 2. Inode bitmap pyramid (3-level allocator)
 			// Mark root inode (index 0) as allocated
 			inodeAllocBuilder.MarkAllocated(0)

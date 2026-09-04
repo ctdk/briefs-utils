@@ -282,7 +282,6 @@ func sortShards(s []uint64) {
 }
 
 // readSuperblock reads and parses the superblock from block 0.
-// readSuperblock reads and parses the superblock from block 0.
 func readSuperblock(dev *BlockDevice) (*briefs.SuperblockLayout, error) {
 	return briefs.ReadSuperblock(dev, dev.BlockSize())
 }

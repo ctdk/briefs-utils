@@ -2,9 +2,11 @@
 package fuse
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
+	"syscall"
+
+	"github.com/ctdk/briefs-utils/briefs"
 )
 
 // BlockDevice provides random-access block I/O at the filesystem's block size.
@@ -34,9 +36,15 @@ func OpenBlockDevice(path string) (*BlockDevice, uint64, error) {
 		return nil, 0, fmt.Errorf("read superblock probe: %w", err)
 	}
 
-	// Extract block size from superblock at offset 48 (8 bytes, little-endian).
-	// This matches the BlockSize field in SuperblockLayout.
-	blockSize := binary.LittleEndian.Uint64(probe[48:56])
+	// Parse the probe through the generated superblock codec instead of a
+	// hand-rolled offset read; the full magic/version validation happens in
+	// Mount's readSuperblock right after this.
+	probeSb := &briefs.SuperblockLayout{}
+	if err := probeSb.UnmarshalBinary(probe); err != nil {
+		f.Close()
+		return nil, 0, fmt.Errorf("parse superblock probe: %w", err)
+	}
+	blockSize := probeSb.BlockSize
 	if blockSize == 0 || blockSize > 4096 || (blockSize&(blockSize-1)) != 0 {
 		// Invalid or non-power-of-2 block size; fall back to default 4096.
 		// This handles older images or corrupted superblocks gracefully.
@@ -111,11 +119,18 @@ func (bd *BlockDevice) Sync() error {
 	return nil
 }
 
-// Fdatasync is like Sync but only flushes data, not metadata. On regular
-// files it falls back to a full Sync when the platform lacks fdatasync.
+// Fdatasync flushes the device's data to durable storage without the
+// metadata a full Sync also writes (the data-drain half of the kernel's
+// briefs_btree_drain discipline). Platforms or file types without
+// fdatasync fall back to a full Sync, which flushes data too.
 func (bd *BlockDevice) Fdatasync() error {
-	if err := bd.file.Sync(); err != nil {
-		return fmt.Errorf("fdatasync device: %w", err)
+	if err := syscall.Fdatasync(int(bd.file.Fd())); err != nil {
+		if err != syscall.ENOSYS && err != syscall.EINVAL {
+			return fmt.Errorf("fdatasync device: %w", err)
+		}
+		if serr := bd.file.Sync(); serr != nil {
+			return fmt.Errorf("fdatasync device (sync fallback): %w", serr)
+		}
 	}
 	return nil
 }

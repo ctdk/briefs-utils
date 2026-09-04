@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -135,9 +136,9 @@ func CheckMounted(path string) error {
 	return nil
 }
 
-// resolvePath resolves a path to its absolute form, following symlinks.
+// resolvePath resolves a path to its absolute, cleaned form.
 func resolvePath(path string) (string, error) {
-	return filepathAbs(path)
+	return filepath.Abs(path)
 }
 
 // resolveLoopBackingFile reads the backing_file sysfs entry for a loop device.
@@ -152,17 +153,3 @@ func resolveLoopBackingFile(loopDev string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// filepathAbs is a direct implementation of filepath.Abs without importing path/filepath.
-func filepathAbs(path string) (string, error) {
-	if strings.HasPrefix(path, "/") {
-		return path, nil
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	if cwd == "/" {
-		return "/" + path, nil
-	}
-	return cwd + "/" + path, nil
-}
