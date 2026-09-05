@@ -116,6 +116,115 @@ func (a *Allocator) AllocBlock() uint64 {
 	return 0
 }
 
+// AllocBlocks finds and allocates a contiguous run of n free blocks under one
+// lock, returning the starting data-relative block, or 0 when no contiguous
+// run of length n is free (or n == 0). Ported from the kernel's
+// briefs_alloc_blocks (alloc.c:350): first-fit scan of the L2 words for a
+// maximal run of set (free) bits at least n long, possibly spanning word
+// boundaries, with the last word masked to blockCount bits so a run cannot
+// run past the end of the device. The block-0 failure sentinel is reserved
+// (idempotently) before the scan, so a run never starts at 0.
+func (a *Allocator) AllocBlocks(n uint64) uint64 {
+	if a.l0 == nil || n == 0 {
+		return 0
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if n > a.freeCount || n > a.blockCount {
+		return 0
+	}
+
+	// Reserve the data-relative block-0 sentinel so a run never starts there
+	// (briefs_alloc_block's convention; mkfs normally did this already).
+	if a.l2[0]&1 != 0 {
+		a.l2[0] &^= 1
+		a.freeCount--
+		if a.l2[0] == 0 {
+			a.l1[0] &^= 1
+			if a.l1[0] == 0 {
+				a.l0[0] &^= 1
+			}
+		}
+		a.dirty = true
+	}
+
+	runStart, runLen := uint64(0), uint64(0)
+	for w2 := uint64(0); w2 < a.l2Words; w2++ {
+		word := a.l2[w2]
+		base := w2 * 64
+
+		// Mask trailing bits beyond blockCount in the last word.
+		if w2 == a.l2Words-1 {
+			if rem := a.blockCount % 64; rem != 0 {
+				word &= (1 << rem) - 1
+			}
+		}
+		if word == 0 {
+			runLen = 0
+			continue
+		}
+
+		// Walk each maximal run of set bits within this word.
+		// (Named wbits: `bits` is the math/bits package.)
+		wbits := word
+		for wbits != 0 {
+			b := uint64(bits.TrailingZeros64(wbits))
+			s := base + b
+			// Count consecutive set bits from b within this word.
+			// TrailingZeros64(0) == 64, so an all-ones-from-b run
+			// (only possible at b == 0) yields cnt == 64.
+			cnt := uint64(bits.TrailingZeros64(^(wbits >> b)))
+			if runLen > 0 && s == runStart+runLen {
+				runLen += cnt // contiguous with the previous word's run
+			} else {
+				runStart, runLen = s, cnt
+			}
+			if runLen >= n {
+				goto found
+			}
+			// Clear the consumed run bits. When cnt == 64 the whole
+			// word is one run from bit b (bits below b are already
+			// 0), so clearing the entire word is equivalent and
+			// avoids the (1 << 64) that would otherwise loop forever.
+			if cnt >= 64 {
+				wbits = 0
+			} else {
+				wbits &^= ((1 << cnt) - 1) << b
+			}
+		}
+	}
+
+	// No contiguous run of length n.
+	return 0
+
+found:
+	// Clear the n bits.
+	for i := uint64(0); i < n; i++ {
+		blk := runStart + i
+		a.l2[blk/64] &^= 1 << (blk % 64)
+	}
+	a.freeCount -= n
+
+	// Propagate L2 -> L1 -> L0 for every L2 word that became all-zero.
+	w2First := runStart / 64
+	w2Last := (runStart + n - 1) / 64
+	for w2 := w2First; w2 <= w2Last; w2++ {
+		if a.l2[w2] == 0 {
+			w1, b1 := w2/64, w2%64
+			a.l1[w1] &^= 1 << b1
+			if a.l1[w1] == 0 {
+				w0, b0 := w1/64, w1%64
+				a.l0[w0] &^= 1 << b0
+			}
+		}
+	}
+
+	a.dirty = true
+	return runStart
+}
+
 // FreeBlock marks a data-relative block as free.
 func (a *Allocator) FreeBlock(relBlock uint64) {
 	a.mu.Lock()

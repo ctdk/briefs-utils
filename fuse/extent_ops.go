@@ -95,24 +95,69 @@ func (b *BrieFS) fallocateOp(ino uint64, off, size uint64, mode uint32) error {
 	}
 
 	// Preallocate: allocate unwritten extents for [off, end). Promote inline
-	// data first if the range exceeds the inline region.
+	// data first if the range exceeds the inline region; the promoted block
+	// joins preallocate's rollback/journal list so a later failure frees it
+	// and the commit journals a JRN_EXTENT_ALLOC for it.
+	var allocated []uint64
 	if in.Flags&briefs.InodeFlagInlineData != 0 && end > inlineDataMax {
-		var drain, allocated []uint64
+		var drain []uint64
 		if err := b.promoteInlineData(in, &drain, &allocated); err != nil {
 			b.rollbackAlloc(allocated)
 			return err
 		}
-		// Persist the promoted inode (the preallocate below rebuilds again, but
-		// the promoted block must be on disk before the unwritten extents).
 	}
 
-	return b.preallocate(in, off, end, mode)
+	return b.preallocate(in, off, end, mode, allocated)
+}
+
+// allocUnwrittenHole allocates unwritten extent(s) covering the hole blocks
+// [startBlk, endBlk), preferring one contiguous run (Allocator.AllocBlocks, one
+// bitmap pass) and falling back to per-block allocation when the bitmap is too
+// fragmented for a run — the kernel's briefs_zero_alloc_hole pattern
+// (file.c:2797), which replaced per-block hole allocation in 0fd1448.
+// Allocated data-relative blocks are appended to *allocated (the caller's
+// rollback list); on ENOSPC the partial allocations are left in *allocated for
+// the caller to roll back. The returned extents are unwritten and sorted; the
+// caller inserts them via insertExtentSorted (which merges adjacent
+// phys-contiguous runs).
+func (b *BrieFS) allocUnwrittenHole(startBlk, endBlk uint64, allocated *[]uint64) ([]briefs.Extent, error) {
+	seg := endBlk - startBlk
+	if rel := b.dataAlloc.AllocBlocks(seg); rel != 0 {
+		for i := uint64(0); i < seg; i++ {
+			*allocated = append(*allocated, rel+i)
+		}
+		return []briefs.Extent{{
+			Offset: startBlk,
+			Phys:   b.dataRegionStart + rel,
+			Len:    seg,
+			Flags:  briefs.ExtentFlagUnwritten,
+		}}, nil
+	}
+
+	// No contiguous run of seg fit: per-block fallback.
+	var exts []briefs.Extent
+	for blk := startBlk; blk < endBlk; blk++ {
+		rel := b.dataAlloc.AllocBlock()
+		if rel == 0 {
+			return nil, syscall.ENOSPC
+		}
+		*allocated = append(*allocated, rel)
+		exts = append(exts, briefs.Extent{
+			Offset: blk,
+			Phys:   b.dataRegionStart + rel,
+			Len:    1,
+			Flags:  briefs.ExtentFlagUnwritten,
+		})
+	}
+	return exts, nil
 }
 
 // preallocate allocates unwritten extents covering [start, end) for blocks not
 // already mapped, rebuilds the index, and commits. With KEEP_SIZE the file size
-// is unchanged; otherwise it grows to end.
-func (b *BrieFS) preallocate(in *briefs.Inode, start, end uint64, mode uint32) error {
+// is unchanged; otherwise it grows to end. allocated carries any blocks already
+// allocated by the caller this op (inline-data promotion) so they are journaled
+// and rolled back with the preallocate's own allocations.
+func (b *BrieFS) preallocate(in *briefs.Inode, start, end uint64, mode uint32, allocated []uint64) error {
 	bs := b.blockSize
 	startBlk := start / bs
 	endBlk := (end + bs - 1) / bs // ceiling
@@ -122,21 +167,31 @@ func (b *BrieFS) preallocate(in *briefs.Inode, start, end uint64, mode uint32) e
 		return err
 	}
 
-	var allocated []uint64
-	for blk := startBlk; blk < endBlk; blk++ {
+	for blk := startBlk; blk < endBlk; {
 		if _, found := lookupExtent(exts, blk); found {
-			continue // already mapped (written or unwritten)
+			blk++ // already mapped (written or unwritten)
+			continue
 		}
-		rel := b.dataAlloc.AllocBlock()
-		if rel == 0 {
+		// Contiguous hole segment [blk, holeEnd): allocate it as one
+		// unwritten run when the bitmap allows.
+		holeEnd := blk + 1
+		for holeEnd < endBlk {
+			if _, found := lookupExtent(exts, holeEnd); found {
+				break
+			}
+			holeEnd++
+		}
+		newExts, err := b.allocUnwrittenHole(blk, holeEnd, &allocated)
+		if err != nil {
 			b.rollbackAlloc(allocated)
-			return syscall.ENOSPC
+			return err
 		}
-		allocated = append(allocated, rel)
-		abs := b.dataRegionStart + rel
-		// Unwritten blocks read as zeros (readFileData) and convert on write
-		// (writeExtentData), so no need to zero them here.
-		exts = insertExtentSorted(exts, briefs.Extent{Offset: blk, Phys: abs, Len: 1, Flags: briefs.ExtentFlagUnwritten})
+		for _, e := range newExts {
+			// Unwritten blocks read as zeros (readFileData) and
+			// convert on write (writeExtentData), so no zeroing here.
+			exts = insertExtentSorted(exts, e)
+		}
+		blk = holeEnd
 	}
 
 	// Grow the file size for a plain (non-KEEP_SIZE) preallocate past EOF.
