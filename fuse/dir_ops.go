@@ -421,10 +421,9 @@ func (b *BrieFS) symlinkInDir(parentIno uint64, name string, target string, uid,
 }
 // mirroring briefs_unlink_common (dir.c:586).  isRmdir selects the rmdir path
 // (ENOTDIR/ENOTEMPTY checks, parent nlink drop, child nlink cleared).  When the
-// target's nlink reaches zero its inode is freed immediately (the kernel
-// defers this to evict; the FUSE bridge has no VFS inode cache, and Phase 4
-// tests do not exercise open-unlinked files).  Data-extent freeing for
-// non-empty files lands in Phase 5.  Locking: the global dir lock + the parent
+// target's nlink reaches zero its inode is freed immediately, along with its
+// data extents (freeInodeData) — the kernel defers this to evict, but the
+// FUSE bridge has no VFS inode cache.  Locking: the global dir lock + the parent
 // and child inode-block locks (parent then child; the global lock serializes
 // dir ops so the order cannot deadlock).
 func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error {

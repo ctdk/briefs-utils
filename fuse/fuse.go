@@ -452,10 +452,9 @@ func (n *brieFSNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 }
 
 func (n *brieFSNode) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
-	// The bridge is now read-write; file data writes land in Phase 5. For
-	// now accept read opens and write opens alike (a write open on a regular
-	// file simply has no Write handler yet, so writes will ENOSYS until Phase
-	// 5 wires them up).
+	// No per-handle state: reads and writes are served straight from the
+	// device by Read/Write below, so a null FileHandle works. KEEP_CACHE
+	// lets the kernel keep read-ahead data across opens.
 	return nil, fuse.FOPEN_KEEP_CACHE, 0
 }
 

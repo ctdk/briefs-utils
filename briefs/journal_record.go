@@ -2,7 +2,7 @@
 //
 // These mirror the kernel's struct jrn_* (briefs.h:152+) with byte-exact,
 // little-endian on-disk layout.  Sizes are pinned by the kernel's
-// BUILD_BUG_ON() checks (briefs.h:1894-1926):
+// BUILD_BUG_ON() checks (briefs.h:1908-1925):
 //
 //	jrn_extent_alloc   = 80
 //	jrn_extent_free    = 80
@@ -14,6 +14,11 @@
 //	jrn_inode_full     = 560
 //	jrn_xattr_data     = 20-byte prefix + variable data
 //	jrn_symlink_data   = 20-byte prefix + variable target
+//
+// The variable-length records have no sizeof pin: jrn_xattr_data's __le64
+// members give it 8-byte struct alignment, so sizeof rounds up to 24 — the
+// kernel pins offsetof(data) == 20 instead (briefs.h:1921), which is the
+// prefix size below.
 //
 // Go struct field alignment differs from C, so each Marshal() writes fields
 // at explicit offsets via binary.LittleEndian rather than relying on

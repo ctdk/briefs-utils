@@ -50,13 +50,13 @@ type repairPlan struct {
 
 // repairOptions selects which repair/optimization phases run.
 type repairOptions struct {
-	RebuildAllocator bool // rebuild allocator bitmaps from the scan (phase 2)
-	RepairBtreeCRC   bool // rewrite torn B-tree node checksums (phase 3)
-	RebuildBtree     bool // rebuild corrupt B+ tree extent indexes from recovered extents (phase 4)
+	RebuildAllocator   bool // rebuild allocator bitmaps from the scan (phase 2)
+	RepairBtreeCRC     bool // rewrite torn B-tree node checksums (phase 3)
+	RebuildBtree       bool // rebuild corrupt B+ tree extent indexes from recovered extents (phase 4)
 	ReclaimOrphanBtree bool // free allocated-but-unreferenced B-tree node blocks (phase 5, default-off even in "all")
-	CompactExtents   bool // merge adjacent file extents (phase 4)
-	CompactTries     bool // rebuild directory tries (phase 3)
-	RepairLinks      bool // recompute inode nlink values (phase 5)
+	CompactExtents     bool // rebuild tree-backed inodes' B+ tree extent indexes minimally packed (phase 4)
+	CompactTries       bool // rebuild directory tries (phase 3)
+	RepairLinks        bool // recompute inode nlink values (phase 5)
 }
 
 func (fs *fsckState) errorf(format string, args ...interface{}) {
