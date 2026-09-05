@@ -485,3 +485,26 @@ func (j *Journal) Dirty() bool {
 	defer j.mu.Unlock()
 	return j.dirty
 }
+
+// Label returns the volume label from the in-memory superblock under the
+// journal lock (the reader side of the kernel's lock_buffer(sb_bh) pairing
+// around sb->label access, file.c:287/:317).
+func (j *Journal) Label() [BrieFSVolLabelLen]byte {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.sb.Label
+}
+
+// UpdateLabel replaces the volume label in the in-memory superblock and
+// persists block 0, all under the journal lock — the same serialization the
+// kernel gets from lock_buffer(sb_bh) in FS_IOC_SETFSLABEL (file.c:317).
+// The label is not journaled: the kernel memcpy's it into the locked sb
+// buffer and syncs that buffer directly, and the bridge matches (a torn
+// label against a concurrent checkpoint is cosmetic — a 64-byte display
+// field, never parsed structurally — and the next sync rewrites it whole).
+func (j *Journal) UpdateLabel(label [BrieFSVolLabelLen]byte) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.sb.Label = label
+	return j.syncSuperblock()
+}

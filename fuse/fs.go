@@ -225,6 +225,78 @@ found:
 	return runStart
 }
 
+// TrimFreeRuns walks the L2 leaf bitmap read-only for maximal free runs,
+// invoking visit for each (runStart, runLen) pair in data-relative blocks,
+// possibly spanning L2 word boundaries. The allocator mutex is held across
+// the whole walk, so a concurrent allocation cannot hand out a block the
+// visitor is about to discard (kernel briefs_trim_fs holds alloc->lock the
+// same way, alloc.c:534); visit must not call back into the Allocator.
+// The clamping / minlen policy lives in the caller (the kernel's
+// briefs_trim_flush, alloc.c:474). Ported from briefs_trim_fs (alloc.c:512).
+func (a *Allocator) TrimFreeRuns(visit func(runStart, runLen uint64) error) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.l0 == nil {
+		return nil
+	}
+
+	runStart, runLen := uint64(0), uint64(0)
+	flush := func() error {
+		if runLen == 0 {
+			return nil
+		}
+		if err := visit(runStart, runLen); err != nil {
+			return err
+		}
+		runLen = 0
+		return nil
+	}
+
+	for w2 := uint64(0); w2 < a.l2Words; w2++ {
+		word := a.l2[w2]
+		base := w2 * 64
+
+		// Mask trailing bits beyond blockCount in the last word.
+		if w2 == a.l2Words-1 {
+			if rem := a.blockCount % 64; rem != 0 {
+				word &= (1 << rem) - 1
+			}
+		}
+		if word == 0 {
+			if err := flush(); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Walk each maximal run of set bits within this word
+		// (named wbits: `bits` is the math/bits package).
+		wbits := word
+		for wbits != 0 {
+			b := uint64(bits.TrailingZeros64(wbits))
+			s := base + b
+			// TrailingZeros64(0) == 64, so an all-ones-from-b run
+			// (only possible at b == 0) yields cnt == 64.
+			cnt := uint64(bits.TrailingZeros64(^(wbits >> b)))
+			if runLen > 0 && s == runStart+runLen {
+				runLen += cnt // contiguous with the previous word's run
+			} else {
+				if err := flush(); err != nil {
+					return err
+				}
+				runStart, runLen = s, cnt
+			}
+			if cnt >= 64 {
+				wbits = 0
+			} else {
+				wbits &^= ((1 << cnt) - 1) << b
+			}
+		}
+	}
+	return flush()
+}
+
 // FreeBlock marks a data-relative block as free.
 func (a *Allocator) FreeBlock(relBlock uint64) {
 	a.mu.Lock()

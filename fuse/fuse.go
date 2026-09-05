@@ -657,9 +657,14 @@ func (n *brieFSNode) Removexattr(ctx context.Context, name string) syscall.Errno
 	return errToErrno(n.bfs.removeXattr(n.ino, name))
 }
 
-// Ioctl handles FS_IOC_GETFLAGS/SETFLAGS (chattr/lsattr) and
+// Ioctl handles the mount-level FITRIM / FS_IOC_{GET,SET}FSLABEL (ioctlMount,
+// mirroring the superblock-scoped cases of the kernel's briefs_ioctl) and the
+// per-inode FS_IOC_GETFLAGS/SETFLAGS (chattr/lsattr) and
 // FS_IOC_FSGETXATTR/FSSETXATTR (xfs_io/statx). Unknown ioctls return ENOTTY.
 func (n *brieFSNode) Ioctl(ctx context.Context, f fs.FileHandle, cmd uint32, arg uint64, input []byte, output []byte) (int32, syscall.Errno) {
+	if r, errno, handled := n.bfs.ioctlMount(ctx, cmd, input, output); handled {
+		return r, errno
+	}
 	return n.bfs.ioctlFileattr(n.ino, cmd, input, output)
 }
 
