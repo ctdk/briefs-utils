@@ -106,7 +106,7 @@ func verifyXattrBlock(fs *fsckState, ino uint64, in *briefs.Inode, blockSize uin
 
 		// Cross-reference: treat the xattr block as allocated metadata so the
 		// orphan/leak passes account for it.
-		fs.usedBlocks[abs] = true
+		fs.usedBlocks.mark(abs)
 
 		if !isCont && h.EntryCount == 0 {
 			fs.warnf("ino %d: xattr block %d has zero entries (should have been freed)",

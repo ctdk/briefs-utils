@@ -51,7 +51,7 @@ func reclaimOrphanBtree(fs *fsckState, plan *repairPlan, opts *repairOptions, bl
 			continue
 		}
 		// Reachable by some inode's tree or data extents: not an orphan.
-		if fs.usedBlocks[absBlk] {
+		if fs.usedBlocks.has(absBlk) {
 			continue
 		}
 

@@ -21,7 +21,7 @@ func TestCollectInodeExtentsUnwrittenAndHole(t *testing.T) {
 	fs := &fsckState{
 		file:        mustOpen(tmp.Name()),
 		sb:          &briefs.SuperblockLayout{BlockSize: 4096},
-		usedBlocks:  make(map[uint64]bool),
+		usedBlocks:  newBlockSet(),
 		inodes:      make(map[uint64]*briefs.Inode),
 		entryCounts: make(map[uint64]int),
 	}
@@ -50,10 +50,10 @@ func TestCollectInodeExtentsUnwrittenAndHole(t *testing.T) {
 			}
 			in.SetInlineExtent(0, tc.ext.Offset, tc.ext.Phys, tc.ext.Len, uint64(tc.ext.Flags))
 			fs.inodes[ino] = in
-			fs.usedBlocks = make(map[uint64]bool)
+			fs.usedBlocks = newBlockSet()
 			collectInodeExtents(fs, ino, in, 4096)
-			if got := fs.usedBlocks[tc.wantUsed]; got != tc.wantSet {
-				t.Errorf("usedBlocks[%d] = %v, want %v", tc.wantUsed, got, tc.wantSet)
+			if has := fs.usedBlocks.has(tc.wantUsed); has != tc.wantSet {
+				t.Errorf("usedBlocks.has(%d) = %v, want %v", tc.wantUsed, has, tc.wantSet)
 			}
 		})
 	}

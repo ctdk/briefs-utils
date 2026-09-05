@@ -98,7 +98,7 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 	// Initialize maps for cross-referencing
 	fs.inodes = make(map[uint64]*briefs.Inode)
 	fs.dirs = nil
-	fs.usedBlocks = make(map[uint64]bool)
+	fs.usedBlocks = newBlockSet()
 	fs.entryCounts = make(map[uint64]int)
 	fs.failedTrieDirs = make(map[uint64]bool)
 	fs.failedBtreeInos = make(map[uint64]bool)
@@ -179,7 +179,7 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 				// catches a directory that claims subdirs it no longer has.
 				if in.IsDir() && in.DirTrieRoot != 0 {
 					fs.dirs = append(fs.dirs, dirInfo{ino: ino, trieRoot: in.DirTrieRoot})
-					fs.usedBlocks[briefs.TrieRefBlock(in.DirTrieRoot)] = true
+					fs.usedBlocks.mark(briefs.TrieRefBlock(in.DirTrieRoot))
 				}
 
 				// File with zero size but extents
@@ -251,16 +251,14 @@ func collectInodeExtents(fs *fsckState, ino uint64, in *briefs.Inode, blockSize 
 				ino, ext.Flags, ext.Phys, ext.Len)
 		}
 		if ext.Len > 0 && ext.Phys > 0 {
-			for bk := uint64(0); bk < ext.Len; bk++ {
-				fs.usedBlocks[ext.Phys+bk] = true
-			}
+			fs.usedBlocks.markRange(ext.Phys, ext.Len)
 		}
 		return nil
 	}
 
 	// Record every B-tree node block as used metadata.
 	addNodeBlock := func(block uint64) error {
-		fs.usedBlocks[block] = true
+		fs.usedBlocks.mark(block)
 		return nil
 	}
 

@@ -310,7 +310,7 @@ func main() {
 				fs.errors = 0
 				fs.inodes = make(map[uint64]*briefs.Inode)
 				fs.dirs = nil
-				fs.usedBlocks = make(map[uint64]bool)
+				fs.usedBlocks = newBlockSet()
 				fs.entryCounts = make(map[uint64]int)
 				fs.failedTrieDirs = make(map[uint64]bool)
 				fs.failedBtreeInos = make(map[uint64]bool)

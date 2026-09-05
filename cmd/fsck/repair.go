@@ -32,11 +32,20 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int, opts *repairOpt
 	if opts.RebuildAllocator {
 		// Rebuild data allocator from the structures fsck found.
 		plan.dataAlloc = briefs.NewAllocBuilder(dataBlockCount)
-		for absBlk := range fs.usedBlocks {
-			if absBlk >= dataRegionStart && absBlk < dataRegionStart+dataBlockCount {
+		fs.usedBlocks.eachRange(func(start, end uint64) {
+			// Intervals can straddle the data-region start (a metadata
+			// interval ending exactly where a data interval begins
+			// coalesces), so clip both ends before marking.
+			if start < dataRegionStart {
+				start = dataRegionStart
+			}
+			if end > dataRegionStart+dataBlockCount {
+				end = dataRegionStart + dataBlockCount
+			}
+			for absBlk := start; absBlk < end; absBlk++ {
 				plan.dataAlloc.MarkAllocated(absBlk - dataRegionStart)
 			}
-		}
+		})
 	} else {
 		// Use the on-disk allocator so selective repairs only touch the requested
 		// phases.

@@ -71,7 +71,7 @@ func TestVerifyXattrBlockVersion(t *testing.T) {
 		fs := &fsckState{
 			file:       f,
 			sb:         &briefs.SuperblockLayout{BlockSize: 4096, TotalBlocks: 100},
-			usedBlocks: make(map[uint64]bool),
+			usedBlocks: newBlockSet(),
 		}
 		in := &briefs.Inode{InodeNumber: 2, Magic: briefs.MagicInode, XattrOffset: 10, XattrSize: 16}
 		verifyXattrBlock(fs, 2, in, 4096)
@@ -90,14 +90,14 @@ func TestVerifyXattrBlockVersion(t *testing.T) {
 		fs := &fsckState{
 			file:       f,
 			sb:         &briefs.SuperblockLayout{BlockSize: 4096, TotalBlocks: 100},
-			usedBlocks: make(map[uint64]bool),
+			usedBlocks: newBlockSet(),
 		}
 		in := &briefs.Inode{InodeNumber: 3, Magic: briefs.MagicInode, XattrOffset: 11, XattrSize: 16}
 		verifyXattrBlock(fs, 3, in, 4096)
 		if fs.errors != 0 {
 			t.Errorf("expected no errors for xattr version 1, got %d", fs.errors)
 		}
-		if !fs.usedBlocks[11] {
+		if !fs.usedBlocks.has(11) {
 			t.Errorf("expected xattr block 11 to be marked used")
 		}
 	})
@@ -112,14 +112,14 @@ func TestVerifyXattrBlockVersion(t *testing.T) {
 		fs := &fsckState{
 			file:       f,
 			sb:         &briefs.SuperblockLayout{BlockSize: 4096, TotalBlocks: 100},
-			usedBlocks: make(map[uint64]bool),
+			usedBlocks: newBlockSet(),
 		}
 		in := &briefs.Inode{InodeNumber: 4, Magic: briefs.MagicInode, XattrOffset: 12, XattrSize: 32}
 		verifyXattrBlock(fs, 4, in, 4096)
 		if fs.errors != 0 {
 			t.Errorf("expected no errors for xattr version 2, got %d", fs.errors)
 		}
-		if !fs.usedBlocks[12] {
+		if !fs.usedBlocks.has(12) {
 			t.Errorf("expected xattr block 12 to be marked used")
 		}
 	})
@@ -135,14 +135,14 @@ func TestVerifyXattrBlockVersion(t *testing.T) {
 		fs := &fsckState{
 			file:       f,
 			sb:         &briefs.SuperblockLayout{BlockSize: 4096, TotalBlocks: 100},
-			usedBlocks: make(map[uint64]bool),
+			usedBlocks: newBlockSet(),
 		}
 		in := &briefs.Inode{InodeNumber: 5, Magic: briefs.MagicInode, XattrOffset: 20, XattrSize: 32}
 		verifyXattrBlock(fs, 5, in, 4096)
 		if fs.errors != 0 {
 			t.Errorf("expected no errors for v2 chain, got %d", fs.errors)
 		}
-		if !fs.usedBlocks[20] || !fs.usedBlocks[21] {
+		if !fs.usedBlocks.has(20) || !fs.usedBlocks.has(21) {
 			t.Errorf("expected xattr chain blocks 20 and 21 to be marked used")
 		}
 	})
@@ -158,7 +158,7 @@ func TestVerifyXattrBlockVersion(t *testing.T) {
 		fs := &fsckState{
 			file:       f,
 			sb:         &briefs.SuperblockLayout{BlockSize: 4096, TotalBlocks: 100},
-			usedBlocks: make(map[uint64]bool),
+			usedBlocks: newBlockSet(),
 		}
 		in := &briefs.Inode{InodeNumber: 6, Magic: briefs.MagicInode, XattrOffset: 30, XattrSize: 32}
 		verifyXattrBlock(fs, 6, in, 4096)

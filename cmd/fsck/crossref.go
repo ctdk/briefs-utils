@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"math/bits"
 	"os"
+	"sort"
 
 	"github.com/ctdk/briefs-utils/briefs"
 )
@@ -23,28 +25,23 @@ func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 		return
 	}
 
-	// Build a set of data-relative blocks that the allocator says are allocated
-	allocAllocated := make(map[uint64]bool)
-	for i := uint64(0); i < dataBlockCount; i++ {
-		if briefs.AllocIsAllocated(l2, dataBlockCount, i) {
-			allocAllocated[i] = true
-		}
-	}
-
-	// Check 1: Blocks used by inodes/tries that are NOT marked allocated
+	// Check 1: Blocks used by inodes/tries that are NOT marked allocated.
+	// The allocator bitmap itself is the membership structure (allocated =
+	// bit clear in the L2 leaf), so test it directly instead of building a
+	// per-block map first.
 	orphans := 0
-	for absBlk := range fs.usedBlocks {
+	fs.usedBlocks.each(func(absBlk uint64) {
 		if absBlk < dataRegionStart || absBlk >= dataRegionStart+dataBlockCount {
 			// Block is outside the data region — metadata, which is fine
-			continue
+			return
 		}
 		relBlk := absBlk - dataRegionStart
-		if !allocAllocated[relBlk] {
+		if !briefs.AllocIsAllocated(l2, dataBlockCount, relBlk) {
 			fs.reportLimited(&orphans, 20, fs.errorf, "(more orphan block errors suppressed)",
 				"block %d (data-relative %d): used by inode/trie but NOT marked allocated in bitmap",
 				absBlk, relBlk)
 		}
-	}
+	})
 	if orphans > 0 {
 		fmt.Fprintf(os.Stderr, "  block cross-ref: %d block(s) used but not marked allocated\n", orphans)
 	}
@@ -56,26 +53,44 @@ func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 	//
 	// Data-relative block 0 is reserved as the ENOSPC sentinel (matching kernel
 	// behavior), so it's expected to be allocated but unused. Skip it.
+	// The allocated (clear) bits are iterated word-at-a-time: on a large
+	// volume this is the pass fsck spends most of its cross-reference time
+	// in, and a per-block loop over billions of bits does not scale.
 	leaked := 0
+	allocatedCount := 0
 	hasFailedTries := len(fs.failedTrieDirs) > 0
 	hasFailedBtrees := len(fs.failedBtreeInos) > 0
-	for relBlk := range allocAllocated {
-		if relBlk == 0 {
-			// Block 0 is the ENOSPC sentinel; expected to be unused.
-			continue
+	for w, word := range l2 {
+		base := uint64(w) * 64
+		if base >= dataBlockCount {
+			break
 		}
-		absBlk := dataRegionStart + relBlk
-		if !fs.usedBlocks[absBlk] {
-			if hasFailedTries || hasFailedBtrees {
-				fs.reportLimited(&leaked, 20, fs.warnf,
-					"(more unverifiable block warnings suppressed)",
-					"block %d (data-relative %d): marked allocated but not found during trie/btree walk (may be from a failed traversal)",
-					absBlk, relBlk)
-			} else {
-				fs.reportLimited(&leaked, 20, fs.errorf,
-					"(more leaked block errors suppressed)",
-					"block %d (data-relative %d): marked allocated in bitmap but NOT referenced by any inode/trie",
-					absBlk, relBlk)
+		inv := ^word // set bit = allocated block
+		if rem := dataBlockCount - base; rem < 64 {
+			inv &= (1 << rem) - 1
+		}
+		for inv != 0 {
+			b := bits.TrailingZeros64(inv)
+			inv &^= 1 << b
+			relBlk := base + uint64(b)
+			allocatedCount++
+			if relBlk == 0 {
+				// Block 0 is the ENOSPC sentinel; expected to be unused.
+				continue
+			}
+			absBlk := dataRegionStart + relBlk
+			if !fs.usedBlocks.has(absBlk) {
+				if hasFailedTries || hasFailedBtrees {
+					fs.reportLimited(&leaked, 20, fs.warnf,
+						"(more unverifiable block warnings suppressed)",
+						"block %d (data-relative %d): marked allocated but not found during trie/btree walk (may be from a failed traversal)",
+						absBlk, relBlk)
+				} else {
+					fs.reportLimited(&leaked, 20, fs.errorf,
+						"(more leaked block errors suppressed)",
+						"block %d (data-relative %d): marked allocated in bitmap but NOT referenced by any inode/trie",
+						absBlk, relBlk)
+				}
 			}
 		}
 	}
@@ -88,7 +103,7 @@ func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 	}
 
 	fs.verbosef("block cross-ref: %d block(s) marked allocated, %d block(s) referenced by inodes/tries",
-		len(allocAllocated), len(fs.usedBlocks))
+		allocatedCount, fs.usedBlocks.count())
 
 	if orphans == 0 && leaked == 0 {
 		fmt.Fprintf(os.Stderr, "  block cross-ref: all used blocks match allocator bitmap\n")
@@ -307,7 +322,7 @@ func verifyExtentOverlaps(fs *fsckState) {
 	regions = append(regions, region{"inode table", itStart, itEnd})
 
 	overlaps := 0
-	for i := 0; i < len(allExtents); i++ {
+	for i := range allExtents {
 		ei := allExtents[i]
 		eiEnd := ei.phys + ei.len
 
@@ -322,17 +337,29 @@ func verifyExtentOverlaps(fs *fsckState) {
 					ei.ino, ei.phys, ei.len, r.name, r.start, r.end-1)
 			}
 		}
+	}
 
-		// Check against other extents
-		for j := i + 1; j < len(allExtents); j++ {
-			ej := allExtents[j]
-			ejEnd := ej.phys + ej.len
-			if ei.phys < ejEnd && eiEnd > ej.phys {
-				fs.reportLimited(&overlaps, 20, fs.errorf,
-					"(more extent overlap errors suppressed)",
-					"ino %d extent and ino %d extent overlap: [%d,%d) vs [%d,%d)",
-					ei.ino, ej.ino, ei.phys, eiEnd, ej.phys, ejEnd)
-			}
+	// Extent-vs-extent overlap: sort by physical start and scan with the
+	// running maximum end. A pairwise O(n²) scan does not scale to large
+	// volumes; after sorting, an interval overlaps an earlier one iff its
+	// start is below the maximum end seen so far, and the interval holding
+	// that maximum is a witness — every overlapping pair flags its later
+	// member at least once (no false negatives), though a pair is
+	// attributed to the furthest-reaching earlier interval rather than to
+	// each earlier interval it overlaps.
+	sort.Slice(allExtents, func(i, j int) bool { return allExtents[i].phys < allExtents[j].phys })
+	maxEnd, maxIdx := uint64(0), -1
+	for i := range allExtents {
+		ei := allExtents[i]
+		if maxIdx >= 0 && ei.phys < maxEnd {
+			w := allExtents[maxIdx]
+			fs.reportLimited(&overlaps, 20, fs.errorf,
+				"(more extent overlap errors suppressed)",
+				"ino %d extent and ino %d extent overlap: [%d,%d) vs [%d,%d)",
+				ei.ino, w.ino, ei.phys, ei.phys+ei.len, w.phys, w.phys+w.len)
+		}
+		if end := ei.phys + ei.len; end > maxEnd {
+			maxEnd, maxIdx = end, i
 		}
 	}
 

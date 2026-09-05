@@ -77,7 +77,7 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootRef uint64, blockS
 			slot := briefs.TrieRefSlot(ref)
 
 			// Record the containing page as used.
-			fs.usedBlocks[block] = true
+			fs.usedBlocks.mark(block)
 
 			// Cross-check the page header's live_count against the free-slot bitmap.
 			allocated := bits.OnesCount64(page.FreeSlots)

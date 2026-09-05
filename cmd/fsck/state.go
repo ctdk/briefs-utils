@@ -17,9 +17,9 @@ type fsckState struct {
 	verbose bool
 	// Collected during inode table scan for cross-referencing
 	inodes      map[uint64]*briefs.Inode // ino -> inode
-	dirs        []dirInfo               // directories with trie roots
-	usedBlocks  map[uint64]bool         // all blocks referenced by extents or trie nodes
-	entryCounts map[uint64]int          // ino -> number of directory entries referencing it
+	dirs        []dirInfo                // directories with trie roots
+	usedBlocks  *blockSet                // all blocks referenced by extents or trie nodes (interval-backed)
+	entryCounts map[uint64]int           // ino -> number of directory entries referencing it
 	// Tracks directories where trie walk had structural errors (bad magic, etc.)
 	failedTrieDirs map[uint64]bool // ino -> true if trie walk had unrecoverable errors
 	// Tracks tree-backed inodes whose B+ tree extent index walk had structural
