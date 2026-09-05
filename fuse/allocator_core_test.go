@@ -37,6 +37,9 @@ func TestAllocatorCoreMatchesBuilder(t *testing.T) {
 		l2Words:    uint64(len(b.L2)),
 		blockCount: b.BlockCount,
 		freeCount:  b.FreeCount,
+		// markL2Word needs a real words-per-block divisor; Sync is not
+		// exercised here, so any positive multiple of 8 works.
+		blockSize: 4096,
 	}
 
 	const ops = 50000

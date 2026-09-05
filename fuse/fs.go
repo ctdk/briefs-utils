@@ -14,14 +14,18 @@ import (
 type Allocator struct {
 	mu sync.Mutex
 
-	dev     *BlockDevice
-	poolStart uint64
-	blockSize  uint64
+	dev                       *BlockDevice
+	poolStart                 uint64
+	blockSize                 uint64
 	l0Words, l1Words, l2Words uint64
-	blockCount       uint64
-	freeCount        uint64
-	l0, l1, l2       []uint64
-	dirty            bool
+	blockCount                uint64
+	freeCount                 uint64
+	l0, l1, l2                []uint64
+	dirty                     bool
+	// l2Dirty holds the indices (within the L2 level) of the on-disk blocks
+	// whose words changed since the last Sync, so Sync rewrites only those.
+	// L0/L1 are small summaries and are rewritten wholesale whenever dirty.
+	l2Dirty map[uint64]bool
 }
 
 // OpenAllocator reads the allocator pool from disk and initializes the in-memory bitmap.
@@ -48,7 +52,19 @@ func OpenAllocator(dev *BlockDevice, poolStart uint64) (*Allocator, error) {
 		l0:         l0,
 		l1:         l1,
 		l2:         l2,
+		l2Dirty:    make(map[uint64]bool),
 	}, nil
+}
+
+// markL2Word records the on-disk L2 block containing word index w2 as
+// changed, so Sync writes only the L2 blocks that actually differ (the L2
+// leaf dominates the pool: on a 17TB volume it is over 130,000 blocks).
+// Called with a.mu held, alongside dirty = true.
+func (a *Allocator) markL2Word(w2 uint64) {
+	if a.l2Dirty == nil {
+		a.l2Dirty = make(map[uint64]bool)
+	}
+	a.l2Dirty[w2/(a.blockSize/8)] = true
 }
 
 // AllocBlock finds and allocates a single free block.
@@ -101,6 +117,7 @@ func (a *Allocator) AllocBlock() uint64 {
 		a.l2[w2Idx] &^= 1 << b2
 		a.freeCount--
 		a.dirty = true
+		a.markL2Word(w2Idx)
 
 		// Propagate upward if word went to zero
 		if a.l2[w2Idx] == 0 {
@@ -148,6 +165,7 @@ func (a *Allocator) AllocBlocks(n uint64) uint64 {
 			}
 		}
 		a.dirty = true
+		a.markL2Word(0)
 	}
 
 	runStart, runLen := uint64(0), uint64(0)
@@ -211,6 +229,7 @@ found:
 	w2First := runStart / 64
 	w2Last := (runStart + n - 1) / 64
 	for w2 := w2First; w2 <= w2Last; w2++ {
+		a.markL2Word(w2)
 		if a.l2[w2] == 0 {
 			w1, b1 := w2/64, w2%64
 			a.l1[w1] &^= 1 << b1
@@ -307,6 +326,7 @@ func (a *Allocator) FreeBlock(relBlock uint64) {
 	}
 	if briefs.AllocMarkFree(a.l0, a.l1, a.l2, &a.freeCount, a.blockCount, relBlock) {
 		a.dirty = true
+		a.markL2Word(relBlock / 64)
 	}
 }
 
@@ -320,6 +340,7 @@ func (a *Allocator) ReserveBlock(relBlock uint64) {
 	}
 	if briefs.AllocMarkAllocated(a.l0, a.l1, a.l2, &a.freeCount, a.blockCount, relBlock) {
 		a.dirty = true
+		a.markL2Word(relBlock / 64)
 	}
 }
 
@@ -386,7 +407,12 @@ func (a *Allocator) Sync() error {
 		return nil
 	}
 
-	// Level 0
+	// Level 0 and Level 1 are summaries of L2 and are small even on huge
+	// volumes (on 17TB: ~33 and ~2100 blocks); tracking which of their words
+	// crossed the zero boundary is not worth it, so they are rewritten
+	// wholesale. The L2 leaf is where the bulk of the pool lives (over
+	// 130,000 blocks on the same volume), so only the blocks whose words
+	// changed are written.
 	pos := a.poolStart + 1
 	if err := writeDirty(pos, a.l0, a.l0Words); err != nil {
 		return fmt.Errorf("sync L0: %w", err)
@@ -399,9 +425,27 @@ func (a *Allocator) Sync() error {
 	}
 	pos += l1Blocks
 
-	// Level 2
-	if err := writeDirty(pos, a.l2, a.l2Words); err != nil {
-		return fmt.Errorf("sync L2: %w", err)
+	// Level 2: only the changed blocks. PackAllocWords zero-pads the tail
+	// of the last block, matching the wholesale write above. An empty set
+	// with dirty set cannot happen (every mutation marks its L2 word); the
+	// wholesale fallback keeps a forgotten mark from silently dropping a
+	// changed block.
+	if len(a.l2Dirty) == 0 {
+		if err := writeDirty(pos, a.l2, a.l2Words); err != nil {
+			return fmt.Errorf("sync L2: %w", err)
+		}
+	} else {
+		for blk := range a.l2Dirty {
+			first := blk * wpb
+			if first >= a.l2Words {
+				continue // stale index; cannot happen while markL2Word gates
+			}
+			last := min(first+wpb, a.l2Words)
+			l2Blocks := briefs.PackAllocWords(a.l2[first:last], blockSize)
+			if err := a.dev.WriteBlock(pos+blk, l2Blocks[0]); err != nil {
+				return fmt.Errorf("sync L2 block %d: %w", blk, err)
+			}
+		}
 	}
 
 	// Update header with free_count
@@ -422,6 +466,7 @@ func (a *Allocator) Sync() error {
 	}
 
 	a.dirty = false
+	a.l2Dirty = make(map[uint64]bool)
 	return nil
 }
 
@@ -474,4 +519,3 @@ func (im *InodeManager) WriteInode(inode *briefs.Inode) error {
 
 	return im.dev.WriteBlock(blk, buf)
 }
-
