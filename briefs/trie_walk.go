@@ -63,6 +63,11 @@ type TrieWalker struct {
 	// distinguished by the emit flag, so a node may legitimately appear
 	// twice but never three times).
 	visited map[uint64]bool
+	// pageCache holds the pages the sibling-chain scan already read while
+	// scheduling a node, so the node's own visit does not read the same
+	// page a second time.  Entries are consumed (deleted) on first use;
+	// only pages pushed but not yet visited are cached at any moment.
+	pageCache map[uint64][]byte
 	// Note, if set, is called on every recoverable problem. A non-nil
 	// return aborts the walk: Next reports ok=false from then on. A nil
 	// Note skips the offending node/chain silently.
@@ -74,8 +79,9 @@ type TrieWalker struct {
 // yields a walk that is immediately finished.
 func NewTrieWalker(read TrieReadFunc, root uint64) *TrieWalker {
 	w := &TrieWalker{
-		read:    read,
-		visited: make(map[uint64]bool),
+		read:      read,
+		visited:   make(map[uint64]bool),
+		pageCache: make(map[uint64][]byte),
 	}
 	if !TrieRefIsNull(root) {
 		w.stack = append(w.stack, root)
@@ -146,14 +152,23 @@ func (w *TrieWalker) Next() (ref uint64, emitted bool, buf []byte, page *TriePag
 	return 0, false, nil, nil, nil, false
 }
 
-// readNode reads and parses the page and slot a reference points at.
+// readNode reads and parses the page and slot a reference points at.  When
+// the sibling-chain scan that scheduled this node already read its page, the
+// cached buffer is reused instead of issuing a second device read.
 func (w *TrieWalker) readNode(ref uint64) (buf []byte, page *TriePage, node *TrieSlot, ok bool) {
-	buf, err := w.read(TrieRefBlock(ref))
-	if err != nil {
-		w.note(ref, TrieNoteRead, err)
-		return nil, nil, nil, false
+	block := TrieRefBlock(ref)
+	if cached, hit := w.pageCache[block]; hit {
+		delete(w.pageCache, block)
+		buf = cached
+	} else {
+		var err error
+		buf, err = w.read(block)
+		if err != nil {
+			w.note(ref, TrieNoteRead, err)
+			return nil, nil, nil, false
+		}
 	}
-	page, err = ReadTriePage(buf)
+	page, err := ReadTriePage(buf)
 	if err != nil {
 		w.note(ref, TrieNotePage, err)
 		return nil, nil, nil, false
@@ -191,8 +206,12 @@ func (w *TrieWalker) collectChildren(parentRef uint64, node *TrieSlot) []uint64 
 			break
 		}
 		children = append(children, child)
-		cbuf, rerr := w.read(TrieRefBlock(child))
+		blk := TrieRefBlock(child)
+		cbuf, rerr := w.read(blk)
 		if rerr == nil {
+			// The DFS will visit this child later and would otherwise
+			// read the same page again; keep the buffer for readNode.
+			w.pageCache[blk] = cbuf
 			if _, perr := ReadTriePage(cbuf); perr != nil {
 				rerr = perr
 			} else if cn, serr := ReadTrieSlot(cbuf, TrieRefSlot(child)); serr != nil {

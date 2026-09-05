@@ -112,13 +112,13 @@ func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 
 // computeDirSubdirCounts walks each directory's trie and returns a map of
 // ino -> number of subdirectory entries it contains. A directory's nlink is
-// 2 (., ..) plus its subdirectory count, so this is the shared computation
-// behind both verifyLinkCounts (read-only check) and repairLinkCounts (fix).
+// 2 (., ..) plus its subdirectory count, so this is the computation behind
+// repairLinkCounts (fix). The verify pass no longer uses it: it re-derives
+// the counts from the entries verifyAllDirTries already collected, avoiding
+// a second walk of every trie.
 // It is strict: a collectDirectoryEntries error aborts and is returned, since
-// a partial count would make directory nlink checks wrong. Callers that may
-// run with broken tries (the verify pass) tolerate the error by skipping the
-// directory check; the repair path is gated on fs.failedTrieDirs being empty,
-// so it always gets a complete count.
+// a partial count would make directory nlink checks wrong. The repair path is
+// gated on fs.failedTrieDirs being empty, so it always gets a complete count.
 func computeDirSubdirCounts(fs *fsckState, blockSize uint64) (map[uint64]int, error) {
 	subdirCount := make(map[uint64]int)
 	for _, d := range fs.dirs {
@@ -144,15 +144,26 @@ func computeDirSubdirCounts(fs *fsckState, blockSize uint64) (map[uint64]int, er
 // files and symlinks are the number of directory entries referencing them.
 // This matches what repairLinkCounts would fix and what the kernel maintains,
 // so a wrong nlink is flagged instead of passing silently.
-func verifyLinkCounts(fs *fsckState, blockSize uint64) {
-	subdirCount, err := computeDirSubdirCounts(fs, blockSize)
-	if err != nil {
-		// A broken directory trie makes subdir counts unreliable, so skip the
-		// directory nlink check; the trie error itself is already reported by
-		// verifyAllDirTries. Files and symlinks can still be checked against
-		// entryCounts.
-		fs.errorf("link counts: skipping directory nlink check: %v", err)
-		subdirCount = nil
+//
+// Subdirectory counts are derived from the entries the trie walk
+// (verifyAllDirTries) already collected — every entry carries its parent —
+// instead of walking each directory trie a second time. A directory whose
+// trie walk had structural errors is in fs.failedTrieDirs and its entries
+// may be incomplete, so the directory nlink check is skipped in that case
+// (the trie error itself is already reported); files and symlinks can still
+// be checked against entryCounts.
+func verifyLinkCounts(fs *fsckState, entries []trieEntry) {
+	var subdirCount map[uint64]int
+	if len(fs.failedTrieDirs) > 0 {
+		fs.errorf("link counts: skipping directory nlink check: %d director(ies) with failed trie walks",
+			len(fs.failedTrieDirs))
+	} else {
+		subdirCount = make(map[uint64]int)
+		for _, e := range entries {
+			if target, ok := fs.inodes[e.Inode]; ok && target.IsDir() {
+				subdirCount[e.Parent]++
+			}
+		}
 	}
 
 	mismatches := 0

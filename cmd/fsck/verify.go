@@ -78,13 +78,15 @@ func runVerificationPass(fs *fsckState, blockSize, inodeSize uint64) int {
 	}
 
 	// 6. Cross-referencing checks
+	// (The inode bitmap cross-reference runs inside verifyInodeTable: the
+	// scan already visits every bitmap-allocated slot, so a second full
+	// inode-table read would buy nothing.)
 	fmt.Fprintf(os.Stderr, "\nCross-referencing:\n")
-	verifyInodeBitmapCrossReference(fs, blockSize, inodeSize)
 	verifyBlockCrossReference(fs, blockSize)
 	verifySuperblockFreeCounts(fs, totalInodes)
 	verifyDirEntryCrossReference(fs, allEntries)
 	verifyDuplicateNames(fs, allEntries)
-	verifyLinkCounts(fs, blockSize)
+	verifyLinkCounts(fs, allEntries)
 	verifyOrphanedInodes(fs)
 	verifyExtentOverlaps(fs)
 	verifyReachability(fs, allEntries)

@@ -178,61 +178,6 @@ func readAllocatorL2(file *os.File, poolBlock, blockSize uint64) (l2 []uint64, b
 	return l2, hdr.BlockCount, nil
 }
 
-// verifyInodeBitmapCrossReference checks that every allocated inode bitmap slot
-// corresponds to an inode with valid magic on disk.  It does NOT check the
-// reverse (a free slot still holding a valid magic): mkfs.briefs no longer
-// pre-zeroes the inode table, so on a reused device an unallocated slot
-// legitimately retains the previous filesystem's stale inode bytes, including a
-// valid magic.  The kernel only consults a slot once it allocates it, so such
-// stale content is harmless at runtime and is not an inconsistency worth
-// flagging.  An allocated slot that lacks a valid magic, however, is a real
-// bitmap/table mismatch and is reported.
-func verifyInodeBitmapCrossReference(fs *fsckState, blockSize, inodeSize uint64) {
-	inodeTableStart := fs.sb.InodeTableOffset
-	inodesPerBlock := blockSize / inodeSize
-
-	l2, blockCount, err := readAllocatorL2(fs.file, fs.sb.InodeBMOffset, blockSize)
-	if err != nil {
-		fs.errorf("inode bitmap cross-ref: %v", err)
-		return
-	}
-
-	// Check each inode slot
-	badAllocated := 0 // bitmap says allocated, but no valid inode magic
-	ino := uint64(1)
-	errorReportLimit := 20
-
-	for bi := uint64(0); bi < (blockCount+inodesPerBlock-1)/inodesPerBlock; bi++ {
-		absBlock := inodeTableStart + bi
-		buf := make([]byte, blockSize)
-		if _, err := fs.file.ReadAt(buf, int64(absBlock*blockSize)); err != nil {
-			fs.errorf("inode bitmap cross-ref: read inode table block %d: %v", absBlock, err)
-			ino += inodesPerBlock
-			continue
-		}
-
-		for j := uint64(0); j < inodesPerBlock && ino <= blockCount; j++ {
-			offset := j * inodeSize
-			magic := binary.LittleEndian.Uint64(buf[offset+bytesPerWord:])
-
-			allocated := briefs.AllocIsAllocated(l2, blockCount, ino-1)
-
-			hasMagic := magic == briefs.MagicInode
-
-			if allocated && !hasMagic {
-				fs.reportLimited(&badAllocated, errorReportLimit, fs.errorf,
-					"(more inode bitmap/table mismatch errors suppressed)",
-					"ino %d: bitmap says allocated but inode has no valid magic (0x%016X)", ino, magic)
-			}
-			ino++
-		}
-	}
-
-	if badAllocated == 0 {
-		fmt.Fprintf(os.Stderr, "  inode bitmap cross-ref: all allocated bitmap entries have valid inode magic\n")
-	}
-}
-
 // verifySuperblockFreeCounts cross-checks the superblock free counts against
 // the allocator headers and the actual inode/found counts.
 func verifySuperblockFreeCounts(fs *fsckState, totalInodesFound int) {
