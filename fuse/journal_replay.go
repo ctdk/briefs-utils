@@ -623,6 +623,15 @@ func (b *BrieFS) replayReconcileNlinks() error {
 	}
 	linkCount := make(map[uint64]uint32)
 	subdirCount := make(map[uint64]uint32)
+	// Pass 3a below reads every allocated inode once; this keeps the two
+	// fields pass 3b needs so it does not have to read the whole table a
+	// second time. Only an inode whose nlink actually disagrees is read
+	// again, for the WriteInode patch.
+	type inodeState struct {
+		isDir  bool
+		nlinks uint32
+	}
+	state := make(map[uint64]inodeState)
 
 	dirFtype := uint8(briefs.ModeDir >> 12)
 
@@ -632,7 +641,11 @@ func (b *BrieFS) replayReconcileNlinks() error {
 			continue
 		}
 		di, err := b.inodes.ReadInode(ino)
-		if err != nil || !di.IsDir() {
+		if err != nil {
+			continue
+		}
+		state[ino] = inodeState{isDir: di.IsDir(), nlinks: di.Nlinks}
+		if !di.IsDir() {
 			continue
 		}
 		iter := NewTrieIterator(b.dev, di.DirTrieRoot)
@@ -651,21 +664,18 @@ func (b *BrieFS) replayReconcileNlinks() error {
 	}
 
 	// Pass 3b: patch on-disk nlinks where they disagree.
-	for ino := uint64(1); ino <= maxIno; ino++ {
-		if !b.inodeAlloc.Allocated(ino - 1) {
-			continue
-		}
-		di, err := b.inodes.ReadInode(ino)
-		if err != nil {
-			continue
-		}
+	for ino, st := range state {
 		var expected uint32
-		if di.IsDir() {
+		if st.isDir {
 			expected = 2 + subdirCount[ino]
 		} else {
 			expected = linkCount[ino]
 		}
-		if di.Nlinks == expected {
+		if st.nlinks == expected {
+			continue
+		}
+		di, err := b.inodes.ReadInode(ino)
+		if err != nil {
 			continue
 		}
 		di.Nlinks = expected
