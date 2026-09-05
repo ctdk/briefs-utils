@@ -560,6 +560,24 @@ func (b *BrieFS) collectExtentsAndNodes(in *briefs.Inode) (exts []briefs.Extent,
 	return
 }
 
+// zeroBlockRange reads the block at abs, zeroes [from, to), and writes it
+// back (from >= to is a no-op). zeroBlockTail is the [from, blockSize)
+// special case; zeroRangeOp uses arbitrary sub-block ranges for the partial
+// head/tail blocks of a ZERO_RANGE.
+func (b *BrieFS) zeroBlockRange(abs, from, to uint64) error {
+	if from >= to {
+		return nil
+	}
+	buf, err := b.dev.ReadBlock(abs)
+	if err != nil {
+		return err
+	}
+	for i := from; i < to; i++ {
+		buf[i] = 0
+	}
+	return b.dev.WriteBlock(abs, buf)
+}
+
 // zeroBlockTail reads the block at abs, zeroes [from, blockSize), and writes
 // it back. The physical half of briefs_zero_eof_tail (file.c:61): BrieFS
 // zeroes freshly allocated blocks, so the tail is normally already zero; this
@@ -567,14 +585,7 @@ func (b *BrieFS) collectExtentsAndNodes(in *briefs.Inode) (exts []briefs.Extent,
 // EOF-tail zeroers below differ only in which blocks they guard on and how the
 // write is made durable, so they share this.
 func (b *BrieFS) zeroBlockTail(abs uint64, from uint64) error {
-	buf, err := b.dev.ReadBlock(abs)
-	if err != nil {
-		return err
-	}
-	for i := from; i < b.blockSize; i++ {
-		buf[i] = 0
-	}
-	return b.dev.WriteBlock(abs, buf)
+	return b.zeroBlockRange(abs, from, b.blockSize)
 }
 
 // zeroEofTail zeroes [oldSize, block_end) of the block containing oldSize,

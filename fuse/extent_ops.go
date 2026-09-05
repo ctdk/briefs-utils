@@ -1,11 +1,13 @@
 // Package fuse: fallocate, truncate (setattr size), and setattr metadata.
 //
-// Ports briefs_fallocate (file.c:1876), the truncate paths of briefs_setattr
-// (file.c:836), and the killpriv (file_remove_privs) that strips suid/sgid and
-// clears security.capability on file-modifying ops. The extent-list changes
-// (punch hole, truncate down, preallocate) reuse the Phase-5 infrastructure:
-// collect the extents + btree nodes, mutate the sorted extent list, rebuild the
-// index, and commit via commitExtentChange.
+// Ports briefs_fallocate (file.c:3459) with all five modes (preallocate,
+// PUNCH_HOLE, ZERO_RANGE, COLLAPSE_RANGE, INSERT_RANGE), the truncate paths of
+// briefs_setattr (file.c:836), and the killpriv (file_remove_privs) that
+// strips suid/sgid and clears security.capability on file-modifying ops. The
+// extent-list changes (punch hole, truncate down, preallocate, collapse,
+// insert, zero-range conversion) reuse the Phase-5 infrastructure: collect the
+// extents + btree nodes, mutate the sorted extent list, rebuild the index, and
+// commit via commitExtentChange.
 
 package fuse
 
@@ -17,8 +19,11 @@ import (
 
 // fallocate flags (uapi/linux/fallocate.h).
 const (
-	fallocKeepSize  uint32 = 0x01
-	fallocPunchHole uint32 = 0x02
+	fallocKeepSize      uint32 = 0x01
+	fallocPunchHole     uint32 = 0x02
+	fallocCollapseRange uint32 = 0x08
+	fallocZeroRange     uint32 = 0x10
+	fallocInsertRange   uint32 = 0x20
 )
 
 // S_ISUID / S_ISGID (mode bits stripped by killpriv).
@@ -56,21 +61,31 @@ type fuseSetAttrIn struct {
 	ctimensec uint32
 }
 
-// fallocateOp mirrors briefs_fallocate (file.c:1876): preallocate (optionally
-// KEEP_SIZE) allocates unwritten extents; PUNCH_HOLE frees the blocks in the
-// range and leaves a hole. COLLAPSE/INSERT range are unsupported (EOPNOTSUPP).
+// fallocateOp mirrors briefs_fallocate (file.c:3459): plain preallocation
+// (optionally KEEP_SIZE) allocates unwritten extents; PUNCH_HOLE frees the
+// blocks in the range and leaves a hole; ZERO_RANGE zeroes the range and
+// converts its block-aligned middle to unwritten; COLLAPSE_RANGE removes the
+// range and shifts the tail down; INSERT_RANGE opens a hole and shifts the
+// tail up.
 func (b *BrieFS) fallocateOp(ino uint64, off, size uint64, mode uint32) error {
 	if b.readOnly {
 		return syscall.EROFS
 	}
-	if mode&^(fallocKeepSize|fallocPunchHole) != 0 {
+	if mode&^(fallocKeepSize|fallocPunchHole|fallocCollapseRange|fallocZeroRange|fallocInsertRange) != 0 {
 		return syscall.EOPNOTSUPP
 	}
 	if mode&fallocPunchHole != 0 && mode&fallocKeepSize == 0 {
 		return syscall.EINVAL
 	}
-	if off < 0 || size == 0 {
+	if size == 0 {
 		return syscall.EINVAL
+	}
+	// The bridge's s_maxbytes stand-in (the kernel uses MAX_LFS_FILESIZE):
+	// no file on this image can exceed the device. Overflow-safe so a
+	// userspace negative offset (huge uint64) cannot wrap past the check.
+	maxBytes := b.sb.TotalBlocks * b.blockSize
+	if off > maxBytes || size > maxBytes-off {
+		return syscall.EFBIG
 	}
 
 	lock := b.inodeBlockLock(ino)
@@ -89,15 +104,23 @@ func (b *BrieFS) fallocateOp(ino uint64, off, size uint64, mode uint32) error {
 		return err
 	}
 
-	end := off + size
-	if mode&fallocPunchHole != 0 {
+	// Dispatch in the kernel's order (file.c:3543-3559).
+	switch {
+	case mode&fallocPunchHole != 0:
 		return b.punchHole(in, off, size)
+	case mode&fallocCollapseRange != 0:
+		return b.collapseRangeOp(in, off, size)
+	case mode&fallocInsertRange != 0:
+		return b.insertRangeOp(in, off, size)
+	case mode&fallocZeroRange != 0:
+		return b.zeroRangeOp(in, off, size, mode)
 	}
 
-	// Preallocate: allocate unwritten extents for [off, end). Promote inline
-	// data first if the range exceeds the inline region; the promoted block
-	// joins preallocate's rollback/journal list so a later failure frees it
-	// and the commit journals a JRN_EXTENT_ALLOC for it.
+	// Preallocate: allocate unwritten extents for [off, off+size). Promote
+	// inline data first if the range exceeds the inline region; the promoted
+	// block joins preallocate's rollback/journal list so a later failure
+	// frees it and the commit journals a JRN_EXTENT_ALLOC for it.
+	end := off + size
 	var allocated []uint64
 	if in.Flags&briefs.InodeFlagInlineData != 0 && end > inlineDataMax {
 		var drain []uint64
@@ -235,6 +258,444 @@ func (b *BrieFS) punchHole(in *briefs.Inode, off, size uint64) error {
 		return err
 	}
 	return b.commitExtentChange(in, allocated, freed, oldNodes)
+}
+
+// shiftExtents rewrites the extent list for COLLAPSE_RANGE (dir < 0) and
+// INSERT_RANGE (dir > 0), ported from briefs_shift_extents (file.c:3129).
+//
+// For collapse (S, L in blocks): the middle [S, S+L) is removed -- its data
+// blocks are collected in freed (journaled + freed by the caller's commit) and
+// dropped from the list; every extent at/after S+L shifts down by L; extents
+// straddling S or S+L are split (kept prefix + freed middle + re-pointed
+// suffix at S).
+//
+// For insert: a hole [S, S+L) is opened; every extent at/after S shifts up by
+// L; an extent straddling S is split into a kept prefix and a suffix shifted
+// to S+L. No blocks are freed or allocated. The returned list is folded
+// through insertExtentSorted so adjacent phys-contiguous same-flag pieces
+// merge, like the kernel's rebuild.
+func shiftExtents(exts []briefs.Extent, S, L uint64, dir int) (newExts []briefs.Extent, freed []uint64) {
+	var raw []briefs.Extent
+	for _, e := range exts {
+		o, eend := e.Offset, e.Offset+e.Len
+
+		if dir < 0 {
+			// collapse: remove [S, S+L), shift >= S+L down by L
+			switch {
+			case eend <= S:
+				raw = append(raw, e)
+			case o >= S+L:
+				e.Offset = o - L
+				raw = append(raw, e)
+			case o >= S && eend <= S+L:
+				// Wholly inside the removed range: free, drop.
+				if e.Phys != 0 {
+					for blk := o; blk < eend; blk++ {
+						freed = append(freed, e.Phys+(blk-o))
+					}
+				}
+			default:
+				// Straddles S and/or S+L.
+				if o < S {
+					raw = append(raw, briefs.Extent{Offset: o, Phys: e.Phys, Len: S - o, Flags: e.Flags})
+				}
+				midStart, midEnd := o, eend
+				if midStart < S {
+					midStart = S
+				}
+				if midEnd > S+L {
+					midEnd = S + L
+				}
+				if midStart < midEnd && e.Phys != 0 {
+					for blk := midStart; blk < midEnd; blk++ {
+						freed = append(freed, e.Phys+(blk-o))
+					}
+				}
+				if eend > S+L {
+					raw = append(raw, briefs.Extent{
+						Offset: S, // (S+L) - L
+						Phys:   e.Phys + (S + L - o),
+						Len:    eend - (S + L),
+						Flags:  e.Flags,
+					})
+				}
+			}
+		} else {
+			// insert: open hole [S, S+L), shift >= S up by L
+			switch {
+			case eend <= S:
+				raw = append(raw, e)
+			case o >= S:
+				e.Offset = o + L
+				raw = append(raw, e)
+			default:
+				// Straddles S: prefix kept, suffix shifted up.
+				raw = append(raw, briefs.Extent{Offset: o, Phys: e.Phys, Len: S - o, Flags: e.Flags})
+				raw = append(raw, briefs.Extent{
+					Offset: S + L,
+					Phys:   e.Phys + (S - o),
+					Len:    eend - S,
+					Flags:  e.Flags,
+				})
+			}
+		}
+	}
+	for _, e := range raw {
+		newExts = insertExtentSorted(newExts, e)
+	}
+	return newExts, freed
+}
+
+// collapseRangeOp mirrors briefs_do_collapse_range (file.c:3235): remove the
+// block-aligned [off, off+size) and shift the tail down by size; FileSize
+// shrinks by size. A range reaching EOF is a truncate, not a collapse
+// (-EINVAL); the alignment check keeps the block math exact.
+func (b *BrieFS) collapseRangeOp(in *briefs.Inode, off, size uint64) error {
+	bs := b.blockSize
+	if off%bs != 0 || size%bs != 0 {
+		return syscall.EINVAL
+	}
+	if off+size >= in.FileSize {
+		return syscall.EINVAL
+	}
+	if in.Flags&briefs.InodeFlagInlineData != 0 {
+		return syscall.EOPNOTSUPP
+	}
+
+	S, L := off/bs, size/bs
+	exts, oldNodes, err := b.collectExtentsAndNodes(in)
+	if err != nil {
+		return err
+	}
+	newExts, freed := shiftExtents(exts, S, L, -1)
+
+	in.FileSize -= size
+	sec, nsec := nowTime()
+	in.MtimeSec, in.MtimeNsec = sec, nsec
+	in.CtimeSec, in.CtimeNsec = sec, nsec
+
+	var allocated []uint64
+	var drain []uint64
+	if err := b.rebuildExtentIndex(in, newExts, oldNodes, &drain, &allocated); err != nil {
+		b.rollbackAlloc(allocated)
+		return err
+	}
+	return b.commitExtentChange(in, allocated, freed, oldNodes)
+}
+
+// insertRangeOp mirrors briefs_do_insert_range (file.c:3316): open a
+// block-aligned hole of size at off, shifting the data at/after off up by
+// size; FileSize grows by size. The inserted range is a plain hole (reads as
+// zero); no blocks are allocated. An offset at/past EOF is -EINVAL (it would
+// grow the file over a region the shift never touched), as is a request that
+// would push FileSize past the device (the bridge's s_maxbytes stand-in,
+// mirroring the kernel's overflow-safe insert check, file.c:3520).
+func (b *BrieFS) insertRangeOp(in *briefs.Inode, off, size uint64) error {
+	bs := b.blockSize
+	if off%bs != 0 || size%bs != 0 {
+		return syscall.EINVAL
+	}
+	if off >= in.FileSize {
+		return syscall.EINVAL
+	}
+	maxBytes := b.sb.TotalBlocks * b.blockSize
+	if size > maxBytes-in.FileSize {
+		return syscall.EFBIG
+	}
+	if in.Flags&briefs.InodeFlagInlineData != 0 {
+		return syscall.EOPNOTSUPP
+	}
+
+	S, L := off/bs, size/bs
+	exts, oldNodes, err := b.collectExtentsAndNodes(in)
+	if err != nil {
+		return err
+	}
+	newExts, _ := shiftExtents(exts, S, L, +1)
+
+	in.FileSize += size
+	sec, nsec := nowTime()
+	in.MtimeSec, in.MtimeNsec = sec, nsec
+	in.CtimeSec, in.CtimeNsec = sec, nsec
+
+	var allocated []uint64
+	var drain []uint64
+	if err := b.rebuildExtentIndex(in, newExts, oldNodes, &drain, &allocated); err != nil {
+		b.rollbackAlloc(allocated)
+		return err
+	}
+	return b.commitExtentChange(in, allocated, nil, oldNodes)
+}
+
+// zeroRangeOp mirrors briefs_do_zero_range (file.c:2846): zero the contents
+// of [off, off+size) with ext4/xfs semantics (generic/009):
+//
+//   - byte-granular zeroing of the partial head/tail blocks (or of the whole
+//     range when it never covers a full block); written blocks are zeroed in
+//     place and stay "data" -- a partial-block zero must NOT convert to
+//     unwritten (generic/009 case 17). Holes/unwritten already read as zero
+//     and are skipped.
+//
+//   - the block-aligned middle [ceil(off), floor(end)) is converted to
+//     UNWRITTEN extents: written blocks have their flag flipped in place
+//     (same phys; the on-disk data is masked by the unwritten flag, as on
+//     ext4), and holes are allocated as fresh unwritten blocks.
+//
+// With !KEEP_SIZE the file may be extended to end (the extension's old-EOF
+// tail is zeroed first unless the EOF block was just converted to unwritten).
+// ctime advances always; mtime only when the file grew (the kernel's
+// zero-range timestamp tail, file.c:3085).
+func (b *BrieFS) zeroRangeOp(in *briefs.Inode, off, size uint64, mode uint32) error {
+	bs := b.blockSize
+	end := off + size
+
+	var allocated []uint64
+
+	// Inline-data file whose range fits the 256-byte region: zero in place.
+	if in.Flags&briefs.InodeFlagInlineData != 0 {
+		if end <= inlineDataMax {
+			return b.zeroRangeInline(in, off, end, mode)
+		}
+		// Promote to extent-backed, then take the extent path below; the
+		// promoted block joins this op's rollback/journal list.
+		var drain []uint64
+		if err := b.promoteInlineData(in, &drain, &allocated); err != nil {
+			b.rollbackAlloc(allocated)
+			return err
+		}
+	}
+
+	exts, oldNodes, err := b.collectExtentsAndNodes(in)
+	if err != nil {
+		b.rollbackAlloc(allocated)
+		return err
+	}
+
+	// Full-block bounds of the conversion middle.
+	sFull := (off + bs - 1) / bs
+	eFull := end / bs
+
+	// Byte-granular zeroing of the partial blocks: everything outside the
+	// middle (or the whole range when there is no middle). Only mapped,
+	// written blocks are touched; holes/unwritten read as zero already.
+	zeroRegion := func(from, to uint64) error {
+		for blk := from / bs; blk*bs < to; blk++ {
+			ext, found := lookupExtent(exts, blk)
+			if !found || ext.Phys == 0 || ext.Flags&briefs.ExtentFlagUnwritten != 0 {
+				continue
+			}
+			abs := ext.Phys + (blk - ext.Offset)
+			// Zero range within this block: [max(from, blkStart),
+			// min(to, blkEnd)) shifted to block-relative offsets.
+			zFrom := uint64(0)
+			if blk*bs < from {
+				zFrom = from - blk*bs
+			}
+			zTo := to - blk*bs
+			if zTo > bs {
+				zTo = bs
+			}
+			if err := b.zeroBlockRange(abs, zFrom, zTo); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if sFull < eFull {
+		if err := zeroRegion(off, sFull*bs); err != nil {
+			b.rollbackAlloc(allocated)
+			return err
+		}
+		if err := zeroRegion(eFull*bs, end); err != nil {
+			b.rollbackAlloc(allocated)
+			return err
+		}
+	} else {
+		if err := zeroRegion(off, end); err != nil {
+			b.rollbackAlloc(allocated)
+			return err
+		}
+	}
+
+	// Convert the middle to unwritten: written extents flip their flag in
+	// place (same phys); hole segments are allocated as fresh unwritten
+	// blocks. cursor walks the logical block range covered so far.
+	var newExts []briefs.Extent
+	converted := false
+	if sFull < eFull {
+		converted = true
+		var raw []briefs.Extent
+		cursor := sFull
+		for _, e := range exts {
+			o, ee := e.Offset, e.Offset+e.Len
+
+			// Hole inside the range, before this extent.
+			if o > cursor {
+				holeEnd := o
+				if holeEnd > eFull {
+					holeEnd = eFull
+				}
+				if cursor < holeEnd {
+					segs, err := b.allocUnwrittenHole(cursor, holeEnd, &allocated)
+					if err != nil {
+						b.rollbackAlloc(allocated)
+						return err
+					}
+					raw = append(raw, segs...)
+				}
+			}
+
+			switch {
+			case ee <= sFull || o >= eFull:
+				// Entirely outside the range: keep as-is.
+				raw = append(raw, e)
+			default:
+				// Prefix before the range: keep as-is.
+				if o < sFull {
+					raw = append(raw, briefs.Extent{Offset: o, Phys: e.Phys, Len: sFull - o, Flags: e.Flags})
+				}
+				// In-range portion: flip to unwritten, same phys.
+				ms, me := o, ee
+				if ms < sFull {
+					ms = sFull
+				}
+				if me > eFull {
+					me = eFull
+				}
+				raw = append(raw, briefs.Extent{
+					Offset: ms,
+					Phys:   e.Phys + (ms - o),
+					Len:    me - ms,
+					Flags:  briefs.ExtentFlagUnwritten,
+				})
+				// Suffix after the range: keep as-is.
+				if ee > eFull {
+					raw = append(raw, briefs.Extent{
+						Offset: eFull,
+						Phys:   e.Phys + (eFull - o),
+						Len:    ee - eFull,
+						Flags:  e.Flags,
+					})
+				}
+			}
+
+			if c := min(ee, eFull); c > cursor {
+				cursor = c
+			}
+		}
+		// Trailing hole after the last extent, inside the range.
+		if cursor < eFull {
+			segs, err := b.allocUnwrittenHole(cursor, eFull, &allocated)
+			if err != nil {
+				b.rollbackAlloc(allocated)
+				return err
+			}
+			raw = append(raw, segs...)
+		}
+		// Fold through insertExtentSorted so adjacent phys-contiguous
+		// same-flag pieces merge (a kept unwritten prefix and the flipped
+		// in-range portion become one extent), like the kernel's rebuild.
+		for _, e := range raw {
+			newExts = insertExtentSorted(newExts, e)
+		}
+	}
+
+	// Extension: zero the old-EOF block's tail before the size advances past
+	// it (generic/363), unless the EOF block was just converted to unwritten
+	// (it already reads as zero; zeroing its on-disk bytes is unnecessary).
+	oldSize := in.FileSize
+	grew := false
+	if mode&fallocKeepSize == 0 && end > in.FileSize {
+		if oldSize%bs != 0 && oldSize/bs < sFull {
+			var drain []uint64
+			if err := b.zeroEofTail(exts, int64(oldSize), &drain); err != nil {
+				b.rollbackAlloc(allocated)
+				return err
+			}
+		}
+		in.FileSize = end
+		grew = true
+	}
+
+	sec, nsec := nowTime()
+	in.CtimeSec, in.CtimeNsec = sec, nsec
+	if grew {
+		in.MtimeSec, in.MtimeNsec = sec, nsec
+	}
+
+	if converted {
+		var drain []uint64
+		if err := b.rebuildExtentIndex(in, newExts, oldNodes, &drain, &allocated); err != nil {
+			b.rollbackAlloc(allocated)
+			return err
+		}
+		return b.commitExtentChange(in, allocated, nil, oldNodes)
+	}
+
+	// No extent change: persist the inode (times, possible growth) and the
+	// zeroed partial blocks via the metadata-only commit.
+	if err := b.dev.Fdatasync(); err != nil {
+		b.failWrite()
+		return err
+	}
+	if err := b.journalInodeFull(in); err != nil {
+		b.failWrite()
+		return err
+	}
+	if err := b.journal.Sync(false); err != nil {
+		b.failWrite()
+		return err
+	}
+	if err := b.writeInodeDirect(in); err != nil {
+		b.failWrite()
+		return err
+	}
+	return b.dev.Fdatasync()
+}
+
+// zeroRangeInline applies ZERO_RANGE to an inline-data file whose range fits
+// the 256-byte region (the kernel do_zero_range's first branch, file.c:2878):
+// zero [off, min(end, size)) of the region, optionally grow the size to end,
+// and commit via the metadata-only path. An extension's new bytes are not
+// zeroed here (the kernel does not either): the inline region past the old
+// size reads as zero by convention.
+func (b *BrieFS) zeroRangeInline(in *briefs.Inode, off, end uint64, mode uint32) error {
+	zStart, zEnd := off, end
+	if zEnd > in.FileSize {
+		zEnd = in.FileSize
+	}
+	if zStart < zEnd {
+		region := in.InlineData()
+		for i := zStart; i < zEnd; i++ {
+			region[i] = 0
+		}
+		in.SetInlineData(region)
+	}
+
+	grew := false
+	if mode&fallocKeepSize == 0 && end > in.FileSize {
+		in.FileSize = end
+		grew = true
+	}
+	sec, nsec := nowTime()
+	in.CtimeSec, in.CtimeNsec = sec, nsec
+	if grew {
+		in.MtimeSec, in.MtimeNsec = sec, nsec
+	}
+
+	if err := b.journalInodeFull(in); err != nil {
+		b.failWrite()
+		return err
+	}
+	if err := b.journal.Sync(false); err != nil {
+		b.failWrite()
+		return err
+	}
+	if err := b.writeInodeDirect(in); err != nil {
+		b.failWrite()
+		return err
+	}
+	return b.dev.Fdatasync()
 }
 
 // truncateInode is the public truncate entry: lock + read + truncateLocked.

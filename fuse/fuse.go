@@ -763,8 +763,9 @@ func (n *brieFSNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetA
 	return 0
 }
 
-// Allocate handles fallocate. Mirrors briefs_fallocate (file.c:1876):
-// preallocate (unwritten extents) and PUNCH_HOLE; COLLAPSE/INSERT unsupported.
+// Allocate handles fallocate. Mirrors briefs_fallocate (file.c:3459) with
+// all five modes: preallocate (unwritten extents), PUNCH_HOLE, ZERO_RANGE,
+// COLLAPSE_RANGE, and INSERT_RANGE.
 func (n *brieFSNode) Allocate(ctx context.Context, f fs.FileHandle, off, size uint64, mode uint32) syscall.Errno {
 	return errToErrno(n.bfs.fallocateOp(n.ino, off, size, mode))
 }
