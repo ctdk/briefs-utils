@@ -540,15 +540,21 @@ func isPowerOfTwo(n uint64) bool {
 // zeroBlocks overwrites a range of blocks with zeros.  start is the first
 // block offset and count is the number of blocks.  The caller must ensure
 // start and count are within the device bounds.
+//
+// The zeros go out in large batches instead of one WriteAt per block: mkfs
+// clears the journal region this way (up to a few thousand blocks), and the
+// per-block syscalls dominate that step's runtime for no benefit.
 func zeroBlocks(file *os.File, start, count, blockSize uint64) error {
+	const maxBatchBlocks = 1024 // 4 MiB at the default 4K block size
 	if count == 0 {
 		return nil
 	}
-	zeroBlock := make([]byte, blockSize)
-	for i := uint64(0); i < count; i++ {
-		off := int64((start + i) * blockSize)
-		if _, err := file.WriteAt(zeroBlock, off); err != nil {
-			return fmt.Errorf("write zero block at %d: %w", start+i, err)
+	for first := uint64(0); first < count; first += maxBatchBlocks {
+		n := min(maxBatchBlocks, count-first)
+		batch := make([]byte, n*blockSize)
+		off := int64((start + first) * blockSize)
+		if _, err := file.WriteAt(batch, off); err != nil {
+			return fmt.Errorf("write zero blocks at %d: %w", start+first, err)
 		}
 	}
 	return nil
