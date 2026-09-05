@@ -162,6 +162,17 @@ func Mount(imagePath string, opts MountOptions) error {
 			// Setting FsName to the backing device path makes the source
 			// match, like the kernel mount (/dev/vdb1 ... briefs).
 			FsName: imagePath,
+			// Negotiate FUSE_POSIX_ACL, the bridge's stand-in for the
+			// kernel's SB_POSIXACL (super.c, ACL feature a113c76).  The
+			// kernel then evaluates ACL permissions itself from the
+			// system.posix_acl_access xattr (fetched through the
+			// ordinary Getxattr path) and setfacl writes the canonical
+			// blob through Setxattr -- no namespace filtering to lift:
+			// the bridge already stores any name verbatim, and ACLs on
+			// the on-disk format ARE ordinary prefixed xattrs
+			// (briefs-xattr/acl parity), so kernel-created and
+			// fuse-created ACLs interoperate.
+			EnableAcl: true,
 		},
 		// The root is never produced by a Lookup, so without this its
 		// stableAttr.Ino is 0 and stat reports ino 0 (and ".." from the

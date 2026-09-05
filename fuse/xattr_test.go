@@ -237,3 +237,44 @@ func TestXattrRebuildPreservesOthers(t *testing.T) {
 
 	fsckClean(t, b, img)
 }
+
+// TestXattrSystemNamespace round-trips system.posix_acl_* xattrs. The bridge
+// imposes no namespace filter (names are stored verbatim, like the kernel's
+// xattr.c treats ACLs as ordinary prefixed xattrs), which is what the mount's
+// FUSE_POSIX_ACL negotiation (fuse.go EnableAcl) relies on: the kernel
+// evaluates permissions from system.posix_acl_access and setfacl writes the
+// canonical blob through the same setxattr path. The value here is opaque
+// bytes -- the bridge does not parse ACL entries.
+func TestXattrSystemNamespace(t *testing.T) {
+	mkfs := buildMkfs(t)
+	img := mkfsImage(t, mkfs, 5000)
+	b := openBridge(t, img)
+
+	in, _ := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false)
+	ino := in.InodeNumber
+
+	// A canonical-format access ACL (version 2 header + entries); the
+	// bridge stores it like any other value.
+	acl := []byte{
+		0x02, 0, 0, 0, // posix_acl_xattr_header: version 2
+		0x06, 0, 0x01, 0, 0xff, 0xff, 0xff, 0xff, // owner::rw-
+		0x04, 0, 0x04, 0, 0xff, 0xff, 0xff, 0xff, // group::r--
+		0x00, 0, 0x08, 0, 0xff, 0xff, 0xff, 0xff, // other::---
+	}
+	if err := b.setXattr(ino, "system.posix_acl_access", acl, 0); err != nil {
+		t.Fatalf("setxattr system.posix_acl_access: %v", err)
+	}
+	got, err := b.getXattr(ino, "system.posix_acl_access")
+	if err != nil {
+		t.Fatalf("getxattr system.posix_acl_access: %v", err)
+	}
+	if !bytesEqual(got, acl) {
+		t.Fatalf("ACL xattr round-trip mismatch: got %d bytes, want %d", len(got), len(acl))
+	}
+	names, err := b.listXattr(ino)
+	if err != nil || len(names) != 1 || names[0] != "system.posix_acl_access" {
+		t.Fatalf("listxattr: want [system.posix_acl_access], got %v (err %v)", names, err)
+	}
+
+	fsckClean(t, b, img)
+}
