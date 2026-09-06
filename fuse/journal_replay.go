@@ -287,6 +287,15 @@ func (b *BrieFS) applyRecord(rtype uint32, data []byte, reserveOnly bool) error 
 		}
 		return b.replayXattrData(xd)
 
+	case briefs.JRN_TRIE_PAGE:
+		// Reserved record type (kernel branch wip/475-content-journaling,
+		// unmerged): no payload struct or replay handler exists yet. Fail
+		// loudly rather than falling through to the silent default skip —
+		// a skipped trie-page restore would leave stale directory data
+		// in place. Mounting such an image stays impossible until the
+		// branch merges and this grows a real handler.
+		return fmt.Errorf("JRN_TRIE_PAGE record: no replay handler (unmerged kernel branch wip/475-content-journaling is not supported)")
+
 	default:
 		return nil
 	}

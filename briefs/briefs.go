@@ -76,6 +76,17 @@ const (
 	JRN_INODE_FULL
 	JRN_SYMLINK_DATA
 	JRN_XATTR_DATA
+	// JRN_TRIE_PAGE (12) exists only on the unmerged kernel branch
+	// wip/475-content-journaling, where it restores full trie page
+	// contents during replay.  Mainline kernels never write it (their
+	// JRN_END is 12), so reserving the number here changes nothing for
+	// mainline images — but it means the value is already correct the day
+	// that branch merges, instead of colliding silently with this
+	// constant block's old JRN_END.  When the branch merges: add the
+	// payload struct + replay handler here and in fuse/journal_replay.go's
+	// applyRecord (which currently fails loudly on this type), and update
+	// briefs_test.go's parity table.
+	JRN_TRIE_PAGE
 	JRN_END
 )
 

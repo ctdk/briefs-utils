@@ -25,7 +25,11 @@ func TestJournalRecordEnumValues(t *testing.T) {
 		{"JRN_INODE_FULL", JRN_INODE_FULL, 9},
 		{"JRN_SYMLINK_DATA", JRN_SYMLINK_DATA, 10},
 		{"JRN_XATTR_DATA", JRN_XATTR_DATA, 11},
-		{"JRN_END", JRN_END, 12},
+		// Reserved: kernel branch wip/475-content-journaling assigns 12
+		// to JRN_TRIE_PAGE. Mainline's JRN_END is 12; the Go side
+		// reserves the number ahead of the merge (see briefs.go).
+		{"JRN_TRIE_PAGE", JRN_TRIE_PAGE, 12},
+		{"JRN_END", JRN_END, 13},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
