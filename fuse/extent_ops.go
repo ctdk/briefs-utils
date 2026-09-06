@@ -231,6 +231,11 @@ func (b *BrieFS) preallocate(in *briefs.Inode, start, end uint64, mode uint32, a
 		b.rollbackAlloc(allocated)
 		return err
 	}
+	// Raise the metadata shield for the unwritten blocks this preallocate
+	// inserted, before the commit (kernel briefs_raise_unwritten_reserve
+	// after the fallocate loop, file.c:3762-3772).  Recompute-from-extents
+	// also no-ops a re-fallocate over already-unwritten blocks.
+	b.updateUnwrittenRes(in.InodeNumber, exts)
 	return b.commitExtentChange(in, allocated, nil, oldNodes)
 }
 
@@ -257,6 +262,9 @@ func (b *BrieFS) punchHole(in *briefs.Inode, off, size uint64) error {
 		b.rollbackAlloc(allocated)
 		return err
 	}
+	// The punched-out blocks may have been unwritten: release their share of
+	// the shield before the commit (kernel release in briefs_do_punch_hole).
+	b.updateUnwrittenRes(in.InodeNumber, newExts)
 	return b.commitExtentChange(in, allocated, freed, oldNodes)
 }
 
@@ -380,6 +388,9 @@ func (b *BrieFS) collapseRangeOp(in *briefs.Inode, off, size uint64) error {
 		b.rollbackAlloc(allocated)
 		return err
 	}
+	// Freed collapsed blocks may have been unwritten: shrink the shield for
+	// the remainder (kernel release in briefs_do_collapse_range).
+	b.updateUnwrittenRes(in.InodeNumber, newExts)
 	return b.commitExtentChange(in, allocated, freed, oldNodes)
 }
 
@@ -629,6 +640,11 @@ func (b *BrieFS) zeroRangeOp(in *briefs.Inode, off, size uint64, mode uint32) er
 			b.rollbackAlloc(allocated)
 			return err
 		}
+		// The conversion may both raise the shield (holes became unwritten,
+		// flipped-written blocks newly count — kernel do_zero_range raises
+		// for every block that ends the op unwritten but did not start it,
+		// file.c:3017-3019) and keep it (unwritten->unwritten stays counted).
+		b.updateUnwrittenRes(in.InodeNumber, newExts)
 		return b.commitExtentChange(in, allocated, nil, oldNodes)
 	}
 
@@ -867,6 +883,9 @@ func (b *BrieFS) truncateLocked(in *briefs.Inode, newSize uint64) error {
 			b.rollbackAlloc(allocated)
 			return err
 		}
+		// Truncated-away blocks may have been unwritten: shrink the shield
+		// for the remainder (kernel release in briefs_setattr truncate).
+		b.updateUnwrittenRes(in.InodeNumber, newExts)
 		return b.commitExtentChange(in, allocated, freed, oldNodes)
 	}
 	// Truncate up.

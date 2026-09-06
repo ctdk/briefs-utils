@@ -173,6 +173,9 @@ func (b *BrieFS) freeInodeData(in *briefs.Inode) error {
 			return err
 		}
 	}
+	// Drop the inode's unwritten-extent reservation with it (kernel
+	// briefs_drop_unwritten_reserve at full extent free, extent.c).
+	b.setUnwrittenRes(in.InodeNumber, 0)
 	return nil
 }
 

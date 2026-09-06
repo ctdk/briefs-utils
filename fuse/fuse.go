@@ -55,11 +55,19 @@ type BrieFS struct {
 	// inode_block_lock (briefs.h:44), the first lock in the kernel order.
 	inodeBlockLocks [64]sync.Mutex
 
+	// Unwritten-extent metadata reservation (kernel alloc->meta_shield,
+	// alloc.c:843): unwrittenRes maps inode number to that inode's unwritten
+	// block count, from which the data allocator's shield is derived
+	// (meta_shield.go).  In-memory only, like the kernel's binfo counters.
+	// Lazily initialized; protected by shieldMu (a leaf lock).
+	shieldMu     sync.Mutex
+	unwrittenRes map[uint64]uint64
+
 	// cache is the per-operation block cache (see cache.go).  A mutating
 	// handler calls cacheBegin before its first metadata read and flushCache
 	// before journal.Sync so all of the operation's metadata lands on disk
 	// together.  nil between operations.  Protected by mu.
-	cache     map[uint64][]byte
+	cache      map[uint64][]byte
 	cacheDirty map[uint64]bool
 
 	// Replay-private maps (journal_replay.go). Non-nil only during
@@ -468,7 +476,10 @@ func (n *brieFSNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off
 
 func (n *brieFSNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	out.Blocks = n.bfs.sb.DataBlocks
-	out.Bfree = n.bfs.dataAlloc.FreeCount()
+	// f_bfree/f_bavail exclude the meta_shield: those blocks are reserved
+	// for the future B+tree metadata of outstanding unwritten-extent
+	// reservations, not available to data writers (kernel super.c:799-804).
+	out.Bfree = n.bfs.dataAlloc.FreeCountData()
 	out.Bavail = out.Bfree
 	out.Files = n.bfs.inodeAlloc.TotalBlocks()
 	out.Ffree = n.bfs.inodeAlloc.FreeCount()

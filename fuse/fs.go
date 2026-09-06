@@ -22,6 +22,16 @@ type Allocator struct {
 	freeCount                 uint64
 	l0, l1, l2                []uint64
 	dirty                     bool
+	// metaShield is the unwritten-extent metadata reserve (kernel
+	// alloc->meta_shield, alloc.c:193-217): a COUNT of free blocks reserved
+	// for the worst-case B+tree nodes that fragmenting the outstanding
+	// unwritten extents could require.  Held as a count, never bitmap bits,
+	// so data allocations stop at free_count == metaShield while
+	// AllocBlockMeta (B+tree nodes) draws from the full free count.  Always
+	// 0 on the inode allocator.  Adjusted by BrieFS.setUnwrittenRes
+	// (meta_shield.go), which maintains the kernel invariant
+	// meta_shield == sum over inodes of metaReserveSize(unwritten blocks).
+	metaShield uint64
 	// l2Dirty holds the indices (within the L2 level) of the on-disk blocks
 	// whose words changed since the last Sync, so Sync rewrites only those.
 	// L0/L1 are small summaries and are rewritten wholesale whenever dirty.
@@ -67,13 +77,44 @@ func (a *Allocator) markL2Word(w2 uint64) {
 	a.l2Dirty[w2/(a.blockSize/8)] = true
 }
 
-// AllocBlock finds and allocates a single free block.
-// Returns the data-relative block number, or 0 if out of space.
+// AllocBlock finds and allocates a single free block (a DATA allocation:
+// it respects metaShield).  Returns the data-relative block number, or 0
+// if out of space.
 func (a *Allocator) AllocBlock() uint64 {
+	return a.allocBlock(false)
+}
+
+// AllocBlockMeta is the metadata-class single-block allocation: it ignores
+// metaShield and draws from the full free count, mirroring the kernel's
+// briefs_alloc_block_meta (alloc.c:316) whose only callers are the B+tree
+// node allocations (btree.c splits/promote).  Without the bypass, a fs
+// filled to free_count == metaShield would ENOSPC exactly when the shield
+// exists to let the unwritten-extent conversion's node splits proceed.
+func (a *Allocator) AllocBlockMeta() uint64 {
+	return a.allocBlock(true)
+}
+
+// allocBlock is the shared single-block allocator, mirroring the kernel's
+// __briefs_alloc_block (alloc.c:193).  forMeta selects whether the metadata
+// shield applies.
+func (a *Allocator) allocBlock(forMeta bool) uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if a.freeCount == 0 || a.l0 == nil {
+	// Data allocations must respect the metadata shield: the effective
+	// free count is free_count - meta_shield, so a fs filled to 100% stops
+	// at free_count == meta_shield, leaving the shielded blocks free for
+	// metadata.  Metadata allocations (forMeta) bypass the shield and draw
+	// from the full free_count (ENOSPC only at true exhaustion).
+	avail := a.freeCount
+	if !forMeta {
+		if avail > a.metaShield {
+			avail -= a.metaShield
+		} else {
+			avail = 0
+		}
+	}
+	if avail == 0 || a.l0 == nil {
 		return 0
 	}
 
@@ -149,7 +190,16 @@ func (a *Allocator) AllocBlocks(n uint64) uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if n > a.freeCount || n > a.blockCount {
+	// Data run allocation respects metaShield like allocBlock (kernel
+	// briefs_alloc_blocks, alloc.c:365-371): a run is a data allocation, so
+	// it must leave the shielded blocks for metadata.
+	dataAvail := a.freeCount
+	if dataAvail > a.metaShield {
+		dataAvail -= a.metaShield
+	} else {
+		dataAvail = 0
+	}
+	if n > dataAvail || n > a.blockCount {
 		return 0
 	}
 
@@ -349,6 +399,38 @@ func (a *Allocator) FreeCount() uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.freeCount
+}
+
+// AdjustShield raises (delta > 0) or lowers (delta < 0) the unwritten-extent
+// metadata reserve.  Callers derive deltas from metaReserveSize so the sum
+// over inodes exactly matches the shield (kernel alloc.c:897/920).
+func (a *Allocator) AdjustShield(delta int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if delta >= 0 {
+		a.metaShield += uint64(delta)
+	} else {
+		a.metaShield -= uint64(-delta)
+	}
+}
+
+// Shield returns the current metadata reserve count.
+func (a *Allocator) Shield() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.metaShield
+}
+
+// FreeCountData returns the free blocks available to data allocations:
+// freeCount minus metaShield, clamped at zero.  Statfs reports this so df
+// shows the data-allocatable free space (kernel super.c:799-804).
+func (a *Allocator) FreeCountData() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.freeCount <= a.metaShield {
+		return 0
+	}
+	return a.freeCount - a.metaShield
 }
 
 // Allocated reports whether the given data-relative block (or inode, for the

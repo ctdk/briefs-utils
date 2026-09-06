@@ -457,6 +457,11 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 	if rebuildNeeded {
 		oldNodesToFree = oldNodes
 	}
+	// A conversion shrank the unwritten region: lower the metadata shield
+	// before the commit so a concurrent op cannot grab the surplus blocks
+	// (the kernel releases per converted block under extent_lock; here the
+	// recompute from the final extent list covers all conversion at once).
+	b.updateUnwrittenRes(in.InodeNumber, exts)
 	if err := b.commitExtentChange(in, *allocated, nil, oldNodesToFree); err != nil {
 		return 0, err
 	}
@@ -640,7 +645,11 @@ func (b *BrieFS) rebuildExtentIndex(in *briefs.Inode, exts []briefs.Extent, oldN
 	}
 
 	allocFn := func() (uint64, error) {
-		rel := b.dataAlloc.AllocBlock()
+		// Metadata-class allocation: B+tree nodes draw from the full free
+		// count, bypassing the unwritten-extent shield (the kernel's
+		// briefs_alloc_block_meta, whose only callers are the btree.c
+		// node allocations this mirrors).
+		rel := b.dataAlloc.AllocBlockMeta()
 		if rel == 0 {
 			return 0, syscall.ENOSPC
 		}
