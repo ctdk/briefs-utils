@@ -2,7 +2,7 @@
 
 ## Overview
 
-The BrieFS FUSE bridge (`cmd/fuse`, branch `fuse-rw-work`) is a Go port of the
+The BrieFS FUSE bridge (`cmd/fuse`) is a Go port of the
 BrieFS kernel module. It shares the on-disk format (`briefs/` package) and
 ports the kernel journal write path + journal-replay-on-mount to Go, making a
 FUSE-written volume crash-consistent, recoverable, and kernel-mountable.
@@ -31,7 +31,7 @@ This document records the xfstests status for the FUSE-mounted BrieFS as of
   `fusermount`). The BrieFS kernel module is **not** required (FUSE mounts are
   pure userspace), though loading it is harmless.
 - `/go/bin/fuse.briefs`, `/go/bin/mkfs.briefs`, `/go/bin/fsck.briefs` built from
-  `fuse-rw-work` (rebuild with `go build -a` after edits — the VM source is an
+  the briefs-utils repo (rebuild with `go build -a` after edits — the VM source is an
   NFS mount of the host, and NFS clock skew can make a plain `go build` skip
   recompiling changed packages).
 - `mount.fuse.briefs` installed in a directory `mount(8)` searches (`/sbin` or
@@ -258,22 +258,31 @@ bridge bugs to fix, and 032 is a fiemap feature-skip.
 
 ## FUSE bridge coverage
 
-The FUSE bridge implements all BrieFS operations at full kernel parity:
+The FUSE bridge implements all BrieFS operations at full kernel parity
+(feature list updated 2026-09-06 for the bu-refactor-1 branch — the results
+tables above are still the 2026-08-06 run; the bridge has not been re-run
+under xfstests since):
 
 - **Directory ops**: create, mkdir, unlink, rmdir (with journal ordering +
   trie root pinning).
 - **File data writes**: inline data (≤256B), extent-backed (inline array ≤8,
   B+ tree spill), hole allocation, unwritten extent conversion.
 - **Extended attributes**: user, trusted, security namespaces; set/get/list/
-  remove; continuation blocks for large values.
+  remove; continuation blocks for large values. POSIX ACLs are enforced
+  (mount enables go-fuse ACL negotiation; ACLs live in the
+  `system.posix_acl_*` xattrs exactly as in the kernel).
 - **Fileattr / chattr**: FS_IOC_GETFLAGS/SETFLAGS, FS_IOC_FSGETXATTR/
   FSSETXATTR; immutable/append enforcement.
 - **Link / symlink / mknod / rename**: hardlink, inline + extent symlinks,
   block/char/fifo/socket special files, renameat2 (NOREPLACE, EXCHANGE,
   WHITEOUT).
-- **Fallocate / setattr / killpriv**: KEEP_SIZE preallocate (unwritten
-  extents), PUNCH_HOLE, truncate up/down, chmod/chown/utimes, suid/sgid
-  stripping + security.capability clearing on write/chown.
+- **Fallocate / setattr / killpriv**: all five fallocate modes (KEEP_SIZE
+  preallocate with unwritten extents, PUNCH_HOLE, ZERO_RANGE, COLLAPSE_RANGE,
+  INSERT_RANGE), truncate up/down, chmod/chown/utimes, suid/sgid stripping +
+  security.capability clearing on write/chown. Like the kernel's
+  `meta_shield`, B+ tree metadata is reserved for unwritten extents, so
+  converting a preallocated block cannot ENOSPC on a full filesystem.
+- **Ioctls**: FITRIM and FS_IOC_{GET,SET}FSLABEL (see `fuse/ioctl_mount.go`).
 - **Journal port**: Go port of the kernel journal write path (`briefs/
   journal_write.go`), with drain-before-snapshot durability for btree nodes
   and commit-before-flush for re-derivable metadata (trie pages, inline data,
@@ -281,16 +290,21 @@ The FUSE bridge implements all BrieFS operations at full kernel parity:
 - **Journal replay on mount**: Go port of the kernel's `briefs_journal_replay`
   (`fuse/journal_replay.go`), running the 3-pass replay (reserve bitmap bits,
   re-derive tries + restore inode/symlink/xattr blocks, reconcile nlinks) so a
-  crashed/dirty volume recovers consistently on remount.
+  crashed/dirty volume recovers consistently on remount. Replay applies the
+  kernel's generation guards (kernel commit 33e4019) for inode-full/update
+  records.
 - **Per-inode-block locking**: sharded per-inode-table-block mutexes for
   concurrent file writes on disjoint blocks.
-- **Not implemented**: fiemap (`FS_IOC_FIEMAP`) — gates `generic/032` to
-  NOT RUN.
+- **Not implemented**: fiemap (`FS_IOC_FIEMAP` — gates `generic/032` to
+  NOT RUN) and the file-range exchange ioctls
+  (XFS_IOC_EXCHANGE_RANGE/SWAP_RANGE, COMMIT_RANGE — deferred, rationale in
+  `fuse/ioctl_mount.go`). O_TMPFILE is not bridge-addressable: the 6.12 FUSE
+  client has no O_TMPFILE support.
 
 ## Repository layout
 
 | Repo | Branch | Role |
 |------|--------|------|
 | `~/src/briefs` (kernel) | `master` | Kernel module + xfstests wrappers (`tests/xfstests/fuse-briefs-*`, `run-suite.sh`, `run-fuse-subset.sh`) |
-| `~/go/src/github.com/ctdk/briefs-utils` | `fuse-rw-work` | Go FUSE bridge (`cmd/fuse`), mkfs (`cmd/mkfs`), fsck (`cmd/fsck`), shared format (`briefs/`), `mount.fuse.briefs` helper |
+| `~/go/src/github.com/ctdk/briefs-utils` | `bu-refactor-1` | Go FUSE bridge (`cmd/fuse`), mkfs (`cmd/mkfs`), fsck (`cmd/fsck`), shared format (`briefs/`), `mount.fuse.briefs` helper (current dev branch; the read-write bridge work is in `master`) |
 | `~/src/xfstests-dev` | — | xfstests source + configs (`configs/briefs-fuse.config`), `common/rc` FUSE-type fixes |

@@ -43,7 +43,7 @@ GLOBAL OPTIONS:
 fsck.briefs
 -----------
 
-The idea with `fsck.briefs` is that it will repair broken, mangled, and mutilated BrieFS volumes. It performs a growing list of consistency checks, including CRC32C verification of journal records and B+ tree extent index nodes, structural validation of those B+ trees (high-key monotonicity, child-pointer range/level, leaf prev/next linkage, cross-leaf key ordering, extent-count agreement), validation of the packed directory trie pages used by BrieFS 0.7.0+, validation of inode extended-attribute chains (magic, header version, used_size, CRC32C, entry bounds, continuation blocks, and chain length/loop detection), and preservation of the inode `user_flags` field used for chattr/lsattr flags.
+The idea with `fsck.briefs` is that it will repair broken, mangled, and mutilated BrieFS volumes. It performs a growing list of consistency checks, including CRC32C verification of journal records and B+ tree extent index nodes, structural validation of those B+ trees (high-key monotonicity, child-pointer range/level, leaf prev/next linkage, cross-leaf key ordering, extent-count agreement), validation of the packed directory trie pages used by BrieFS 0.7.0+, validation of inode extended-attribute chains (magic, header version, used_size, CRC32C, entry bounds, continuation blocks, and chain length/loop detection), validation of inode `generation` and `user_flags` values, and preservation of the `user_flags` field used for chattr/lsattr flags.
 
 Repairs are organized into phases, selectable with `--repair-only` (comma-separated):
 
@@ -51,7 +51,7 @@ Repairs are organized into phases, selectable with `--repair-only` (comma-separa
 * `btrees` — recompute and rewrite B+ tree extent-index node checksums (CRC-only; no structural change).
 * `btree-rebuild` — fully rebuild a damaged B+ tree extent index from its surviving extents, dropping to inline extents when ≤8 remain.
 * `btree-orphan` — free orphan B+ tree node blocks left behind by a torn split. Destructive, so it is **opt-in only and not included in `all`**.
-* `extents` — compact and rebalance file extent indexes, merging underfull B+ tree leaves (a no-op on an already-minimal tree).
+* `extents` — rebuild tree-backed files' B+ tree extent indexes minimally packed; data extents themselves are never merged (a no-op on an already-minimal tree).
 * `trie` — compact directory trie pages.
 * `links` — repair inode link counts.
 
@@ -88,7 +88,7 @@ GLOBAL OPTIONS:
 fuse.briefs
 -----------
 
-A FUSE bridge for BrieFS so you can mount BrieFS volumes without the commitment of loading and/or battling with a kernel module. The FUSE bridge is **read-write** (full kernel parity) but **experimental**: it implements all directory and file operations (create, mkdir, unlink, rmdir, link, symlink, mknod, rename with renameat2 EXCHANGE/WHITEOUT), extended attributes (user/trusted/security), fileattr/chattr (FS_IOC_GETFLAGS/SETFLAGS, FS_IOC_FSGETXATTR/FSSETXATTR), fallocate (KEEP_SIZE/PUNCH_HOLE), setattr (chmod/chown/utimes/truncate), and killpriv (suid/sgid + security.capability stripping). It also ports the kernel journal write path to Go and replays the journal on mount, making FUSE-written volumes crash-consistent and recoverable (a crashed/dirty volume remounts with the same consistency the kernel module provides) and kernel-mountable. However, it has not yet been tested across the full xfstests suite — see the `xfstests-fuse-status.md` document for the current pass/fail record and known issues.
+A FUSE bridge for BrieFS so you can mount BrieFS volumes without the commitment of loading and/or battling with a kernel module. The FUSE bridge is **read-write** (full kernel parity) but **experimental**: it implements all directory and file operations (create, mkdir, unlink, rmdir, link, symlink, mknod, rename with renameat2 EXCHANGE/WHITEOUT), extended attributes (user/trusted/security), POSIX ACLs, fileattr/chattr (FS_IOC_GETFLAGS/SETFLAGS, FS_IOC_FSGETXATTR/FSSETXATTR), fallocate (all five modes: KEEP_SIZE preallocate with unwritten extents, PUNCH_HOLE, ZERO_RANGE, COLLAPSE_RANGE, INSERT_RANGE), FITRIM and FS_IOC_{GET,SET}FSLABEL, setattr (chmod/chown/utimes/truncate), and killpriv (suid/sgid + security.capability stripping). Like the kernel's `meta_shield`, it reserves B+ tree metadata for unwritten extents, so converting a preallocated block to written cannot ENOSPC on a full filesystem. It also ports the kernel journal write path to Go and replays the journal on mount, making FUSE-written volumes crash-consistent and recoverable (a crashed/dirty volume remounts with the same consistency the kernel module provides) and kernel-mountable. However, it has not yet been tested across the full xfstests suite — see the `xfstests-fuse-status.md` document for the current pass/fail record and known issues.
 
 ### Mounting with `mount -t fuse.briefs`
 

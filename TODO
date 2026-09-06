@@ -2,10 +2,15 @@
 * [Done] Make man pages.  Each command has a hidden --generate-man-page
   flag (wired through urfave/cli-docs/v3) that writes a section-8 man page
   to man/man8/<name>.8; `make man` regenerates all three.
-* The codebase is starting to feel a bit hairy. It could stand another round of
-  refactoring.
-* [Done] The FUSE bridge is read-write (fuse-rw-work branch): full kernel
-  parity (all dir/file ops, xattrs, fileattr/chattr, renameat2, fallocate/
+* [Done] The codebase was feeling a bit hairy, so it got another round of
+  refactoring: the bu-refactor-1 branch (27 commits, not yet merged) deduplicated
+  the trie/btree/journal/xattr walkers into shared briefs helpers, wired up
+  fsck --verbose, removed the dead code, fixed the fsck scan hot spots, ported
+  the kernel's replay generation guards and trie sibling-chain caps, and closed
+  the FUSE feature gaps (all five fallocate modes, POSIX ACLs, FITRIM/FSLABEL
+  ioctls, the unwritten-extent metadata reserve).
+* [Done] The FUSE bridge is read-write: full kernel parity
+  (all dir/file ops, xattrs, ACLs, fileattr/chattr, renameat2, fallocate/
   setattr/killpriv), Go journal port, per-inode-block locking. Still
   experimental — see xfstests-fuse-status.md for the xfstests pass/fail
   record and known issues.
@@ -13,10 +18,18 @@
 * Expand xfstests coverage for BrieFS under FUSE: the replay-sensitive subset
   (generic/003, 029, 030, 032, 321, 322, 547, 640, 475, 011) currently gives
   7 PASS / 2 FAIL (generic/547, 011) / 1 NOT RUN (generic/032, fiemap
-  unsupported) under the FUSE bridge. (A prior "10/10 PASS" result was invalid
-  — the harness was mounting via the kernel module, not the FUSE bridge; see
-  the correction note in xfstests-fuse-status.md.) Broaden to the full generic
-  group.
+  unsupported) under the FUSE bridge — the 2026-08-06 record; the bridge has
+  since gained the fallocate modes, ACLs, and FITRIM/FSLABEL ioctls on
+  bu-refactor-1, not yet re-run under xfstests. (A prior "10/10 PASS" result
+  was invalid — the harness was mounting via the kernel module, not the FUSE
+  bridge; see the correction note in xfstests-fuse-status.md.) Broaden to
+  the full generic group.
+* Implement the remaining ioctls in the FUSE bridge: fiemap (FS_IOC_FIEMAP,
+  which gates generic/032 to NOT RUN) and the file-range exchange ioctls
+  (XFS_IOC_EXCHANGE_RANGE/SWAP_RANGE and COMMIT_RANGE — a ~500-line
+  two-inode port of the kernel's briefs_do_exchange; rationale in
+  fuse/ioctl_mount.go). O_TMPFILE is not bridge-addressable: the 6.12 FUSE
+  client has no O_TMPFILE support.
 * Port the kernel's replay trie-block reuse pool + per-directory partial-pool
   seeding (briefs_trie_seed_pool) into the FUSE replay, so crash-replay on a
   near-full filesystem reuses JRN_TRIE_ALLOC blocks instead of allocating fresh
