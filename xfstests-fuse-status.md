@@ -8,20 +8,32 @@ ports the kernel journal write path + journal-replay-on-mount to Go, making a
 FUSE-written volume crash-consistent, recoverable, and kernel-mountable.
 
 This document records the xfstests status for the FUSE-mounted BrieFS as of
-2026-08-06.
+2026-09-06.
 
-> **Correction (2026-08-06).** An earlier version of this document reported
-> "10/10 PASS" for the replay-sensitive subset. That result was **invalid**: the
-> FUSE xfstests harness was not actually engaging the FUSE bridge — it was
-> mounting via the BrieFS *kernel* module. `common/config` line 116
-> unconditionally resets `MOUNT_PROG="$(type -P mount)"` (the kernel mount), and
-> the subset script's `eval "$(grep -E '^export' …)"` workaround did not
-> survive `./check` re-sourcing `common/config`, so `MOUNT_PROG` reverted to the
-> kernel mount and every "FUSE" result was in fact a kernel result. The
-> `generic/547` "flakey can't read superblock" timing flake recorded below was
-> likewise a *kernel* dm-flakey flake, not a FUSE/replay bug. The harness has
-> since been fixed (see "How to run") and the results below are the **real**
-> FUSE-bridge results.
+> **Correction history — two harness bugs, two invalid records.**
+>
+> 1. *(2026-08-06, first record)* "10/10 PASS" was invalid: the harness was
+>    not engaging the FUSE bridge at all. Fixed by the `HOST_OPTIONS` +
+>    `configs/briefs-fuse.config` approach (`MOUNT_PROG`/`UMOUNT_PROG`
+>    wrappers).
+> 2. *(2026-08-06, second record, 7/10 PASS)* — **also invalid for every
+>    scratch-mounting test.** `common/config` resets
+>    `MOUNT_PROG="$(type -P mount)"` unconditionally (line ~116), but the
+>    `[briefs]` section override only re-parses when `CONFIG_INCLUDED` is
+>    unset. `./check` exports `CONFIG_INCLUDED=true`, so **every test child**
+>    re-sources `common/config` and silently reverts to the plain kernel
+>    mount (`SHELLOPTS=xtrace` repro: child trace shows
+>    `+ /usr/bin/mount -t briefs /dev/vdc1 /mnt/briefs-scratch`). With the
+>    kernel module loaded, those child kernel mounts silently *succeeded*, so
+>    the Aug-6 results for 003 029 030 321 322 547 640 475 were all
+>    kernel-backed. Only `run-suite.sh`'s TEST_DEV mounts — and hence
+>    `generic/011`, which uses `$TEST_DIR` — ever genuinely exercised the
+>    bridge.
+>
+> Both are now fixed (see "How to run"); the results below are the first
+> trustworthy per-test FUSE-bridge record, from the 2026-09-06 re-run with the
+> kernel module **removed** so any residual kernel mount fails loudly instead
+> of silently succeeding.
 
 ## How to run xfstests against the FUSE mount
 
@@ -29,7 +41,7 @@ This document records the xfstests status for the FUSE-mounted BrieFS as of
 
 - `fuse3` installed on the VM (`apt-get install -y fuse3` — provides
   `fusermount`). The BrieFS kernel module is **not** required (FUSE mounts are
-  pure userspace), though loading it is harmless.
+  pure userspace).
 - `/go/bin/fuse.briefs`, `/go/bin/mkfs.briefs`, `/go/bin/fsck.briefs` built from
   the briefs-utils repo (rebuild with `go build -a` after edits — the VM source is an
   NFS mount of the host, and NFS clock skew can make a plain `go build` skip
@@ -44,13 +56,22 @@ This document records the xfstests status for the FUSE-mounted BrieFS as of
 
 ### Running
 
-The **correct** way to engage FUSE is to set `HOST_OPTIONS` so `common/config`
-sources the `[briefs]` section *after* its line-116 `MOUNT_PROG` reset, which
-overrides `MOUNT_PROG` back to the FUSE wrapper. (Exporting `MOUNT_PROG`
-directly does **not** work — `./check` re-sources `common/config` and clobbers
-it.)
+**Remove the kernel module first.** `MODULE_ALIAS_FS("briefs")` makes
+`mount -t briefs` auto-load `briefs_fs`, so an installed module turns any
+accidental kernel mount into a silent false pass — the exact failure mode that
+invalidated both earlier records. For a FUSE run:
 
-The `run-fuse-subset.sh` wrapper does this for the replay-sensitive subset:
+```bash
+sudo rmmod briefs_fs 2>/dev/null
+sudo mv /lib/modules/$(uname -r)/extra/briefs/briefs_fs.ko /root/briefs_fs.ko.current
+sudo depmod -a
+```
+
+(restore with the reverse `mv` + `depmod -a` + `modprobe fs-briefs` when done).
+`run-suite.sh` now guards its `modprobe` so a FUSE run (`MOUNT_CMD` matching
+`*fuse*`) never auto-loads the module itself.
+
+The `run-fuse-subset.sh` wrapper runs the replay-sensitive subset:
 
 ```bash
 # Inside the VM, as root:
@@ -74,6 +95,23 @@ sudo bash -c 'export HOST_OPTIONS=/xfstests/configs/briefs-fuse.config \
   bash /vagrant/tests/xfstests/run-suite.sh generic/003'
 ```
 
+### Harness fixes that make the results trustworthy
+
+- `common/config` (xfstests-dev): the unconditional
+  `MOUNT_PROG="$(type -P mount)"` / `UMOUNT_PROG` reset now only runs when the
+  variable is unset, so an exported/inherited wrapper survives `./check`'s
+  child re-sourcing (`CONFIG_INCLUDED=true` path). This is the child-mount
+  bypass fix.
+- `run-suite.sh` (kernel repo): `modprobe briefs_fs` skipped for FUSE runs.
+- `fuse-briefs-umount` (kernel repo): resolves a **device** argument
+  (`/dev/vdc1`) to its mountpoint via `findmnt -S` before unmounting.
+  `_check_briefs_filesystem` → `_umount_or_remount_ro` passes `$device`, and
+  the wrapper previously (a) could not reliably unmount by device spec and
+  (b) computed a pidfile key that never matched the one `fuse-briefs-mount`
+  wrote (keyed by mountpoint) — so the post-test fsck ran on a still-mounted
+  scratch and refused ("is mounted"), failing 029/030 spuriously in the
+  2026-09-06 run. Fixed after that run; re-verify on the next 030 run.
+
 ### How the wrappers work
 
 - `fuse-briefs-mount [-t briefs] [-o opts] <dev> <mnt>`: the `MOUNT_PROG`
@@ -85,10 +123,10 @@ sudo bash -c 'export HOST_OPTIONS=/xfstests/configs/briefs-fuse.config \
 - `mount.fuse.briefs <src> <target>`: the `mount(8)` type helper. Backgrounds
   `fuse.briefs -i <src> -m <target>` via `setsid`, writes the daemon PID to
   `/tmp/fuse-briefs-<target>.pid`, polls `mountpoint -q` until visible.
-- `fuse-briefs-umount <mnt>`: the `UMOUNT_PROG` wrapper. Runs
-  `umount`/`fusermount -u`, waits for the recorded `fuse.briefs` PID to exit
-  (journal checkpoint completes) so the next test's `mkfs.briefs` doesn't race
-  the checkpoint.
+- `fuse-briefs-umount <mnt-or-device>`: the `UMOUNT_PROG` wrapper. Resolves
+  device→mountpoint (see above), runs `umount`/`fusermount -u`, waits for the
+  recorded `fuse.briefs` PID to exit (journal checkpoint completes) so the
+  next test's `mkfs.briefs` doesn't race the checkpoint.
 - `FSTYP` stays `briefs` (not `fuse`) so the `common/briefs` helpers
   (`_require_briefs_feature`, `_check_briefs_filesystem`) remain active — only
   the mount path is swapped to FUSE.
@@ -112,31 +150,61 @@ teaching. These changes are in the `xfstests-dev` tree:
   xfstests treats the device as unmounted (`_check_if_dev_already_mounted` →
   `_exit 1`), the systematic empty-output failure every test hit before this.
 
-## Results (2026-08-06, FUSE actually engaged)
+## Results (2026-09-06, kernel module removed, child-mount bypass fixed)
 
-### Replay-sensitive subset
+Pre-fix sanity run (harness fix not yet applied, module removed → bypass made
+loud): 0 PASS / 8 FAIL / 2 NOT RUN — every scratch test died with
+`mount: unknown filesystem type 'briefs'`, proving the Aug-6 "passes" were
+kernel mounts. Archive: `tests/xfstests/runs/run-20260906-180622-fuse.txt`.
+
+Post-fix run (archive `tests/xfstests/runs/run-20260906-184643-fuse.txt` in
+the kernel repo, recorded at commit `ee47e72`):
 
 | Test | Description | Result | Detail |
 |------|-------------|--------|--------|
-| `generic/003` | basic journal test | ✅ PASS | |
-| `generic/029` | clean unmount replay | ✅ PASS | |
-| `generic/030` | clean unmount + remount | ✅ PASS | |
-| `generic/032` | replay trie clobber | ⏭️ NOT RUN | `xfs_io fiemap failed` — FUSE bridge does not implement fiemap (clean feature-skip) |
-| `generic/321` | journal replay inode full | ✅ PASS | |
-| `generic/322` | journal write pos fix | ✅ PASS | |
-| `generic/547` | fsstress + fsync + crash-replay | ❌ FAIL | metadata mismatch after crash-replay (see Known issues) |
-| `generic/640` | rename trie root ordering | ✅ PASS | |
-| `generic/475` | dm-error replay | ✅ PASS | validates the journal-replay-on-mount port under xfstests |
-| `generic/011` | dirstress | ❌ FAIL | `rm: … Directory not empty` (readdir/rmdir inconsistency under concurrent dir ops) |
+| `generic/003` | atime updates | ❌ FAIL | **Real bridge gap**: atime never updated after access (all four checks). The bridge's getattr serves its own stored atime; it never advances atime on read ops. |
+| `generic/029` | mmap write vs truncate down/up | ❌ FAIL | **Real bridge bug**: all 6 hexdumps (pre *and* post remount, all 3 cases) end at `0x1000` instead of `0x1400` — data written past the 4096-byte boundary after truncate-up is lost at write time. mmap-writeback size/extension handling. Plus the 030-style fsck-on-mounted artifact (see below). |
+| `generic/030` | mmap truncate | ❌ FAIL (artifact) | `.out.bad` is **empty** — test content matched golden exactly. The only failure is the post-test `_check_scratch_fs` fsck refusing to run on the still-mounted scratch (umount-wrapper device-arg bug, fixed — see harness fixes). Genuinely a harness artifact; re-verify next run. |
+| `generic/032` | fiemap | ⏭️ NOT RUN | `xfs_io fiemap failed` — bridge does not implement fiemap (clean feature-skip) |
+| `generic/321` | fsync under dm-flakey | ✅ PASS | first genuine FUSE pass for a scratch-mounting replay test |
+| `generic/322` | fsync rename under dm-flakey | ❌ FAIL | **Real bridge bug**: scenario 2's `pwrite 2M 1M` (offset 2 MiB past EOF 1 MiB) reports success (`wrote 1048576/1048576 bytes at offset 2097152`) yet the file reads back as 1 MiB — sparse writes past EOF do not advance i_size / do not persist. md5 = the 1 MiB-file hash even *pre-drop*, so replay is not implicated. |
+| `generic/475` | dm-error fsstress crash-replay | 🟠 HANG (timeout) | test body completed ("Silence is golden" — the crash-replay scenario itself succeeded) but 4 fsstress workers sat in D-state for 5+ hours with the `error-test.475` dm device up; `./check` never reaped them and `timeout 900` could not SIGTERM it. They eventually returned on their own (after a `dmsetup remove -f` attempt window) and the run recorded HANG. Same VM-reboot-only class as the kernel 127/521 flush wedges; needs root-cause (daemon-side blocked I/O on the dm-error device should get EIO, not an infinite wait). |
+| `generic/547` | fsstress + fsync + flakey crash-replay | ✅ PASS | **first genuine FUSE 547 pass** — the Aug-6 "metadata mismatch" record was a *kernel* dm-flakey flake observed through the harness bypass and is retracted (see Known issues) |
+| `generic/640` | rename trie-root journal ordering | ✅ PASS | |
+| `generic/011` | dirstress | ❌ FAIL | **Real bridge bug, confirmed**: `rm: … Directory not empty` under concurrent dir ops — identical to the Aug-6 signature (the one genuine FUSE result of that run), now reproduced on the honest harness. readdir does not enumerate all entries under concurrent modification. |
 
-**7 PASS, 2 FAIL (547, 011), 1 NOT RUN (032).**
+**3 PASS (321 547 640), 5 FAIL (003 011 029 030 322), 1 HANG (475), 1 NOT
+RUN (032).** With 030 reclassified as a harness artifact (out.bad empty,
+wrapper fixed after the run; re-verify next run), the real bridge bugs
+surfaced by the first honest run are: **003 (atime), 011 (readdir under
+concurrent modification), 029 (mmap/truncate tail loss), 322 (sparse-write
+i_size loss)**, plus the **475 wedge**.
 
-`generic/475` (dm-error sudden-death → crash-replay) passing is the key
-validation that the Go journal-replay port (`fuse/journal_replay.go`) works
-under xfstests: after the dm-error kill, the remount replays the live journal
-range and the test's fsck/post-state checks pass.
+`generic/321`, `547`, and `640` passing are the meaningful new signals: the
+journal write path + replay-on-mount port survives fsync/flakey crash-replay
+and the rename journal-ordering scenario genuinely under FUSE.
 
-### Kernel interop
+### Verification that this run really used FUSE
+
+- No `mount: unknown filesystem type 'briefs'` (kernel-mount attempt) in any
+  `.out.bad`/`.full` from the post-fix run — all scratch mounts succeeded,
+  i.e. via the wrappers.
+- The 475 fuse daemon runs `-i /dev/mapper/error-test.475` (dm scratch) and
+  547/321/322 likewise exercised flakey/dm paths through `fuse.briefs`.
+- The per-test failure signatures above (atime, mmap tail, sparse i_size) are
+  *bridge-shaped* bugs the kernel module does not have — independent
+  confirmation the bridge was under test.
+
+## Results history
+
+| Date | Record | Validity |
+|------|--------|-----------|
+| 2026-08-06 (1st) | "10/10 PASS" | invalid — no FUSE engagement at all (MOUNT_PROG clobbered by config reset) |
+| 2026-08-06 (2nd) | "7/10 PASS (547, 011 FAIL)" | invalid for all scratch tests — child-mount bypass; only 011 was genuine FUSE |
+| 2026-09-06 (pre-fix) | 0/8/2 | valid but uninformative — proves the bypass (loud kernel-mount failures) |
+| 2026-09-06 (post-fix) | see table above | **first trustworthy per-test FUSE record** |
+
+## Kernel interop
 
 The kernel interop test (`interop_test.sh`, commit `8a3e7f7` in the kernel
 repo) confirms that a volume written by the Go FUSE bridge is mountable by the
@@ -178,90 +246,78 @@ superblock are persisted. `journal.WriteRecord` is a no-op while in replay,
 so the trie page-init/free paths do not append fresh records into the range
 being replayed.
 
-`generic/475` (dm-error crash-replay) passes under FUSE, exercising this
-path. `generic/547` (fsstress + fsync + dm-flakey crash-replay) does not yet
-pass — see Known issues.
+`generic/321` and `generic/547` (fsync/dm-flakey crash-replay) now pass
+genuinely under FUSE (2026-09-06), exercising this path; `generic/475`'s test
+body also completed its crash-replay scenario before the harness wedge.
 
 ## Known issues
 
-### generic/547 — metadata mismatch after fsstress crash-replay (real FUSE bug)
+### generic/003 — atime never updated (real bridge gap)
 
-With FUSE engaged, `generic/547` fails with a post-crash-replay metadata
-mismatch:
+All four atime checks fail. The bridge never advances atime on read
+operations; since FUSE getattr is served by the daemon, its stored atime
+shadows whatever the kernel VFS might have cached. Fix: update atime (with
+relatime-style throttling to taste) in the bridge's read path.
 
-```
-metadata mismatch in /p1/db/f10
-metadata mismatch in /p1/db/f11
-metadata mismatch in /p1/db/f12
-only in remote fs: /p1/db/fc
-metadata mismatch in /p1/db/fe
-```
+### generic/029 — mmap write after truncate-down/up loses the past-page tail (real bridge bug)
 
-`generic/475` (dm-error, also crash-replay) passes, so the replay port's basic
-correctness is sound; 547 differs by driving fsstress (many concurrent ops,
-fsync, dm-flakey drop_writes), producing a denser journal whose replay is not
-fully idempotent. The likely cause is the **deferred trie-block reuse pool**
-(see below): the FUSE replay re-derives tries via the live `TrieInsert`/
-`TrieRemove`, which allocate fresh trie pages from the data allocator instead
-of reusing the `JRN_TRIE_ALLOC` blocks the kernel's replay-trie-block pool
-reuses, so a non-idempotent re-derivation can leave orphan/aliased trie blocks
-→ "only in remote fs" / metadata mismatch. Porting the kernel's replay
-trie-block pool + per-directory partial-pool seeding (`briefs_trie_seed_pool`)
-is the expected fix. (The earlier "547 flakey can't read superblock" note was
-a *kernel* dm-flakey timing flake observed because the harness was mounting
-via the kernel, not FUSE — it is not a FUSE/replay bug and is retracted.)
+All three cases, both pre- and post-remount: expected file size 5120/5121
+bytes, actual 4096 — the mwrite region `[4096, 5120)` is lost while
+`[2048, 4096)` survives. Already wrong before the remount, so this is at
+write time, not checkpoint/replay. Points at the mmap-writeback path
+clamping/mis-extending the size when writes land past EOF in the block/page
+that follows a truncate-up. Needs debug in `fuse/file_ops.go` (write-back
+handling of partial final blocks) — plausibly related to the 322 size bug
+below.
 
-### generic/011 — dirstress "Directory not empty" (real FUSE bug)
+### generic/322 — sparse write past EOF does not advance i_size (real bridge bug)
 
-With FUSE engaged, `generic/011` (dirstress, concurrent dir ops) fails during
-cleanup:
+`pwrite 2M 1M` on a 1 MiB file reports full success, but the file still reads
+back as 1 MiB afterward (pre-drop md5 equals the 1 MiB-file hash) — the data
+extent and/or the size update for a write starting past EOF is dropped.
+Replay is not implicated (wrong before the flakey drop). Needs debug in the
+bridge's write path (hole creation + size extension for offset > i_size).
 
-```
-rm: cannot remove '/mnt/briefs-test/dirstress.*/stressdir/stress.0': Directory not empty
-rm: cannot remove '.../stress.4': Directory not empty
-…
-```
+### generic/475 — dm-error soak wedge (harness/daemon wedge, body passed)
 
-`rm -rf` removes children before `rmdir`, so "Directory not empty" during a
-recursive remove indicates the FUSE bridge's **readdir does not enumerate all
-entries** under concurrent modification (rm does not see entries to remove,
-but `rmdir` sees the directory as non-empty) — a readdir/trie-iteration
-consistency bug under concurrency, distinct from the kernel-side
-seek/resume fixes. Needs investigation.
+The test's crash-replay content completed, but 4 fsstress workers entered
+uninterruptible D-state against the dm-error scratch mount and stayed there
+for over 5 hours; the test shell could not reap them, `timeout 900` could not
+terminate `./check`, and the run stalled (they eventually returned on their
+own and the run recorded 475 as HANG; `sudo dmsetup remove -f
+error-test.475` is the intended manual unwedge). Root cause open: why
+daemon-side I/O on an error-table dm device blocked indefinitely instead of
+returning EIO. Same "VM-reboot-only" flavor as the kernel-side 127/521
+flush wedges, but those were kernel bugs — this one is bridge-side and new.
+
+### Retracted: generic/547 "metadata mismatch" (was a kernel flake)
+
+The Aug-6 547 failure narrative (replay non-idempotence via the deferred
+trie-block reuse pool) was observed through the harness bypass and was a
+*kernel* dm-flakey flake — 547 passes genuinely under FUSE (2026-09-06). The
+replay-trie-block pool port (kernel `briefs_trie_seed_pool`) remains a
+worthwhile parity item from the 2026-09-04 review, but it is no longer
+implicated in any observed failure.
 
 ### generic/032 — NOT RUN (fiemap unsupported)
 
-`generic/032` cleanly `_notrun`s with `xfs_io fiemap failed (old kernel/wrong
-fs?)` — the FUSE bridge does not implement the `FS_IOC_FIEMAP` ioctl, so the
-test's `_require` gates and skips. Not a failure; a feature gap. Implementing
-fiemap in the bridge would let 032 run.
+`generic/032` cleanly `_notrun`s — the bridge does not implement the
+`FS_IOC_FIEMAP` ioctl. Not a failure; a feature gap. Implementing fiemap in
+the bridge would let 032 run.
 
-### Deferred: trie-block reuse pool for full-fs replay
+### generic/011 — dirstress "Directory not empty" (real bridge bug, confirmed)
 
-The replay re-derives directory tries via the live `TrieInsert`/`TrieRemove`,
-which allocate fresh trie pages from the data allocator (the journal records
-are not appended during replay, so `JRN_TRIE_ALLOC` blocks reserved in pass 1
-are not reused the way the kernel's replay-trie-block pool reuses them). For
-the `generic/475` workload this is harmless (re-derivation is idempotent —
-`-EEXIST`/`-ENOENT` — so no new pages are allocated), but the `generic/547`
-fsstress crash-replay is not fully idempotent and surfaces this as the
-metadata mismatch above. Porting the kernel's replay trie-block pool +
-per-directory partial-pool seeding (`briefs_trie_seed_pool`) would close this,
-matching the kernel's full-fs crash-replay behaviour.
-
-### Coverage gap
-
-Only the replay-sensitive subset has been run under FUSE, not the full
-`generic` group. The 7/10 subset result (with 475 passing) is the first
-trustworthy FUSE xfstests record; the two failures (547, 011) are real FUSE
-bridge bugs to fix, and 032 is a fiemap feature-skip.
+First seen in the Aug-6 run (the one genuine FUSE result of that run, via
+`$TEST_DIR`), and reproduced identically by the 2026-09-06 honest run:
+`rm: … Directory not empty` during dirstress cleanup — readdir does not
+enumerate all entries under concurrent modification (rm does not see the
+entries to remove, but rmdir sees the directory as non-empty). Needs
+investigation in the bridge's readdir/trie-iteration path under concurrency.
 
 ## FUSE bridge coverage
 
 The FUSE bridge implements all BrieFS operations at full kernel parity
-(feature list updated 2026-09-06 for the bu-refactor-1 branch — the results
-tables above are still the 2026-08-06 run; the bridge has not been re-run
-under xfstests since):
+(feature list updated 2026-09-06 for the bu-refactor-1 branch):
 
 - **Directory ops**: create, mkdir, unlink, rmdir (with journal ordering +
   trie root pinning).
@@ -295,11 +351,13 @@ under xfstests since):
   records.
 - **Per-inode-block locking**: sharded per-inode-table-block mutexes for
   concurrent file writes on disjoint blocks.
-- **Not implemented**: fiemap (`FS_IOC_FIEMAP` — gates `generic/032` to
-  NOT RUN) and the file-range exchange ioctls
-  (XFS_IOC_EXCHANGE_RANGE/SWAP_RANGE, COMMIT_RANGE — deferred, rationale in
-  `fuse/ioctl_mount.go`). O_TMPFILE is not bridge-addressable: the 6.12 FUSE
-  client has no O_TMPFILE support.
+- **Known gaps surfaced by the 2026-09-06 run**: atime maintenance on read
+  (003), mmap-writeback size extension past a truncate-up (029), sparse-write
+  i_size extension (322), fiemap (`FS_IOC_FIEMAP` — gates `generic/032` to
+  NOT RUN), and the file-range exchange ioctls (XFS_IOC_EXCHANGE_RANGE/
+  SWAP_RANGE, COMMIT_RANGE — deferred, rationale in `fuse/ioctl_mount.go`).
+  O_TMPFILE is not bridge-addressable: the 6.12 FUSE client has no O_TMPFILE
+  support.
 
 ## Repository layout
 
@@ -307,4 +365,4 @@ under xfstests since):
 |------|--------|------|
 | `~/src/briefs` (kernel) | `master` | Kernel module + xfstests wrappers (`tests/xfstests/fuse-briefs-*`, `run-suite.sh`, `run-fuse-subset.sh`) |
 | `~/go/src/github.com/ctdk/briefs-utils` | `bu-refactor-1` | Go FUSE bridge (`cmd/fuse`), mkfs (`cmd/mkfs`), fsck (`cmd/fsck`), shared format (`briefs/`), `mount.fuse.briefs` helper (current dev branch; the read-write bridge work is in `master`) |
-| `~/src/xfstests-dev` | — | xfstests source + configs (`configs/briefs-fuse.config`), `common/rc` FUSE-type fixes |
+| `~/src/xfstests-dev` | — | xfstests source + configs (`configs/briefs-fuse.config`), `common/rc` + `common/config` FUSE harness fixes |
