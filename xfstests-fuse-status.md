@@ -108,9 +108,26 @@ sudo bash -c 'export HOST_OPTIONS=/xfstests/configs/briefs-fuse.config \
   `_check_briefs_filesystem` → `_umount_or_remount_ro` passes `$device`, and
   the wrapper previously (a) could not reliably unmount by device spec and
   (b) computed a pidfile key that never matched the one `fuse-briefs-mount`
-  wrote (keyed by mountpoint) — so the post-test fsck ran on a still-mounted
-  scratch and refused ("is mounted"), failing 029/030 spuriously in the
-  2026-09-06 run. Fixed after that run; re-verify on the next 030 run.
+  wrote (keyed by mountpoint). Necessary for the post-test unmount to work
+  at all, but **not sufficient** to fix 030/029 — the real cause was the
+  daemon dying at test exit (next bullet).
+- `mount.fuse.briefs` (utils repo): the daemon was launched with plain
+  `setsid`, which stays in the caller's cgroup. xfstests wraps each test in
+  its own transient systemd scope (`fstests-generic-030.scope`) and *stops*
+  that scope when the test exits — killing the daemon with it and leaving a
+  dead FUSE mount: still listed in `/proc/mounts` (stat: "Transport endpoint
+  is not connected") but invisible to `df`, because coreutils `df` omits
+  mounts it cannot stat. `common/rc`'s `_fs_type` is df-based, so
+  `_check_briefs_filesystem` no longer recognised the scratch as a mounted
+  briefs fs, skipped its `_umount_or_remount_ro`, and ran fsck on the
+  still-listed mount — which refused ("is mounted"). This is what actually
+  failed 030 (which deliberately leaves the scratch mounted at exit) in
+  every 2026-09-06/07 run. Fixed 2026-09-07: the daemon is now launched as
+  a transient systemd service in `system.slice` (`systemd-run --unit=…
+  --collect`), which the test scope's teardown does not touch; falls back to
+  `setsid` when systemd-run is unavailable or fails. Verified end-to-end
+  (mount inside a stopped scope survives; umount wrapper reaps it) and
+  generic/030 now **passes** (clean `./check` run, 2026-09-07).
 
 ### How the wrappers work
 
@@ -120,9 +137,12 @@ sudo bash -c 'export HOST_OPTIONS=/xfstests/configs/briefs-fuse.config \
   `/usr/sbin/mount.fuse.briefs`, which backgrounds the `fuse.briefs` daemon,
   records its PID, and waits for the mountpoint to come up. `-o` opts are
   forwarded (the daemon currently ignores them).
-- `mount.fuse.briefs <src> <target>`: the `mount(8)` type helper. Backgrounds
-  `fuse.briefs -i <src> -m <target>` via `setsid`, writes the daemon PID to
-  `/tmp/fuse-briefs-<target>.pid`, polls `mountpoint -q` until visible.
+- `mount.fuse.briefs <src> <target>`: the `mount(8)` type helper. Launches
+  `fuse.briefs -i <src> -m <target>` as a transient systemd service
+  (`systemd-run --unit=… --collect` in `system.slice`, so the daemon survives
+  the mounting process's cgroup teardown — e.g. xfstests stopping the test
+  scope; falls back to `setsid` without systemd-run), writes the daemon PID
+  to `/tmp/fuse-briefs-<target>.pid`, polls `mountpoint -q` until visible.
 - `fuse-briefs-umount <mnt-or-device>`: the `UMOUNT_PROG` wrapper. Resolves
   device→mountpoint (see above), runs `umount`/`fusermount -u`, waits for the
   recorded `fuse.briefs` PID to exit (journal checkpoint completes) so the
@@ -164,7 +184,7 @@ the kernel repo, recorded at commit `ee47e72`):
 |------|-------------|--------|--------|
 | `generic/003` | atime updates | ❌ FAIL | **Real bridge gap**: atime never updated after access (all four checks). The bridge's getattr serves its own stored atime; it never advances atime on read ops. |
 | `generic/029` | mmap write vs truncate down/up | ❌ FAIL | **Real bridge bug**: all 6 hexdumps (pre *and* post remount, all 3 cases) end at `0x1000` instead of `0x1400` — data written past the 4096-byte boundary after truncate-up is lost at write time. mmap-writeback size/extension handling. Plus the 030-style fsck-on-mounted artifact (see below). |
-| `generic/030` | mmap truncate | ❌ FAIL (artifact) | `.out.bad` is **empty** — test content matched golden exactly. The only failure is the post-test `_check_scratch_fs` fsck refusing to run on the still-mounted scratch (umount-wrapper device-arg bug, fixed — see harness fixes). Genuinely a harness artifact; re-verify next run. |
+| `generic/030` | mmap truncate | ✅ PASS (2026-09-07 revalidation) | In the 2026-09-06 run the `.out.bad` was **empty** — test content matched golden exactly — and the only failure was the post-test `_check_scratch_fs` fsck refusing to run on the still-mounted scratch. Root cause (found 2026-09-07): the test scope teardown killed the FUSE daemon, leaving a dead mount that `df` cannot see, so the pre-fsck unmount gate never fired (see harness fixes). Fixed in `mount.fuse.briefs`; revalidated with a clean `./check generic/030` run — **Passed all 1 tests**. |
 | `generic/032` | fiemap | ⏭️ NOT RUN | `xfs_io fiemap failed` — bridge does not implement fiemap (clean feature-skip) |
 | `generic/321` | fsync under dm-flakey | ✅ PASS | first genuine FUSE pass for a scratch-mounting replay test |
 | `generic/322` | fsync rename under dm-flakey | ❌ FAIL | **Real bridge bug**: scenario 2's `pwrite 2M 1M` (offset 2 MiB past EOF 1 MiB) reports success (`wrote 1048576/1048576 bytes at offset 2097152`) yet the file reads back as 1 MiB — sparse writes past EOF do not advance i_size / do not persist. md5 = the 1 MiB-file hash even *pre-drop*, so replay is not implicated. |
@@ -174,11 +194,13 @@ the kernel repo, recorded at commit `ee47e72`):
 | `generic/011` | dirstress | ❌ FAIL | **Real bridge bug, confirmed**: `rm: … Directory not empty` under concurrent dir ops — identical to the Aug-6 signature (the one genuine FUSE result of that run), now reproduced on the honest harness. readdir does not enumerate all entries under concurrent modification. |
 
 **3 PASS (321 547 640), 5 FAIL (003 011 029 030 322), 1 HANG (475), 1 NOT
-RUN (032).** With 030 reclassified as a harness artifact (out.bad empty,
-wrapper fixed after the run; re-verify next run), the real bridge bugs
-surfaced by the first honest run are: **003 (atime), 011 (readdir under
+RUN (032)** as run on 2026-09-06. 030's failure was a harness artifact and
+is now fixed and revalidated (2026-09-07 clean `./check` PASS), so the real
+bridge bugs surfaced by the honest run are: **003 (atime), 011 (readdir under
 concurrent modification), 029 (mmap/truncate tail loss), 322 (sparse-write
-i_size loss)**, plus the **475 wedge**.
+i_size loss)**, plus the **475 wedge**. 029 also carried the 030-style
+post-test fsck artifact; its content-level hexdump failure is independent of
+that and stands.
 
 `generic/321`, `547`, and `640` passing are the meaningful new signals: the
 journal write path + replay-on-mount port survives fsync/flakey crash-replay
@@ -203,6 +225,7 @@ and the rename journal-ordering scenario genuinely under FUSE.
 | 2026-08-06 (2nd) | "7/10 PASS (547, 011 FAIL)" | invalid for all scratch tests — child-mount bypass; only 011 was genuine FUSE |
 | 2026-09-06 (pre-fix) | 0/8/2 | valid but uninformative — proves the bypass (loud kernel-mount failures) |
 | 2026-09-06 (post-fix) | see table above | **first trustworthy per-test FUSE record** |
+| 2026-09-07 | generic/030 re-run: PASS | valid — first clean 030 pass; scope-kill harness fix (`mount.fuse.briefs`) validated |
 
 ## Kernel interop
 
