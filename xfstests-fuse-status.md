@@ -313,6 +313,43 @@ daemon-side I/O on an error-table dm device blocked indefinitely instead of
 returning EIO. Same "VM-reboot-only" flavor as the kernel-side 127/521
 flush wedges, but those were kernel bugs — this one is bridge-side and new.
 
+### generic/013 — RENAME_WHITEOUT shard self-deadlock (real bridge bug, FIXED 2026-09-07)
+
+The 2026-09-07 full-suite run wedged in generic/013: one fsstress worker sat
+in D-state in `renameat2(..., RENAME_WHITEOUT)` for 2+ hours, the FUSE queue
+showed `waiting=1`, and a Go goroutine dump (SIGQUIT on the daemon) showed
+the handler stuck 100 minutes in `sync.Mutex.Lock` inside
+`renameWhiteout` → `lockOtherInodeBlock` (`fuse/link_ops.go`) — with **no
+other goroutine holding the mutex**.
+
+Root cause: `renameWhiteout` first locks the inode-table-block shards of
+{old parent, new parent, moved, target} via `lockInodeShards`, then
+allocates the fresh whiteout inode and locks *its* shard via
+`lockOtherInodeBlock(oldParentIno, whiteout)`, which dedups only against the
+**parent's** shard. The fresh slot can land in a table block sharing a shard
+with the *moved* or *target* inode (fsstress allocates everything from the
+same free-slot region, so this is common); re-locking a shard the same
+goroutine already holds self-deadlocks, since Go mutexes are not reentrant.
+The stuck handler wedges every later client of that shard, and the whole
+mount freezes until the daemon is killed. Fix: `lockInodeBlockUnlessHeld`
+(fuse/fuse.go) dedups against *all* held shards; `renameWhiteout` now uses
+it. Also found while unwedging: the run-suite `timeout` used SIGTERM, which
+bash defers while waiting on a foreground child, so a wedged test defeats
+its own timeout — run-suite.sh now uses `timeout -s KILL` (exit 137 →
+`HANG (timeout)`).
+
+**Validated 2026-09-07**: with the fix, generic/013 runs to completion —
+all three fsstress phases (including the rename-heavy phase 3) finish
+without wedging; 300 s was additionally too short for the bridge's
+per-op journal sync + device fdatasync under fsstress (013 now gets a
+1200 s run-suite timeout). 013 still FAILs, but on a *different*, known
+bug: `rm: cannot remove '…': Directory not empty` during its cleanup — the
+generic/011 readdir family.  New signal from 013's failure: every affected
+directory sits behind long name components (30–115 bytes each) whose
+cumulative depth overflows the trie iterator's fixed 256-byte name stack,
+which drops entries silently (see the 2026-09-04 review, E1 secondary) —
+concrete root-cause lead for the 011 bug.
+
 ### Retracted: generic/547 "metadata mismatch" (was a kernel flake)
 
 The Aug-6 547 failure narrative (replay non-idempotence via the deferred

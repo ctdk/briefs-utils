@@ -649,7 +649,11 @@ func (b *BrieFS) renameWhiteout(oldParentIno uint64, oldName string, newParentIn
 		b.cacheAbort()
 		return err
 	}
-	wUnlock := b.lockOtherInodeBlock(oldParentIno, whiteout.InodeNumber)
+	// Dedup the whiteout's shard against ALL shards held above, not just the
+	// parent's: the fresh slot can share a shard with the moved or target
+	// inode's block, and re-locking it would self-deadlock (see
+	// lockInodeBlockUnlessHeld).
+	wUnlock := b.lockInodeBlockUnlessHeld(inos, whiteout.InodeNumber)
 	defer func() {
 		if wUnlock != nil {
 			wUnlock.Unlock()

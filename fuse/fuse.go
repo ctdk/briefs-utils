@@ -266,6 +266,26 @@ func (b *BrieFS) lockOtherInodeBlock(parentIno, childIno uint64) *sync.Mutex {
 	return cLock
 }
 
+// lockInodeBlockUnlessHeld locks @ino's shard unless that shard is one of the
+// shards this goroutine already holds via lockInodeShards(@held). Go mutexes
+// are not reentrant, so re-locking a held shard self-deadlocks: the op blocks
+// forever on a mutex it itself owns, wedging every later client of that shard.
+// Needed where an op holds SEVERAL shards and then allocates a fresh inode
+// (rename whiteout): the fresh slot's table block can share a shard with any
+// of the held ones -- not just the parent, which is all lockOtherInodeBlock
+// dedups against (generic/013 fsstress wedge, 2026-09-07: the fresh whiteout
+// landed in the moved inode's shard).
+func (b *BrieFS) lockInodeBlockUnlessHeld(held []uint64, ino uint64) *sync.Mutex {
+	s, m := b.inodeBlockShard(ino)
+	for _, h := range held {
+		if hs, _ := b.inodeBlockShard(h); hs == s {
+			return nil
+		}
+	}
+	m.Lock()
+	return m
+}
+
 // lockInodeShards locks the (deduplicated) shards for a set of inodes in
 // ascending shard order and returns a cleanup that unlocks in reverse. Used by
 // multi-inode dir ops (rename), which also hold the global dir lock, so no two
