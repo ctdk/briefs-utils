@@ -60,11 +60,46 @@ mkdir -p "$target"
 log="/tmp/fuse.briefs-$(echo "$target" | tr / _).log"
 # PID file consumed by the umount wrapper so it can wait for the daemon's
 # post-unmount journal checkpoint to finish before the next test reformats
-# the device.  In a non-interactive helper (no job control) `setsid prog &`
-# does not fork, so $! is the daemon's real PID.
+# the device.
 pidfile="/tmp/fuse-briefs-$(echo "$target" | tr / _).pid"
-setsid "$daemon" -i "$src" -m "$target" </dev/null >"$log" 2>&1 &
-echo $! > "$pidfile"
+
+# Launch the daemon detached from the caller's cgroup when possible.
+# xfstests runs each test inside its own systemd scope
+# (fstests-<group>-<test>.scope) and stops that scope when the test exits,
+# killing every process still in it — a daemon started here with plain
+# setsid dies with the test, leaving a dead FUSE mount behind (stat:
+# "Transport endpoint is not connected").  coreutils df omits mounts it
+# cannot stat, so xfstests' _fs_type then no longer recognises the device
+# and its post-test filesystem check never unmounts before running fsck,
+# which refuses to operate on the still-listed mount (generic/030).  A
+# mount must outlive the process that created it (kernel mounts do), so
+# run the daemon as a transient systemd service in system.slice, which the
+# test scope's teardown does not touch.  Fall back to setsid when
+# systemd-run is unavailable or fails to start the unit (non-systemd
+# systems, non-root callers, or a lingering unit name collision).
+pid=""
+unit="fuse-briefs-$(echo "$target" | tr / _ | tr -cd '[:alnum:]_.-')-$$"
+if [ "$(id -u)" = 0 ] && command -v systemd-run >/dev/null 2>&1; then
+  if systemd-run --unit="$unit" --collect --quiet \
+       -p StandardOutput="append:$log" -p StandardError="append:$log" \
+       "$daemon" -i "$src" -m "$target" >/dev/null 2>&1; then
+    # systemd-run returns once the unit is started; MainPID should be set
+    # by then, but retry briefly in case we race the service's fork.
+    for i in $(seq 1 20); do
+      pid="$(systemctl show -p MainPID --value "$unit" 2>/dev/null)"
+      [ -n "$pid" ] && [ "$pid" != 0 ] && break
+      sleep 0.05
+    done
+  fi
+fi
+if [ -n "$pid" ] && [ "$pid" != 0 ]; then
+  echo "$pid" > "$pidfile"
+else
+  # In a non-interactive helper (no job control) `setsid prog &` does not
+  # fork, so $! is the daemon's real PID.
+  setsid "$daemon" -i "$src" -m "$target" </dev/null >>"$log" 2>&1 &
+  echo $! > "$pidfile"
+fi
 
 # Wait for the FUSE mount to become visible.
 for i in $(seq 1 100); do
