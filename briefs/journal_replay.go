@@ -107,6 +107,7 @@ func (j *Journal) MarkCleanAfterReplay() error {
 	j.syncedPos = j.writePos
 	j.dirty = false
 	j.recordsSinceCheckpoint = 0
+	j.blocksSinceCheckpoint = 0
 	j.checkpointSeq = j.sb.CheckpointSeq
 
 	// Refresh free counts from the authoritative allocators before persisting.

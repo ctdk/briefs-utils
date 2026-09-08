@@ -100,23 +100,103 @@ func TestJournalWriteAndSync(t *testing.T) {
 	}
 
 	// After Sync, the superblock's log_end must have advanced past the
-	// written block (commit point persisted).  On a fresh mount where
-	// write_pos == log_start and records are pending, the kernel (and this
-	// port) fires a back-pressure checkpoint at sync start, so log_start
-	// also advances to log_end — the durable invariant is that the commit
-	// happened, i.e. log_end moved past its initial value.
+	// written block (commit point persisted).  The ring was EMPTY
+	// (writePos == logStart, zero blocks advanced since the last
+	// checkpoint), so the sync-time back-pressure must NOT fire: the
+	// kernel takes that path in the empty state too, but its journal
+	// syncs are rare fsync-path events (dir.c:25 rejects per-create
+	// syncs), while this bridge syncs per op — an empty-state checkpoint
+	// here full-checkpointed every op (~6 device fsyncs each; the fuse
+	// 63-HANG throughput family).  The one committed block stays live and
+	// replayable until a real checkpoint retires it.
 	sb2 := &SuperblockLayout{}
 	sbBuf := readBlock(t, f, 4096, 0)
 	if err := sb2.UnmarshalBinary(sbBuf); err != nil {
 		t.Fatalf("UnmarshalBinary sb: %v", err)
 	}
-	if sb2.JournalLogEnd <= initialLogEnd {
-		t.Fatalf("log_end (%d) should be past initial log_end (%d) after Sync",
+	if sb2.JournalLogEnd != initialLogEnd+1 {
+		t.Fatalf("log_end (%d) should be exactly one committed block past initial log_end (%d) after Sync",
 			sb2.JournalLogEnd, initialLogEnd)
 	}
-	if sb2.JournalLogStart != sb2.JournalLogEnd {
-		t.Fatalf("after first-sync back-pressure checkpoint, log_start (%d) should equal log_end (%d)",
-			sb2.JournalLogStart, sb2.JournalLogEnd)
+	if sb2.JournalLogStart != initialLogEnd {
+		t.Fatalf("first Sync on an empty ring must not checkpoint: log_start (%d) should be unchanged at %d",
+			sb2.JournalLogStart, initialLogEnd)
+	}
+}
+
+// TestSyncBackPressureRetiresFullRing: with the empty-ring gate in place
+// (blocksSinceCheckpoint), the sync-time back-pressure must still fire when
+// the ring is genuinely FULL — writePos wrapped back onto logStart with the
+// whole ring live — and must retire BEFORE the pending block is written
+// (flushPending=false), so the pending block lands in the retired position
+// instead of clobbering the oldest live records.
+func TestSyncBackPressureRetiresFullRing(t *testing.T) {
+	// 4-block journal: usable ring = 3 blocks (rel 0,1,2), checkpoint block
+	// at rel 3.  One record + Sync per round advances writePos by one block,
+	// so round 3's advance lands writePos back on logStart with the ring
+	// full, and round 4's Sync entry must fire the back-pressure checkpoint.
+	const totalBlocks, journalBlocks = 4096, 4
+	f, sb := newJournalImage(t, totalBlocks, journalBlocks)
+
+	j, err := NewJournal(sb, f, 4096)
+	if err != nil {
+		t.Fatalf("NewJournal: %v", err)
+	}
+	initialLogStart := sb.JournalLogStart
+	initialSeq := j.sb.CheckpointSeq
+
+	writeRound := func(ino uint64) {
+		t.Helper()
+		rec := &JrnInodeAlloc{Ino: ino, Mode: 0o100644, Nlink: 1}
+		if err := j.WriteRecord(JRN_INODE_ALLOC, rec.Marshal()); err != nil {
+			t.Fatalf("WriteRecord %d: %v", ino, err)
+		}
+		if err := j.Sync(false); err != nil {
+			t.Fatalf("Sync %d: %v", ino, err)
+		}
+	}
+
+	// Fill the ring: rounds 1-3 commit one block each.  None of these may
+	// checkpoint (the every-op regression): the ring is not full yet.
+	for i := uint64(1); i <= 3; i++ {
+		writeRound(i)
+		if got := j.sb.CheckpointSeq; got != initialSeq {
+			t.Fatalf("round %d checkpointed (seq %d, want %d): the sync-time back-pressure fired before the ring was full",
+				i, got, initialSeq)
+		}
+	}
+
+	// Round 4: sync entry with writePos == logStart and the ring full —
+	// the back-pressure must retire here, then write the pending block.
+	writeRound(4)
+	if got := j.sb.CheckpointSeq; got == initialSeq {
+		t.Fatal("sync-time back-pressure did not fire on a full ring (checkpointSeq unchanged)")
+	}
+	// After the retire + pending-block write: logStart == logEnd - 1 (one
+	// live block — round 4's), and logStart returned to the initial
+	// position after the full wrap.
+	if j.sb.JournalLogEnd != j.sb.JournalLogStart+1 {
+		t.Fatalf("after full-ring back-pressure: log_end (%d) should be one live block past log_start (%d)",
+			j.sb.JournalLogEnd, j.sb.JournalLogStart)
+	}
+	if j.sb.JournalLogStart != initialLogStart {
+		t.Fatalf("after full wrap log_start (%d) should be back at the initial position (%d)",
+			j.sb.JournalLogStart, initialLogStart)
+	}
+	if j.blocksSinceCheckpoint != 1 {
+		t.Fatalf("blocksSinceCheckpoint after retire+write: want 1, got %d",
+			j.blocksSinceCheckpoint)
+	}
+
+	// The retired records must be gone from replay's view (log range is
+	// just round 4's block) and the on-disk superblock must agree.
+	sb2 := &SuperblockLayout{}
+	if err := sb2.UnmarshalBinary(readBlock(t, f, 4096, 0)); err != nil {
+		t.Fatalf("UnmarshalBinary sb: %v", err)
+	}
+	if sb2.JournalLogStart != j.sb.JournalLogStart || sb2.JournalLogEnd != j.sb.JournalLogEnd {
+		t.Fatalf("on-disk log range [%d,%d) != in-memory [%d,%d)",
+			sb2.JournalLogStart, sb2.JournalLogEnd, j.sb.JournalLogStart, j.sb.JournalLogEnd)
 	}
 }
 

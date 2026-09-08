@@ -72,6 +72,13 @@ type Journal struct {
 	checkpointBlk uint64
 	checkpointSeq uint64
 	recordsSinceCheckpoint uint32
+	// blocksSinceCheckpoint counts ring positions advanced (writePos moves)
+	// since the last checkpoint.  It is the only discriminator between the
+	// post-checkpoint EMPTY ring (logStart == logEnd == writePos, nothing
+	// live) and a FULLY WRAPPED ring (same three field values, every block
+	// live): on disk the two states are identical, so the sync-time
+	// back-pressure needs this history.  Reset wherever logStart is reset.
+	blocksSinceCheckpoint uint32
 	dirty        bool
 	inCheckpoint bool
 
@@ -189,9 +196,11 @@ func (j *Journal) writeRecordLocked(typ uint32, data []byte) error {
 			return err
 		}
 		j.writePos = j.nextBlock(j.writePos)
+		j.blocksSinceCheckpoint++
 		// Never clobber the checkpoint block.
 		if j.writePos == j.checkpointBlk {
 			j.writePos = j.nextBlock(j.writePos)
+			j.blocksSinceCheckpoint++
 		}
 		j.initCurBlock(j.blockSeq + 1)
 		// curBlock is now empty; the flushed block lives only in the page
@@ -204,7 +213,10 @@ func (j *Journal) writeRecordLocked(typ uint32, data []byte) error {
 		// next_block(write_pos) != write_pos).  Force a checkpoint to retire
 		// the tail instead of overwriting live records.
 		if j.writePos == j.sb.JournalLogStart {
-			if err := j.checkpointLocked(); err != nil {
+			// dirty is false here (the flush above reset it), so the
+			// pending-flush inside the checkpoint is a no-op; the record
+			// appends into the fresh curBlock after the retire.
+			if err := j.checkpointLocked(true); err != nil {
 				return fmt.Errorf("briefs: back-pressure checkpoint: %w", err)
 			}
 			// A ring with >=2 usable blocks is now clear.  A degenerate
@@ -272,10 +284,24 @@ func (j *Journal) syncLocked(checkpoint bool) error {
 	}
 
 	// Back-pressure: if the current block is also the oldest uncheckpointed
-	// block, retire it first (journal.c:2063).
-	if !j.inCheckpoint && j.writePos == j.sb.JournalLogStart {
+	// block, retire it first (journal.c:2476).  writePos == logStart is true
+	// both for a fully wrapped ring (checkpoint required: the block about to
+	// be written is the oldest live one) and for the post-checkpoint EMPTY
+	// ring (writePos never moved past logStart, so the block at writePos was
+	// already retired by that checkpoint).  The kernel takes this path in the
+	// empty state too, which is harmless there because the kernel only syncs
+	// the journal on explicit fsync/sync_fs/DIRSYNC (dir.c:25 rejects
+	// per-create syncs as far too slow).  This bridge syncs per op, so firing
+	// in the empty state would full-checkpoint EVERY op (~6 device fsyncs
+	// each -- the fuse 63-HANG throughput family).  Gate on
+	// blocksSinceCheckpoint: 0 positions advanced since the last checkpoint
+	// means the ring is empty and the write is safe.
+	if !j.inCheckpoint && j.writePos == j.sb.JournalLogStart &&
+		j.blocksSinceCheckpoint > 0 {
 		j.inCheckpoint = true
-		err := j.checkpointLocked()
+		// flushPending=false: with a full ring, writePos == logStart is the
+		// oldest live block; retire first, write the pending block after.
+		err := j.checkpointLocked(false)
 		j.inCheckpoint = false
 		if err != nil {
 			return err
@@ -290,8 +316,10 @@ func (j *Journal) syncLocked(checkpoint bool) error {
 		return err
 	}
 	j.writePos = j.nextBlock(j.writePos)
+	j.blocksSinceCheckpoint++
 	if j.writePos == j.checkpointBlk {
 		j.writePos = j.nextBlock(j.writePos)
+		j.blocksSinceCheckpoint++
 	}
 	j.initCurBlock(j.blockSeq + 1)
 	j.dirty = false
@@ -304,6 +332,20 @@ func (j *Journal) syncLocked(checkpoint bool) error {
 		return fmt.Errorf("briefs: persist journal tail: %w", err)
 	}
 
+	// Allocator bitmaps are metadata the kernel's sync_blockdev would flush
+	// at journal-sync time (its bitmap buffers sit dirty in the buffer
+	// cache); the bridge keeps the bitmaps in memory, so write the changed
+	// pool blocks here, before the single device Sync below.  Without this
+	// a crash left stale on-disk bitmaps (superblock free counts refreshed
+	// from the in-memory allocators, pool blocks not) and only replay could
+	// reconcile them -- the old code masked this by full-checkpointing
+	// every op, whose SyncAllocators wrote the pools as a side effect.
+	if j.allocSyncer != nil {
+		if err := j.allocSyncer.SyncAllocators(); err != nil {
+			return fmt.Errorf("briefs: sync allocators: %w", err)
+		}
+	}
+
 	// Metadata flush (= sync_blockdev): the FUSE bridge has no buffer cache,
 	// so the handler's metadata WriteAt calls are already in the page cache;
 	// a single fdatasync flushes both them and the journal block above.
@@ -314,14 +356,14 @@ func (j *Journal) syncLocked(checkpoint bool) error {
 
 	// Periodic checkpoint (journal.c:2189).
 	if checkpoint && j.recordsSinceCheckpoint >= JrnCheckpointInterval {
-		if err := j.checkpointLocked(); err != nil {
+		if err := j.checkpointLocked(true); err != nil {
 			return fmt.Errorf("briefs: periodic checkpoint: %w", err)
 		}
 	}
 	// Back-pressure after advance (journal.c:2202).
 	if !j.inCheckpoint && j.nextBlock(j.writePos) == j.sb.JournalLogStart {
 		j.inCheckpoint = true
-		err := j.checkpointLocked()
+		err := j.checkpointLocked(true)
 		j.inCheckpoint = false
 		if err != nil {
 			return fmt.Errorf("briefs: back-pressure checkpoint: %w", err)
@@ -340,7 +382,7 @@ func (j *Journal) Checkpoint() error {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return j.checkpointLocked()
+	return j.checkpointLocked(true)
 }
 
 // WriteCheckpointBlock builds a checkpoint journal block in buf: a 16-byte
@@ -381,9 +423,18 @@ func WriteCheckpointBlock(buf []byte, blockSeq uint32, cp *Checkpoint) error {
 	return nil
 }
 
-func (j *Journal) checkpointLocked() error {
+// checkpointLocked retires the live region [logStart, logEnd) by flushing
+// metadata, persisting allocator bitmaps, writing a checkpoint block, and
+// setting logStart = logEnd = writePos.  flushPending selects whether
+// records still sitting in curBlock are committed first (journal.c:374).
+// The sync-time back-pressure caller passes false: when the ring is FULL,
+// writePos == logStart is the oldest LIVE block, and an inner sync there
+// would overwrite records whose metadata this checkpoint has not flushed
+// yet -- retire first, and let the caller's outer syncLocked write the
+// pending block into the now-retired position afterwards.
+func (j *Journal) checkpointLocked(flushPending bool) error {
 	// Flush any pending records first (journal.c:374).
-	if j.dirty {
+	if flushPending && j.dirty {
 		if err := j.syncLocked(true); err != nil {
 			return err
 		}
@@ -434,8 +485,14 @@ func (j *Journal) checkpointLocked() error {
 	j.sb.CheckpointSeq = j.checkpointSeq
 	j.sb.JournalLogStart = j.writePos
 	j.sb.JournalLogEnd = j.writePos
-	j.dirty = false
+	// Do NOT clear j.dirty here: with flushPending=false the pending block
+	// is still unwritten (the sync-time back-pressure retires first, then
+	// the caller's outer syncLocked writes it into the retired position);
+	// clearing dirty would drop those records.  Every flushPending=true
+	// path already cleared it via the inner syncLocked (which wrote the
+	// pending block before we got here).
 	j.recordsSinceCheckpoint = 0
+	j.blocksSinceCheckpoint = 0
 
 	// Persist the updated superblock (free counts + new log boundaries).
 	if err := j.file.Sync(); err != nil {
