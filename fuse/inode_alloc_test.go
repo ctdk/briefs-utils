@@ -51,12 +51,18 @@ func openBridge(t *testing.T, imgPath string) *BrieFS {
 		inodeAlloc:      inodeAlloc,
 		blockSize:       blockSize,
 		dataRegionStart: sb.TrieNodePoolStart + sb.TrieNodePoolSize,
+		dirtyBlocks:     make(map[uint64][]byte),
 	}
+	// Wire the same hooks Mount wires, so tests exercise the production
+	// deferral paths: deferred metadata is visible through the dirty view
+	// and drained by the journal sync after the commit point.
+	dev.SetDirtyView(bfs.dirtyView)
 	j, err := briefs.NewJournal(sb, dev.File(), blockSize)
 	if err != nil {
 		t.Fatalf("NewJournal: %v", err)
 	}
 	j.SetAllocatorSyncer(bfs)
+	j.SetMetaSyncer(bfs)
 	bfs.journal = j
 	return bfs
 }
@@ -114,8 +120,8 @@ func TestInodeAllocFree(t *testing.T) {
 	if got := bfs.inodeAlloc.FreeCount(); got != freeBefore-2 {
 		t.Fatalf("free count after 2 allocs: want %d, got %d", freeBefore-2, got)
 	}
-	if err := bfs.flushCache(); err != nil {
-		t.Fatalf("flushCache: %v", err)
+	if err := bfs.flushCacheToDevice(); err != nil {
+		t.Fatalf("flushCacheToDevice: %v", err)
 	}
 
 	// The on-disk inode must round-trip with the magic and mode we set.
@@ -141,8 +147,8 @@ func TestInodeAllocFree(t *testing.T) {
 	if got := bfs.inodeAlloc.FreeCount(); got != freeBefore {
 		t.Fatalf("free count after frees: want %d, got %d", freeBefore, got)
 	}
-	if err := bfs.flushCache(); err != nil {
-		t.Fatalf("flushCache: %v", err)
+	if err := bfs.flushCacheToDevice(); err != nil {
+		t.Fatalf("flushCacheToDevice: %v", err)
 	}
 	// A freed inode must read back with magic 0 (zeroInodeCached).
 	rt2, err := bfs.inodes.ReadInode(in1.InodeNumber)

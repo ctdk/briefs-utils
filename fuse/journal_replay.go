@@ -110,7 +110,7 @@ func (b *BrieFS) replayJournal() error {
 
 	// Flush all replay-dirty metadata (trie pages, inode/symlink/xattr blocks)
 	// before pass 3 reads the re-derived tries back from disk.
-	if err := b.flushCache(); err != nil {
+	if err := b.flushCacheToDevice(); err != nil {
 		return fmt.Errorf("briefs: replay flush: %w", err)
 	}
 

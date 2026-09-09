@@ -164,10 +164,11 @@ func (b *BrieFS) triePageInit(depth, byteVal, nodeType uint8) (uint64, error) {
 		b.dataAlloc.FreeBlock(rel)
 		return 0, err
 	}
-	// The page is held in the operation's block cache; flushCache (called by
-	// the handler before journal.Sync) writes it durably before any journal
-	// record that traverses into it can be committed — the kernel's
-	// sync_dirty_buffer in briefs_trie_page_init, batched (generic/065).
+	// The page is held in the operation's block cache and reaches the device
+	// through the deferred-metadata drain at the next journal sync — always
+	// after the commit point, so the JRN_TRIE_ALLOC record reserving the
+	// block is durable before the page content (the kernel pins the buffer
+	// in briefs_trie_page_init; generic/065).
 	b.addPartial(block)
 	return briefs.TrieMakeRef(block, 0), nil
 }
@@ -298,19 +299,19 @@ func (b *BrieFS) trieFreeNode(ref uint64) error {
 		return b.saveBlock(block, buf)
 	}
 
-	// Page is empty: the empty page is held in the cache (flushCache writes it
-	// before the journal commits the JRN_TRIE_FREE below), then return the
-	// block to the allocator.
-	putPage(buf, pg)
-	if err := b.saveBlock(block, buf); err != nil {
-		return err
-	}
+	// Page is empty: the page's content is dead — the parent no longer
+	// references the block, and replay re-derives the trie from the dir
+	// records without it.  Drop it from the op cache (a saveBlock here would
+	// re-enter the deferred map, and a later drain would clobber whatever the
+	// block's next owner writes), journal the free, and defer returning the
+	// block to the allocator until that record commits.
+	b.cacheDrop(block)
 	b.removePartial(block)
 	if err := b.journal.WriteRecord(briefs.JRN_TRIE_ALLOC,
 		(&briefs.JrnTrieAlloc{Block: block, Op: 1}).Marshal()); err != nil {
 		return err
 	}
-	b.dataAlloc.FreeBlock(block - b.dataRegionStart)
+	b.deferBlockFree(block)
 	return nil
 }
 

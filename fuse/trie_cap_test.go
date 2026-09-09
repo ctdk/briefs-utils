@@ -44,8 +44,8 @@ func TestTrieIteratorDeepNames(t *testing.T) {
 		b.cacheAbort()
 		t.Fatalf("journal sync: %v", err)
 	}
-	if err := b.flushCache(); err != nil {
-		t.Fatalf("flushCache: %v", err)
+	if err := b.flushCacheToDevice(); err != nil {
+		t.Fatalf("flushCacheToDevice: %v", err)
 	}
 
 	iter := NewTrieIterator(b.dev, di.DirTrieRoot)
@@ -93,6 +93,13 @@ func TestTrieSiblingChainCap(t *testing.T) {
 
 	// Corrupt: the 'a' interm node's first child is the "aa" leaf; point
 	// its next_sibling at itself so the level-1 sibling chain loops.
+	// The corruption is written directly to the device, so first push the
+	// daemon's deferred metadata down (fix B keeps the just-created trie
+	// pages in daemon memory between journal syncs; the dirty-view hook
+	// would serve those copies and shadow the on-disk corruption).
+	if err := b.flushDirtyMeta(); err != nil {
+		t.Fatalf("flush deferred metadata: %v", err)
+	}
 	di, err := b.inodes.ReadInode(d.InodeNumber)
 	if err != nil {
 		t.Fatalf("read dir inode: %v", err)

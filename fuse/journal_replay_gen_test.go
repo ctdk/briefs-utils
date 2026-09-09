@@ -19,8 +19,8 @@ func armInodeSlot(t *testing.T, b *BrieFS, in *briefs.Inode) {
 	if err := b.writeInodeCached(in); err != nil {
 		t.Fatalf("writeInodeCached(%d): %v", in.InodeNumber, err)
 	}
-	if err := b.flushCache(); err != nil {
-		t.Fatalf("flushCache: %v", err)
+	if err := b.flushCacheToDevice(); err != nil {
+		t.Fatalf("flushCacheToDevice: %v", err)
 	}
 }
 
@@ -53,8 +53,8 @@ func TestReplayInodeFullGenerationGuard(t *testing.T) {
 	if err := b.replayInodeFull(2, briefs.MarshalJrnInodeFull(2, raw)); err != nil {
 		t.Fatalf("replayInodeFull(matching): %v", err)
 	}
-	if err := b.flushCache(); err != nil {
-		t.Fatalf("flushCache: %v", err)
+	if err := b.flushCacheToDevice(); err != nil {
+		t.Fatalf("flushCacheToDevice: %v", err)
 	}
 	di, err := b.inodes.ReadInode(2)
 	if err != nil || di == nil {
@@ -73,8 +73,8 @@ func TestReplayInodeFullGenerationGuard(t *testing.T) {
 	if err := b.replayInodeFull(2, briefs.MarshalJrnInodeFull(2, rawStale)); err != nil {
 		t.Fatalf("replayInodeFull(stale): %v", err)
 	}
-	if err := b.flushCache(); err != nil {
-		t.Fatalf("flushCache: %v", err)
+	if err := b.flushCacheToDevice(); err != nil {
+		t.Fatalf("flushCacheToDevice: %v", err)
 	}
 	di, _ = b.inodes.ReadInode(2)
 	if di == nil || di.FileSize != 222 || di.Generation != 7 {
@@ -87,16 +87,16 @@ func TestReplayInodeFullGenerationGuard(t *testing.T) {
 	if err := b.zeroInodeCached(2); err != nil {
 		t.Fatalf("zeroInodeCached: %v", err)
 	}
-	if err := b.flushCache(); err != nil {
-		t.Fatalf("flushCache: %v", err)
+	if err := b.flushCacheToDevice(); err != nil {
+		t.Fatalf("flushCacheToDevice: %v", err)
 	}
 	rawSnap, _ := snap.MarshalBinary() // generation 7 == the slot's old gen
 	b.cacheBegin()
 	if err := b.replayInodeFull(2, briefs.MarshalJrnInodeFull(2, rawSnap)); err != nil {
 		t.Fatalf("replayInodeFull(freed slot): %v", err)
 	}
-	if err := b.flushCache(); err != nil {
-		t.Fatalf("flushCache: %v", err)
+	if err := b.flushCacheToDevice(); err != nil {
+		t.Fatalf("flushCacheToDevice: %v", err)
 	}
 	di, _ = b.inodes.ReadInode(2)
 	if di != nil && di.Magic == briefs.MagicInode {
@@ -129,8 +129,8 @@ func TestReplayInodeUpdateGenerationGuard(t *testing.T) {
 	if err := b.replayInodeUpdate(ok, true); err != nil {
 		t.Fatalf("replayInodeUpdate(matching): %v", err)
 	}
-	if err := b.flushCache(); err != nil {
-		t.Fatalf("flushCache: %v", err)
+	if err := b.flushCacheToDevice(); err != nil {
+		t.Fatalf("flushCacheToDevice: %v", err)
 	}
 	di, _ := b.inodes.ReadInode(2)
 	if di == nil || di.FileSize != 222 {
@@ -143,8 +143,8 @@ func TestReplayInodeUpdateGenerationGuard(t *testing.T) {
 	if err := b.replayInodeUpdate(stale, true); err != nil {
 		t.Fatalf("replayInodeUpdate(stale): %v", err)
 	}
-	if err := b.flushCache(); err != nil {
-		t.Fatalf("flushCache: %v", err)
+	if err := b.flushCacheToDevice(); err != nil {
+		t.Fatalf("flushCacheToDevice: %v", err)
 	}
 	di, _ = b.inodes.ReadInode(2)
 	if di == nil || di.FileSize != 222 {
@@ -157,8 +157,8 @@ func TestReplayInodeUpdateGenerationGuard(t *testing.T) {
 	if err := b.replayInodeUpdate(legacy, false); err != nil {
 		t.Fatalf("replayInodeUpdate(legacy): %v", err)
 	}
-	if err := b.flushCache(); err != nil {
-		t.Fatalf("flushCache: %v", err)
+	if err := b.flushCacheToDevice(); err != nil {
+		t.Fatalf("flushCacheToDevice: %v", err)
 	}
 	di, _ = b.inodes.ReadInode(2)
 	if di == nil || di.FileSize != 444 || di.Nlinks != 2 {

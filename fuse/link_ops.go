@@ -104,13 +104,9 @@ func (b *BrieFS) linkInDir(parentIno uint64, name string, targetIno uint64) (*br
 		b.cacheAbort()
 		return nil, err
 	}
-	if err := b.journal.Sync(false); err != nil {
-		b.cacheAbort()
-		return nil, err
-	}
-	if err := b.flushCache(); err != nil {
-		return nil, err
-	}
+	// Op end (fix B): records are in the ring; the metadata blocks move to
+	// the deferred map, durable at the next journal sync.
+	b.mergeCache()
 	return target, nil
 }
 
@@ -143,10 +139,12 @@ func (b *BrieFS) readSymlink(ino uint64) (string, error) {
 // freeInodeData frees every data block and btree node an inode owns and journals
 // JRN_EXTENT_FREE for each, mirroring briefs_btree_free_all (extent.c). Inline-
 // data inodes own no blocks. Used when an inode reaches nlink 0 (unlink, rename
-// over a target). The caller must hold the inode's shard lock (so the on-disk
-// btree is stable during the walk) and journal the dir-entry removal BEFORE the
-// frees, so a partial commit cannot free blocks the on-disk inode still
-// references.
+// over a target). The frees are deferred until the records commit
+// (deferBlockFree): the block must not be reusable while the last committed
+// on-disk state still references it. The caller must hold the inode's shard
+// lock (so the on-disk btree is stable during the walk) and journal the
+// dir-entry removal BEFORE the frees, so a partial commit cannot free blocks
+// the on-disk inode still references.
 func (b *BrieFS) freeInodeData(in *briefs.Inode) error {
 	if in.Flags&briefs.InodeFlagInlineData != 0 {
 		return nil
@@ -161,14 +159,14 @@ func (b *BrieFS) freeInodeData(in *briefs.Inode) error {
 		}
 		for k := uint64(0); k < ext.Len; k++ {
 			abs := ext.Phys + k
-			b.dataAlloc.FreeBlock(abs - b.dataRegionStart)
+			b.deferBlockFree(abs)
 			if err := b.journalExtentFree(in.InodeNumber, abs); err != nil {
 				return err
 			}
 		}
 	}
 	for _, blk := range nodes {
-		b.dataAlloc.FreeBlock(blk - b.dataRegionStart)
+		b.deferBlockFree(blk)
 		if err := b.journalExtentFree(in.InodeNumber, blk); err != nil {
 			return err
 		}
@@ -413,13 +411,9 @@ func (b *BrieFS) renamePlain(oldParentIno uint64, oldName string, newParentIno u
 		return err
 	}
 
-	if err := b.journal.Sync(false); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.flushCache(); err != nil {
-		return err
-	}
+	// Op end (fix B): records are in the ring; the metadata blocks move to
+	// the deferred map, durable at the next journal sync.
+	b.mergeCache()
 	return nil
 }
 
@@ -559,13 +553,9 @@ func (b *BrieFS) renameExchange(oldParentIno uint64, oldName string, newParentIn
 		}
 	}
 
-	if err := b.journal.Sync(false); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.flushCache(); err != nil {
-		return err
-	}
+	// Op end (fix B): records are in the ring; the metadata blocks move to
+	// the deferred map, durable at the next journal sync.
+	b.mergeCache()
 	return nil
 }
 
@@ -711,12 +701,8 @@ func (b *BrieFS) renameWhiteout(oldParentIno uint64, oldName string, newParentIn
 		return err
 	}
 
-	if err := b.journal.Sync(false); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.flushCache(); err != nil {
-		return err
-	}
+	// Op end (fix B): records are in the ring; the metadata blocks move to
+	// the deferred map, durable at the next journal sync.
+	b.mergeCache()
 	return nil
 }

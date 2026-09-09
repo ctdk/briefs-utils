@@ -287,9 +287,10 @@ func (b *BrieFS) commitXattrOp(in *briefs.Inode, absBlocks []uint64, bufs [][]by
 			b.failWrite()
 			return err
 		}
-		// The new head is committed; free the old blocks in memory.
+		// The new head is committed; free the old blocks in memory
+		// (freeBlockNow also drops any stale deferred copy of them).
 		for _, blk := range oldBlocks {
-			b.dataAlloc.FreeBlock(blk - b.dataRegionStart)
+			b.freeBlockNow(blk)
 		}
 	} else {
 		if err := b.journal.Sync(false); err != nil {

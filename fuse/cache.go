@@ -1,4 +1,4 @@
-// Package fuse: per-operation block cache.
+// Package fuse: per-operation block cache + deferred-metadata write-back.
 //
 // The kernel metadata paths use buffer_heads: sb_bread/sb_getblk return the
 // SAME buffer for a given block within an operation, so a trie insert that
@@ -9,14 +9,24 @@
 // one operation land on the same packed trie page (parent and last sibling
 // frequently share a block).
 //
-// cacheBegin/loadBlock/saveBlock/flushCache provide the equivalent: a
-// short-lived per-operation map of block -> working buffer.  loadBlock returns
-// the cached buffer (loading from disk on first touch); saveBlock marks it
-// dirty.  flushCache writes every dirty block and fdatasyncs once, so all
-// metadata for an operation lands on disk together after the journal commits
-// the records that reference it (commit-before-flush; replay re-derives any
-// metadata that did not reach disk — see the durability-ordering comment in
-// dir_ops.go).
+// cacheBegin/loadBlock/saveBlock provide that per-operation equivalence: a
+// short-lived map of block -> working buffer.  loadBlock returns the cached
+// buffer (loading from disk on first touch); saveBlock marks it dirty.
+//
+// Between ops, mutated blocks live in the deferred-metadata map
+// (BrieFS.dirtyBlocks): the analog of the kernel's pinned, not-yet-dirty
+// buffer heads.  A successful op ends with mergeCache, which moves the op's
+// dirty blocks into that map with NO I/O — the journal is not synced per op
+// (kernel parity: the kernel only syncs on fsync/sync_fs/DIRSYNC; dir.c:25
+// rejects per-create syncs as far too slow).  The map is drained by the
+// journal's sync path via the MetaSyncer hook, AFTER the commit point is
+// persisted (kernel parity: briefs_journal_flush_owned after the log_end
+// persist), so the records justifying a block are always durable before the
+// block reaches the device page cache.  Between the merge and the drain,
+// readers see the deferred content through BlockDevice's dirty-view hook, so
+// lookups/readdirs/stats stay coherent.  Under the FUSE crash model (kill -9:
+// process memory is lost, the OS page cache survives) an unsynced op simply
+// never happened — the same semantics a buffered op has against the kernel.
 
 package fuse
 
@@ -60,11 +70,12 @@ func (b *BrieFS) saveBlock(block uint64, buf []byte) error {
 	return nil
 }
 
-// flushCache writes every dirty cached block to the device and fdatasyncs
-// once, then drops the cache.  Ops call it AFTER journal.Sync (commit-
-// before-flush): the committed records let replay re-derive any metadata that
-// a mid-op crash kept from reaching the page cache.
-func (b *BrieFS) flushCache() error {
+// flushCacheToDevice writes every dirty cached block to the device and
+// fdatasyncs once, then drops the op cache.  This is the write-through
+// variant used where the blocks must reach the disk immediately: journal
+// replay at mount (before any deferral exists).  Mutating ops use
+// mergeCache instead.
+func (b *BrieFS) flushCacheToDevice() error {
 	for block, buf := range b.cache {
 		if !b.cacheDirty[block] {
 			continue
@@ -83,6 +94,161 @@ func (b *BrieFS) flushCache() error {
 	b.cache = nil
 	b.cacheDirty = nil
 	return nil
+}
+
+// mergeCache moves the operation's dirty blocks into the deferred-metadata
+// map (whole-block, last-writer-wins) and drops the op cache.  No I/O: the
+// blocks are written to the device by the next journal sync, after the
+// commit point (MetaSyncer hook in the journal), and until then reads see
+// them through the dirty view.  This is the op-end step that replaces the
+// old per-op journal.Sync + flushCache (fix B: kernel parity for sync
+// frequency).
+func (b *BrieFS) mergeCache() {
+	for block, buf := range b.cache {
+		if !b.cacheDirty[block] {
+			continue
+		}
+		b.setDirtyBlock(block, buf)
+	}
+	b.cache = nil
+	b.cacheDirty = nil
+}
+
+// --- deferred-metadata map (the bridge's write-back cache) ---
+
+// setDirtyBlock stores a block's content in the deferred-metadata map.  The
+// caller must hold the block's inode-table shard lock (or b.mu for
+// dir-op/trie blocks): dir ops hold every touched inode block's shard lock
+// until the op returns, and write paths hold their file's shard lock, so a
+// whole-block store can never interleave with another writer's read-modify-
+// write of the same block.
+func (b *BrieFS) setDirtyBlock(block uint64, buf []byte) {
+	b.dirtyMu.Lock()
+	if b.dirtyBlocks == nil {
+		// Mount initializes the map; test harnesses that construct BrieFS
+		// directly may skip that.  Lazy init keeps them working.
+		b.dirtyBlocks = make(map[uint64][]byte)
+	}
+	b.dirtyBlocks[block] = buf
+	b.dirtyMu.Unlock()
+}
+
+// dirtyView serves deferred blocks to BlockDevice.ReadBlock.  Returns a
+// private copy: callers mutate the buffers they get (loadBlock's in-place
+// edit pattern), and the stored slice must stay pristine so every reader
+// sees a whole-block atomic snapshot.
+func (b *BrieFS) dirtyView(block uint64) ([]byte, bool) {
+	b.dirtyMu.Lock()
+	buf, ok := b.dirtyBlocks[block]
+	b.dirtyMu.Unlock()
+	if !ok {
+		return nil, false
+	}
+	out := make([]byte, len(buf))
+	copy(out, buf)
+	return out, true
+}
+
+// deferBlockFree returns a data block to the allocator only once its freeing
+// record commits: the rel is queued in pendingFrees (applied by SyncMeta at
+// journal-sync time, after the commit point), and any deferred content for
+// the block is dropped — an emptied trie page or a dropped btree node is dead
+// (the records re-derive the structure without it), and a stale deferred copy
+// would shadow reads of — and a later drain clobber — whatever the block's
+// next owner writes into it.  Freeing at op time instead, before the record
+// commits, let the block be reallocated for data whose fresh content the drain
+// then overwrote (the generic/040/041 free-vs-commit class, seen in
+// TestCrashSlotReuseReplay: a reused trie page clobbered the new file's data).
+func (b *BrieFS) deferBlockFree(abs uint64) {
+	rel := abs - b.dataRegionStart
+	b.dirtyMu.Lock()
+	b.pendingFrees = append(b.pendingFrees, rel)
+	delete(b.dirtyBlocks, abs)
+	b.dirtyMu.Unlock()
+}
+
+// freeBlockNow returns a data block to the in-memory allocator immediately,
+// for the paths that free right after their own journal sync committed the
+// freeing records (commitExtentChange, the xattr chain rewrite).  The
+// deferred-content clearing deferBlockFree does applies here too: a freed
+// btree node's stale deferred copy must not shadow or clobber the block's
+// next owner.
+func (b *BrieFS) freeBlockNow(abs uint64) {
+	b.dirtyMu.Lock()
+	delete(b.dirtyBlocks, abs)
+	b.dirtyMu.Unlock()
+	b.dataAlloc.FreeBlock(abs - b.dataRegionStart)
+}
+
+// SyncMeta drains the deferred-metadata map to the device page cache (no
+// fdatasync — the enclosing journal sync flushes) and applies the block
+// frees deferred since the last commit.  Implements briefs.MetaSyncer; the
+// journal calls it only after the commit point is persisted, so both the
+// records justifying these blocks and the frees' JRN_EXTENT_FREE /
+// JRN_TRIE_ALLOC records are durable.  Kernel parity: briefs_journal_flush_
+// owned — the kernel holds freed metadata buffers owned by the journal until
+// the transaction commits.  The enclosing sync then persists the allocator
+// bitmaps (SyncAllocators runs after this), so a completed sync leaves the
+// on-disk bitmap converged with the committed records.
+func (b *BrieFS) SyncMeta() error {
+	b.dirtyMu.Lock()
+	frees := b.pendingFrees
+	b.pendingFrees = nil
+	if len(b.dirtyBlocks) == 0 {
+		b.dirtyMu.Unlock()
+		for _, rel := range frees {
+			b.dataAlloc.FreeBlock(rel)
+		}
+		return nil
+	}
+	snap := b.dirtyBlocks
+	b.dirtyBlocks = make(map[uint64][]byte)
+	b.dirtyMu.Unlock()
+	for _, rel := range frees {
+		b.dataAlloc.FreeBlock(rel)
+	}
+	for block, buf := range snap {
+		if err := b.dev.WriteBlock(block, buf); err != nil {
+			// Restore this block and every unwritten one (the failed
+			// block is still in snap; written ones were deleted) so a
+			// later sync retries them.
+			b.dirtyMu.Lock()
+			for blk2, buf2 := range snap {
+				b.dirtyBlocks[blk2] = buf2
+			}
+			b.dirtyMu.Unlock()
+			return fmt.Errorf("briefs: drain deferred block %d: %w", block, err)
+		}
+		delete(snap, block)
+	}
+	return nil
+}
+
+// flushDirtyMeta drains the deferred-metadata map and fdatasyncs.  Used by
+// the sync entry points that can run with a clean journal (the records were
+// committed by an earlier sync but this deferred content merged after it):
+// Fsync must make the deferred blocks durable even when journal.Sync is a
+// no-op, and unmount must never leave blocks unsaved in daemon memory.
+func (b *BrieFS) flushDirtyMeta() error {
+	b.dirtyMu.Lock()
+	pending := len(b.dirtyBlocks) > 0
+	b.dirtyMu.Unlock()
+	if !pending {
+		return nil
+	}
+	if err := b.SyncMeta(); err != nil {
+		return err
+	}
+	return b.dev.Fdatasync()
+}
+
+// cacheDrop removes a block from the op cache without writing it, for paths
+// that free a metadata block mid-op (an emptied trie page): the block's
+// content is dead and must not survive into the deferred map, where it would
+// shadow reads and be drained over the block's next owner.
+func (b *BrieFS) cacheDrop(block uint64) {
+	delete(b.cache, block)
+	delete(b.cacheDirty, block)
 }
 
 // cacheAbort drops the cache without writing (for error rollback paths).
@@ -175,17 +341,20 @@ func (b *BrieFS) zeroInodeCached(ino uint64) error {
 // (journal-owned bh lifetimes), so a committed snapshot record implies its
 // slot — carrying the new generation — is already on disk.  Replay's
 // generation guard (kernel 33e4019, generic/536) relies on that invariant;
-// without the write-through, a mid-op crash (records committed, flushCache
-// not yet run) would make the guard skip restoring the fresh inode.  Under
-// the FUSE crash model (kill -9; the page cache survives) a plain WriteBlock
-// is as durable as the journal block itself.
+// without the write-through, a mid-op crash (records committed by another
+// op's sync, the slot never written) would make the guard skip restoring the
+// fresh inode.  Under the FUSE crash model (kill -9; the page cache
+// survives) a plain WriteBlock is as durable as the journal block itself.
 //
-// Only the fresh inode's slot is patched in: the block is read straight from
-// the device, not from the per-op cache, because the cache may hold mid-op
-// mutations of OTHER inodes sharing this block (e.g. a rename target
-// mid-removal) that must not reach the page cache before the journal
-// commits the records justifying them.  The op cache is untouched; flushCache
-// writes the full block (fresh slot + everything else) after the commit.
+// Only the fresh inode's slot is patched in: the block is read through the
+// dirty view (NOT from the per-op cache, which may hold mid-op mutations of
+// OTHER inodes sharing this block — e.g. a rename target mid-removal — that
+// must not reach the page cache before the journal commits the records
+// justifying them).  The patched block is written to the page cache AND
+// upserted into the deferred-metadata map, so a later drain can never
+// regress the page cache to a version without the fresh slot; the op cache
+// is untouched, and the op's merge (which includes the fresh slot via
+// writeInodeCached) supersedes the map entry at op end.
 func (b *BrieFS) writeThroughFreshInodeSlot(in *briefs.Inode) error {
 	blk, off := b.inodes.inodeLocation(in.InodeNumber)
 	buf, err := b.dev.ReadBlock(blk)
@@ -197,5 +366,9 @@ func (b *BrieFS) writeThroughFreshInodeSlot(in *briefs.Inode) error {
 		return err
 	}
 	copy(buf[off:], data)
-	return b.dev.WriteBlock(blk, buf)
+	if err := b.dev.WriteBlock(blk, buf); err != nil {
+		return err
+	}
+	b.setDirtyBlock(blk, buf)
+	return nil
 }

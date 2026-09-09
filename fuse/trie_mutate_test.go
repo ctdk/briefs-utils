@@ -66,8 +66,8 @@ func TestTrieInsertLookupRemove(t *testing.T) {
 	if err := b.writeInodeCached(root); err != nil {
 		t.Fatalf("writeInode root: %v", err)
 	}
-	if err := b.flushCache(); err != nil {
-		t.Fatalf("flushCache: %v", err)
+	if err := b.flushCacheToDevice(); err != nil {
+		t.Fatalf("flushCacheToDevice: %v", err)
 	}
 
 	// Every inserted name must look up to its allocated inode.
@@ -103,8 +103,8 @@ func TestTrieInsertLookupRemove(t *testing.T) {
 		t.Errorf("re-insert file: want EEXIST, got %v", err)
 	}
 	_ = b.FreeInode(dup.InodeNumber)
-	if err := b.flushCache(); err != nil {
-		t.Fatalf("flushCache: %v", err)
+	if err := b.flushCacheToDevice(); err != nil {
+		t.Fatalf("flushCacheToDevice: %v", err)
 	}
 
 	// Remove half the entries (and free their inodes so fsck stays clean),
@@ -122,8 +122,8 @@ func TestTrieInsertLookupRemove(t *testing.T) {
 	if err := b.writeInodeCached(root); err != nil {
 		t.Fatalf("writeInode root after remove: %v", err)
 	}
-	if err := b.flushCache(); err != nil {
-		t.Fatalf("flushCache: %v", err)
+	if err := b.flushCacheToDevice(); err != nil {
+		t.Fatalf("flushCacheToDevice: %v", err)
 	}
 	for _, name := range remove {
 		if _, _, err := TrieLookup(b.dev, root.DirTrieRoot, name); err == nil {

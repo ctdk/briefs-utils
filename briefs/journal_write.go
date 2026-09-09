@@ -91,6 +91,7 @@ type Journal struct {
 	inReplay bool
 
 	allocSyncer AllocatorSyncer
+	metaSyncer  MetaSyncer
 }
 
 // NewJournal initializes a Journal from an already-loaded superblock and an
@@ -127,6 +128,20 @@ func NewJournal(sb *SuperblockLayout, file *os.File, blockSize uint64) (*Journal
 // SetAllocatorSyncer wires the allocator interface after construction (the
 // FUSE bridge builds the Journal and allocators separately during Mount).
 func (j *Journal) SetAllocatorSyncer(s AllocatorSyncer) { j.allocSyncer = s }
+
+// MetaSyncer drains deferred metadata blocks at commit time.  The FUSE bridge
+// keeps metadata blocks in daemon memory between ops (the analog of the
+// kernel's pinned, not-yet-dirty buffer heads); the journal calls SyncMeta
+// after persisting the commit point so the blocks reach the device page cache
+// only after the records that justify them are durable (kernel parity:
+// briefs_journal_flush_owned after the log_end persist).  Writes only -- the
+// enclosing sync's device sync flushes them.
+type MetaSyncer interface {
+	SyncMeta() error
+}
+
+// SetMetaSyncer wires the deferred-metadata drain after construction.
+func (j *Journal) SetMetaSyncer(s MetaSyncer) { j.metaSyncer = s }
 
 func (j *Journal) validate() error {
 	if j.journalEnd <= j.journalStart {
@@ -332,14 +347,32 @@ func (j *Journal) syncLocked(checkpoint bool) error {
 		return fmt.Errorf("briefs: persist journal tail: %w", err)
 	}
 
+	// Deferred metadata: the bridge holds metadata blocks in daemon memory
+	// between ops (no per-op flush -- kernel parity, where metadata buffers
+	// stay pinned and not-yet-dirty until the journal sync).  The commit
+	// point is persisted above, so the records justifying these blocks are
+	// durable; write them to the device page cache now (kernel parity:
+	// briefs_journal_flush_owned after the commit).  Writes only -- the
+	// single device Sync below flushes them.  SyncMeta also applies the
+	// block frees deferred at op time, so it must run BEFORE the allocator
+	// persist below: the bitmap must not call a block free while the drain
+	// has yet to remove its old references from the on-disk structure
+	// (generic/040/041 family).
+	if j.metaSyncer != nil {
+		if err := j.metaSyncer.SyncMeta(); err != nil {
+			return fmt.Errorf("briefs: sync deferred metadata: %w", err)
+		}
+	}
+
 	// Allocator bitmaps are metadata the kernel's sync_blockdev would flush
 	// at journal-sync time (its bitmap buffers sit dirty in the buffer
 	// cache); the bridge keeps the bitmaps in memory, so write the changed
-	// pool blocks here, before the single device Sync below.  Without this
-	// a crash left stale on-disk bitmaps (superblock free counts refreshed
-	// from the in-memory allocators, pool blocks not) and only replay could
-	// reconcile them -- the old code masked this by full-checkpointing
-	// every op, whose SyncAllocators wrote the pools as a side effect.
+	// pool blocks here, after the deferred-metadata drain and before the
+	// single device Sync below.  Without this a crash left stale on-disk
+	// bitmaps (superblock free counts refreshed from the in-memory
+	// allocators, pool blocks not) and only replay could reconcile them --
+	// the old code masked this by full-checkpointing every op, whose
+	// SyncAllocators wrote the pools as a side effect.
 	if j.allocSyncer != nil {
 		if err := j.allocSyncer.SyncAllocators(); err != nil {
 			return fmt.Errorf("briefs: sync allocators: %w", err)

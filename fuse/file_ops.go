@@ -40,9 +40,10 @@
 //     before the flush leaves the old on-disk inode, which replay repairs.
 //
 // Inline-data writes keep their data in the inode block itself, which the
-// JRN_INODE_FULL snapshot carries, so they use the simpler commit-before-flush
-// order (journal.Sync then flushCache) — the inode block is snapshot-trusted,
-// nothing else needs draining.
+// JRN_INODE_FULL snapshot carries: the write journals the snapshot and defers
+// the inode block (writeInodeOwned, cache.go) — no sync, like the kernel's
+// buffered-write path.  The snapshot record makes the block re-derivable on
+// replay, so the deferred write needs no drain.
 
 package fuse
 
@@ -229,22 +230,15 @@ func (b *BrieFS) writeFileData(ino uint64, data []byte, off int64) (int, error) 
 	if in.Flags&briefs.InodeFlagInlineData != 0 || (oldSize == 0 && in.NumExtentsTotal == 0) {
 		if totalSize <= inlineDataMax {
 			b.writeInlineData(in, data, off, totalSize)
-			// Inline data lives in the snapshot-trusted inode block: commit, then
-			// write the inode block directly (replay overwrites it if a crash
-			// preempts the write).
+			// Inline data lives in the snapshot-trusted inode block.  Fix B:
+			// journal the snapshot and defer the block (writeInodeOwned) —
+			// the kernel does not sync per buffered write; the block is
+			// durable at the next journal sync after the commit point.
 			if err := b.journalInodeFull(in); err != nil {
 				b.failWrite()
 				return 0, err
 			}
-			if err := b.journal.Sync(false); err != nil {
-				b.failWrite()
-				return 0, err
-			}
-			if err := b.writeInodeDirect(in); err != nil {
-				b.failWrite()
-				return 0, err
-			}
-			if err := b.dev.Fdatasync(); err != nil {
+			if err := b.writeInodeOwned(in); err != nil {
 				b.failWrite()
 				return 0, err
 			}
@@ -512,11 +506,15 @@ func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels, freedAbs, o
 		b.failWrite()
 		return err
 	}
+	// The freeing records are committed by the Sync above, so the frees can
+	// apply now; freeBlockNow also drops any deferred copy a concurrent op
+	// may have merged for these blocks (a freed node must not shadow or
+	// clobber its next owner).
 	for _, abs := range freedAbs {
-		b.dataAlloc.FreeBlock(abs - b.dataRegionStart)
+		b.freeBlockNow(abs)
 	}
 	for _, abs := range oldNodesAbs {
-		b.dataAlloc.FreeBlock(abs - b.dataRegionStart)
+		b.freeBlockNow(abs)
 	}
 	if err := b.writeInodeDirect(in); err != nil {
 		b.failWrite()
@@ -532,8 +530,10 @@ func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels, freedAbs, o
 // writeInodeDirect reads the inode-table block, patches the inode's slot with
 // the marshaled inode, and writes the whole 4K block back atomically. The
 // caller must hold the inode's inodeBlockLock so no other op touches the same
-// block concurrently. Used by the file-write path, which bypasses the per-op
-// cache so writes to files in different inode blocks run concurrently.
+// block concurrently. Used by the file-write paths that commit the journal
+// first (free-gating syncs / commitExtentChange): the block is written to the
+// device page cache AND upserted into the deferred-metadata map so a later
+// drain can never regress the page cache to a version without this patch.
 func (b *BrieFS) writeInodeDirect(in *briefs.Inode) error {
 	blk, off := b.inodes.inodeLocation(in.InodeNumber)
 	buf, err := b.dev.ReadBlock(blk)
@@ -545,7 +545,32 @@ func (b *BrieFS) writeInodeDirect(in *briefs.Inode) error {
 		return err
 	}
 	copy(buf[off:], data)
-	return b.dev.WriteBlock(blk, buf)
+	if err := b.dev.WriteBlock(blk, buf); err != nil {
+		return err
+	}
+	b.setDirtyBlock(blk, buf)
+	return nil
+}
+
+// writeInodeOwned defers an inode-slot update: read the block through the
+// dirty view, patch the slot, store the whole block in the deferred-metadata
+// map.  No I/O, no journal sync — the block is drained by the next journal
+// sync after its records' commit point (kernel parity: the kernel marks
+// metadata buffers dirty only at sync time).  Like writeInodeDirect the
+// caller must hold the inode's inodeBlockLock.
+func (b *BrieFS) writeInodeOwned(in *briefs.Inode) error {
+	blk, off := b.inodes.inodeLocation(in.InodeNumber)
+	buf, err := b.dev.ReadBlock(blk)
+	if err != nil {
+		return err
+	}
+	data, err := in.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	copy(buf[off:], data)
+	b.setDirtyBlock(blk, buf)
+	return nil
 }
 
 // collectExtentsAndNodes returns the inode's current extents (ascending offset)

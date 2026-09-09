@@ -41,6 +41,12 @@ func fsckClean(t *testing.T, b *BrieFS, img string) {
 	if err := b.journal.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint: %v", err)
 	}
+	// Drain deferred metadata like the unmount tail: a clean journal can
+	// still have deferred blocks whose records were committed by an earlier
+	// sync (fix B defers the block writes past the commit).
+	if err := b.flushDirtyMeta(); err != nil {
+		t.Fatalf("flushDirtyMeta: %v", err)
+	}
 	b.dev.Close()
 	fsck := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
 	out, err := exec.Command(fsck, img).CombinedOutput()

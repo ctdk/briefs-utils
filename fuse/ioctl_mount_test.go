@@ -117,6 +117,11 @@ func TestFstrim(t *testing.T) {
 	if err := b.unlinkInDir(1, "gone", false); err != nil {
 		t.Fatalf("unlink gone: %v", err)
 	}
+	// The unlink's block frees are deferred until their records commit
+	// (deferBlockFree); sync the journal to apply them.
+	if err := b.journal.Sync(false); err != nil {
+		t.Fatalf("journal sync after unlink: %v", err)
+	}
 	if got := b.dataAlloc.FreeCount(); got != freeBefore+1 {
 		t.Fatalf("unlink did not free the data block: %d -> %d", freeBefore, got)
 	}

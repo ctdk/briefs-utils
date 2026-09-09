@@ -55,10 +55,14 @@ func TestHardlink(t *testing.T) {
 		t.Fatalf("read via b after unlink a: mismatch")
 	}
 
-	// Unlink b (last link) -> inode + data freed.
+	// Unlink b (last link) -> inode + data freed.  The block frees are
+	// deferred until their records commit (deferBlockFree); sync to apply.
 	freeBefore := b.dataAlloc.FreeCount()
 	if err := b.unlinkInDir(1, "b", false); err != nil {
 		t.Fatalf("unlink b: %v", err)
+	}
+	if err := b.journal.Sync(false); err != nil {
+		t.Fatalf("journal sync after unlink: %v", err)
 	}
 	if got := b.dataAlloc.FreeCount(); got <= freeBefore {
 		t.Fatalf("data blocks not freed on last unlink: free %d -> %d", freeBefore, got)

@@ -171,22 +171,15 @@ func (b *BrieFS) fileattrSet(ino uint64, setFlags bool, flags uint32, setXflags 
 	sec, nsec := nowTime()
 	in.CtimeSec, in.CtimeNsec = sec, nsec
 
-	// Commit the snapshot (user_flags is carried by JRN_INODE_FULL), then write
-	// the inode block. The inode block is snapshot-trusted, so commit-before-
-	// flush is safe (replay restores it).
+	// Journal the snapshot (user_flags is carried by JRN_INODE_FULL) and defer
+	// the inode block: no per-op sync (kernel parity — the kernel does not
+	// sync on chflags); the block is durable at the next journal sync after
+	// the commit point, and the snapshot record makes it replay-derivable.
 	if err := b.journalInodeFull(in); err != nil {
 		b.failWrite()
 		return err
 	}
-	if err := b.journal.Sync(false); err != nil {
-		b.failWrite()
-		return err
-	}
-	if err := b.writeInodeDirect(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	if err := b.dev.Fdatasync(); err != nil {
+	if err := b.writeInodeOwned(in); err != nil {
 		b.failWrite()
 		return err
 	}

@@ -8,12 +8,14 @@ import (
 )
 
 // TestCrashRecovery simulates a kill -9 of the FUSE bridge mid-workload by
-// closing the device WITHOUT the unmount checkpoint.  Each BrieFS op commits
-// its journal records + writes the inode/data blocks before returning, so the
-// on-disk state is consistent even without the final checkpoint; the journal
-// may carry uncommitted (or committed-but-uncheckpointed) records, which a
-// kernel remount would replay.  This test verifies the host-observable result:
-// fsck clean and a fresh mount reads back the data.
+// closing the device WITHOUT the unmount checkpoint.  Ops no longer sync
+// per-op (kernel parity: the bridge defers metadata between journal syncs,
+// like the kernel's pinned buffer heads), so the workload commits
+// explicitly before the simulated crash -- Sync(false) persists the commit
+// point and drains the deferred metadata without checkpointing, leaving
+// exactly the state this test exercises: committed-but-uncheckpointed
+// records that a kernel remount would replay.  This verifies the
+// host-observable result: fsck clean and a fresh mount reads back the data.
 //
 // The kernel-mount replay itself (mounting the FUSE-written image with the
 // BrieFS kernel module and confirming replay) needs the VM and is exercised
@@ -34,7 +36,14 @@ func TestCrashRecovery(t *testing.T) {
 		t.Fatalf("chmod: %v", err)
 	}
 
-	// "Crash": close WITHOUT the unmount checkpoint (the journal may carry
+	// Commit the workload without checkpointing (an unsynced buffered op
+	// would legitimately vanish across a kill -9 -- kernel parity -- which
+	// is not what this crash test is about).
+	if err := b.journal.Sync(false); err != nil {
+		t.Fatalf("journal sync: %v", err)
+	}
+
+	// "Crash": close WITHOUT the unmount checkpoint (the journal carries
 	// uncheckpointed-but-committed records).
 	b.dev.Close()
 

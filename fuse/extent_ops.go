@@ -658,15 +658,14 @@ func (b *BrieFS) zeroRangeOp(in *briefs.Inode, off, size uint64, mode uint32) er
 		b.failWrite()
 		return err
 	}
-	if err := b.journal.Sync(false); err != nil {
+	// Fix B: defer the inode block — no per-op journal sync (kernel parity:
+	// the kernel does not sync per metadata op); durable at the next journal
+	// sync after the commit point.
+	if err := b.writeInodeOwned(in); err != nil {
 		b.failWrite()
 		return err
 	}
-	if err := b.writeInodeDirect(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	return b.dev.Fdatasync()
+	return nil
 }
 
 // zeroRangeInline applies ZERO_RANGE to an inline-data file whose range fits
@@ -703,15 +702,14 @@ func (b *BrieFS) zeroRangeInline(in *briefs.Inode, off, end uint64, mode uint32)
 		b.failWrite()
 		return err
 	}
-	if err := b.journal.Sync(false); err != nil {
+	// Fix B: defer the inode block — no per-op journal sync (kernel parity:
+	// the kernel does not sync per metadata op); durable at the next journal
+	// sync after the commit point.
+	if err := b.writeInodeOwned(in); err != nil {
 		b.failWrite()
 		return err
 	}
-	if err := b.writeInodeDirect(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	return b.dev.Fdatasync()
+	return nil
 }
 
 // truncateInode is the public truncate entry: lock + read + truncateLocked.
@@ -833,15 +831,14 @@ func (b *BrieFS) setattrOp(ino uint64, in *fuseSetAttrIn) error {
 		b.failWrite()
 		return err
 	}
-	if err := b.journal.Sync(false); err != nil {
+	// Fix B: defer the inode block — no per-op journal sync (kernel parity:
+	// the kernel does not sync per setattr); durable at the next journal
+	// sync after the commit point.
+	if err := b.writeInodeOwned(di); err != nil {
 		b.failWrite()
 		return err
 	}
-	if err := b.writeInodeDirect(di); err != nil {
-		b.failWrite()
-		return err
-	}
-	return b.dev.Fdatasync()
+	return nil
 }
 
 // truncateLocked is the size-change path assuming the inode-block lock is held
@@ -906,15 +903,14 @@ func (b *BrieFS) truncateLocked(in *briefs.Inode, newSize uint64) error {
 		b.failWrite()
 		return err
 	}
-	if err := b.journal.Sync(false); err != nil {
+	// Fix B: defer the inode block — no per-op journal sync (kernel parity:
+	// the kernel does not sync per metadata op); durable at the next journal
+	// sync after the commit point.
+	if err := b.writeInodeOwned(in); err != nil {
 		b.failWrite()
 		return err
 	}
-	if err := b.writeInodeDirect(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	return b.dev.Fdatasync()
+	return nil
 }
 
 // removePrivs strips suid/sgid and clears security.capability (killpriv),

@@ -64,11 +64,31 @@ type BrieFS struct {
 	unwrittenRes map[uint64]uint64
 
 	// cache is the per-operation block cache (see cache.go).  A mutating
-	// handler calls cacheBegin before its first metadata read and flushCache
-	// before journal.Sync so all of the operation's metadata lands on disk
-	// together.  nil between operations.  Protected by mu.
+	// handler calls cacheBegin before its first metadata read and mergeCache
+	// at op end to move its dirty blocks into the deferred-metadata map.
+	// nil between operations.  Protected by mu.
 	cache      map[uint64][]byte
 	cacheDirty map[uint64]bool
+
+	// dirtyBlocks is the deferred-metadata write-back map (cache.go): the
+	// bridge's analog of the kernel's pinned, not-yet-dirty buffer heads.
+	// A successful op's metadata blocks live here until the next journal
+	// sync drains them (MetaSyncer hook, after the commit point); readers
+	// see them through BlockDevice's dirty-view hook.  All access goes
+	// through setDirtyBlock/dirtyView/SyncMeta (dirtyMu), never directly:
+	// merges happen under dir-op mu / inode-block shard locks, drains under
+	// the journal lock, and dirtyMu is the common leaf that orders them.
+	dirtyBlocks map[uint64][]byte
+	dirtyMu     sync.Mutex
+
+	// pendingFrees holds data blocks (data-relative) whose freeing records
+	// (JRN_EXTENT_FREE / JRN_TRIE_ALLOC op=1) have been journaled but not
+	// yet committed.  The free is applied to the in-memory allocator only
+	// when the journal commits (SyncMeta, cache.go) — the same gate
+	// commitExtentChange applies to extent frees — so a freed block can
+	// never be reallocated while the last committed on-disk state still
+	// references it.  Guarded by dirtyMu like dirtyBlocks.
+	pendingFrees []uint64
 
 	// Replay-private maps (journal_replay.go). Non-nil only during
 	// replayJournal; nil otherwise.
@@ -128,17 +148,27 @@ func Mount(imagePath string, opts MountOptions) error {
 		inodeAlloc:      inodeAlloc,
 		blockSize:       blockSize,
 		dataRegionStart: dataRegionStart,
+		dirtyBlocks:     make(map[uint64][]byte),
 	}
+
+	// Deferred-metadata reads: blocks held in dirtyBlocks (daemon memory
+	// until the next journal sync) are served to every reader through the
+	// device's dirty-view hook, so lookups/readdirs stay coherent without
+	// per-op writes.  Wired before replay + serving; the map is empty until
+	// the first mutating op.
+	dev.SetDirtyView(bfs.dirtyView)
 
 	// Construct the journal (ported from kernel journal.c).  It mutates sb in
 	// place and writes through dev.  The allocator interface lets it sync the
-	// bitmaps / refresh free counts at checkpoint without an import cycle.
+	// bitmaps / refresh free counts at checkpoint without an import cycle,
+	// and the meta syncer drains the deferred-metadata map at commit time.
 	journal, err := briefs.NewJournal(sb, dev.File(), blockSize)
 	if err != nil {
 		dev.Close()
 		return fmt.Errorf("init journal: %w", err)
 	}
 	journal.SetAllocatorSyncer(bfs)
+	journal.SetMetaSyncer(bfs)
 	bfs.journal = journal
 
 	// Replay the journal before serving: a crash (or dm-flakey simulated power
@@ -201,10 +231,16 @@ func Mount(imagePath string, opts MountOptions) error {
 	// Unmount: always checkpoint (f8ef293) so log_start==log_end and a remount
 	// replays nothing, then flush + close.  Checkpoint errors are best-effort
 	// (the journal may be dirty on a forced unmount); we still drain + close.
+	// flushDirtyMeta is the safety net for the case the checkpoint's inner
+	// sync skipped because the journal was clean: deferred metadata can be
+	// pending with no uncommitted records (its records were committed by an
+	// earlier sync, the blocks merged after it), and that content exists only
+	// in daemon memory until this drain.
 	if bfs.journal != nil {
 		_ = bfs.journal.Checkpoint()
 		_ = bfs.journal.Close()
 	}
+	_ = bfs.flushDirtyMeta()
 	_ = dev.Sync()
 	dev.Close()
 	return nil
@@ -218,16 +254,36 @@ func (b *BrieFS) RefreshFreeCounts() {
 	b.sb.FreeInodes = b.inodeAlloc.FreeCount()
 }
 
-// SyncAllocators writes both allocator bitmap pools to disk.  Implements
-// briefs.AllocatorSyncer; called by the journal at checkpoint, mirroring the
-// kernel's briefs_alloc_sync() pair.  Without this a back-pressure checkpoint
-// would advance log_start past allocation records while the on-disk bitmap
-// still failed to mark the blocks allocated (generic/040/041 family).
+// SyncAllocators writes both allocator bitmap pools to disk, then rewrites
+// the superblock so its free counts match the pools.  Implements
+// briefs.AllocatorSyncer; the journal calls it after the commit point and
+// after the deferred-metadata drain, so the bitmap it writes reflects the
+// frees SyncMeta just applied — never ahead of their records or of the
+// drained structure references (generic/040/041 family).  The superblock
+// rewrite is needed because the commit point's own superblock write
+// (syncSuperblock at the log_end persist) runs before those frees apply; a
+// completed sync must leave the on-disk superblock and pool in agreement or
+// fsck reports a free-count mismatch.  Mirrors the kernel's
+// briefs_alloc_sync() pair (journal.c:394: flush metadata, then sync
+// allocators).
 func (b *BrieFS) SyncAllocators() error {
 	if err := b.dataAlloc.Sync(); err != nil {
 		return fmt.Errorf("sync data allocator: %w", err)
 	}
-	return b.inodeAlloc.Sync()
+	if err := b.inodeAlloc.Sync(); err != nil {
+		return fmt.Errorf("sync inode allocator: %w", err)
+	}
+	b.RefreshFreeCounts()
+	buf := make([]byte, b.blockSize)
+	data, err := b.sb.MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("marshal superblock: %w", err)
+	}
+	copy(buf, data)
+	if err := b.dev.WriteBlock(0, buf); err != nil {
+		return fmt.Errorf("write superblock: %w", err)
+	}
+	return nil
 }
 
 // inodeBlockShard returns the shard index and its mutex for the inode-table
@@ -614,11 +670,13 @@ func (n *brieFSNode) Write(ctx context.Context, f fs.FileHandle, data []byte, of
 	return uint32(nwritten), 0
 }
 
-// Fsync flushes file data and metadata to disk.  Each Write already drains data
-// and btree nodes, commits the journal, and writes the inode block, so Fsync is
-// a belt-and-suspenders flush of any pending page-cache writes plus a journal
-// commit of any buffered records. It takes no lock: dev.Sync and journal.Sync
-// are internally synchronized and Fsync mutates nothing.
+// Fsync flushes file data and metadata to disk.  Mirrors the kernel fsync
+// path (file.c: briefs_file_fsync): drain the data first (filemap_write_and_
+// wait equivalent), commit the journal — which drains the deferred-metadata
+// map after the commit point — then, for the case the journal was already
+// clean but deferred blocks merged after the last commit, drain those too.
+// It takes no lock: dev.Sync and journal.Sync are internally synchronized,
+// the deferred-map drain orders through dirtyMu, and Fsync mutates nothing.
 func (n *brieFSNode) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) syscall.Errno {
 	if n.bfs.readOnly {
 		return syscall.EROFS
@@ -627,6 +685,9 @@ func (n *brieFSNode) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) s
 		return syscall.EIO
 	}
 	if err := n.bfs.journal.Sync(false); err != nil {
+		return syscall.EIO
+	}
+	if err := n.bfs.flushDirtyMeta(); err != nil {
 		return syscall.EIO
 	}
 	return 0

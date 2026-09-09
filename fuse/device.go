@@ -13,6 +13,18 @@ import (
 type BlockDevice struct {
 	file      *os.File
 	blockSize uint64
+
+	// dirtyView, when set, serves reads of blocks the FUSE bridge is holding
+	// in daemon memory (the deferred-metadata map, cache.go): it returns a
+	// private copy of the deferred content so every reader sees the latest
+	// metadata without waiting for the next journal sync to drain it.  Set
+	// once in Mount before serving; nil for standalone users of BlockDevice.
+	dirtyView func(block uint64) ([]byte, bool)
+}
+
+// SetDirtyView wires the deferred-block read hook (see the dirtyView field).
+func (bd *BlockDevice) SetDirtyView(fn func(block uint64) ([]byte, bool)) {
+	bd.dirtyView = fn
 }
 
 // OpenBlockDevice opens a BrieFS image or block device for block-level access.
@@ -64,8 +76,16 @@ func OpenBlockDevice(path string) (*BlockDevice, uint64, error) {
 func (bd *BlockDevice) File() *os.File { return bd.file }
 
 // ReadBlock reads a single block into a newly allocated []byte.
-// blockNum is 0-based.
+// blockNum is 0-based.  Blocks the bridge is deferring in daemon memory are
+// served from the dirty view (as a private copy), so readers see the latest
+// metadata even though the on-disk block is only written at the next journal
+// sync.
 func (bd *BlockDevice) ReadBlock(blockNum uint64) ([]byte, error) {
+	if bd.dirtyView != nil {
+		if buf, ok := bd.dirtyView(blockNum); ok {
+			return buf, nil
+		}
+	}
 	buf := make([]byte, bd.blockSize)
 	offset := int64(blockNum * bd.blockSize)
 	if _, err := bd.file.ReadAt(buf, offset); err != nil {

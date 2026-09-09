@@ -7,19 +7,21 @@
 // (trie_mutate.go) and the journal writer (briefs.Journal) through the
 // per-operation block cache (cache.go).
 //
-// Durability ordering — commit-before-flush.  The kernel commits the journal
-// tail (log_end) before flushing the metadata buffers it references, relying on
-// idempotent replay to re-derive any metadata that did not reach disk.  The
-// FUSE bridge has no buffer cache: metadata lives in the per-op block cache
-// (process memory) until flushCache writes it to the backing file's page cache.
-// To stay crash-safe under the FUSE crash model (kill -9 the FUSE process: the
-// OS page cache survives, process memory is lost) the journal must be committed
-// BEFORE the metadata is flushed: if the process dies between the two, the
-// committed journal records let the kernel replay re-derive the metadata
-// (trie pages via replay_dir_update, inode blocks via replay_inode_full); the
-// reverse order would leave durable metadata referencing un-journaled
-// allocations with a stale allocator bitmap.  So each op ends with
-// journal.Sync(false) then flushCache.
+// Durability ordering — commit-before-flush, deferred like the kernel.  The
+// kernel commits the journal tail (log_end) before flushing the metadata
+// buffers it references, relying on idempotent replay to re-derive any
+// metadata that did not reach disk — and it does NOT sync per op (dir.c:25
+// rejects per-create flushes as far too slow); metadata buffers stay pinned
+// and not-yet-dirty until an fsync/sync_fs/checkpoint flushes them.  The
+// bridge mirrors that (fix B): each op writes its records into the ring and
+// moves its metadata blocks into the deferred-metadata map (cache.go
+// mergeCache, no I/O); the journal's next sync persists the commit point
+// FIRST and only then drains the map, so a block never reaches the device
+// before the records justifying it.  Until the drain, readers see the
+// deferred content through the device's dirty-view hook.  Under the FUSE
+// crash model (kill -9 the FUSE process: the OS page cache survives, process
+// memory is lost) an unsynced op simply never happened — the same semantics
+// a buffered op has against the kernel.
 //
 // One write-through exception: the inode-allocation paths persist the fresh
 // inode's slot to the device page cache BEFORE its JRN_INODE_FULL is committed
@@ -393,15 +395,9 @@ func (b *BrieFS) createNamedInode(parentIno uint64, name string, mode, uid, gid 
 		return nil, err
 	}
 
-	// Commit before flush (see file header): commit the journal records, then
-	// make the metadata durable.
-	if err := b.journal.Sync(false); err != nil {
-		b.cacheAbort()
-		return nil, err
-	}
-	if err := b.flushCache(); err != nil {
-		return nil, err
-	}
+	// Op end (see file header): records are in the ring; the metadata blocks
+	// move to the deferred map, durable at the next journal sync.
+	b.mergeCache()
 	return child, nil
 }
 
@@ -561,13 +557,9 @@ func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error 
 		return err
 	}
 
-	if err := b.journal.Sync(false); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.flushCache(); err != nil {
-		return err
-	}
+	// Op end (see file header): records are in the ring; the metadata blocks
+	// move to the deferred map, durable at the next journal sync.
+	b.mergeCache()
 	_ = ftype
 	return nil
 }
