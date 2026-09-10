@@ -243,29 +243,161 @@ func (b *BrieFS) preallocate(in *briefs.Inode, start, end uint64, mode uint32, a
 // briefs_do_punch_hole. The range is split out of any overlapping extents.
 func (b *BrieFS) punchHole(in *briefs.Inode, off, size uint64) error {
 	bs := b.blockSize
+	end := off + size
 	startBlk := off / bs
-	endBlk := (off + size + bs - 1) / bs
+	endBlk := (end + bs - 1) / bs
+
+	// Inline-data file: zero [off, min(end, size)) of the inline region
+	// (kernel file.c:1599-1627).  A punch never changes the file size.
+	if in.Flags&briefs.InodeFlagInlineData != 0 {
+		zEnd := end
+		if zEnd > in.FileSize {
+			zEnd = in.FileSize
+		}
+		if off < zEnd {
+			region := in.InlineData()
+			for i := off; i < zEnd; i++ {
+				region[i] = 0
+			}
+			in.SetInlineData(region)
+			sec, nsec := nowTime()
+			in.MtimeSec, in.MtimeNsec = sec, nsec
+			in.CtimeSec, in.CtimeNsec = sec, nsec
+			if err := b.journalInodeFull(in); err != nil {
+				b.failWrite()
+				return err
+			}
+			if err := b.writeInodeOwned(in); err != nil {
+				b.failWrite()
+				return err
+			}
+		}
+		return nil
+	}
+
+	needPartialStart := off%bs != 0
+	needPartialEnd := end%bs != 0
+	// Punch wholly inside one block: the boundary block is one and the
+	// same, so the punched portion is [off%bs, end%bs) — NOT the union of
+	// the head and tail zeroing below, which would cover the whole block
+	// and destroy the data outside the (small) punched range
+	// (kernel file.c:1599-1612).
+	sameBoundary := needPartialStart && needPartialEnd && startBlk == endBlk-1
 
 	exts, oldNodes, err := b.collectExtentsAndNodes(in)
 	if err != nil {
 		return err
 	}
-	newExts, freed := freeExtentRange(exts, startBlk, endBlk)
 
-	sec, nsec := nowTime()
-	in.MtimeSec, in.MtimeNsec = sec, nsec
-	in.CtimeSec, in.CtimeNsec = sec, nsec
+	// Partially-punched boundary blocks stay allocated; only their punched
+	// byte ranges are zeroed in place (kernel briefs_zero_block_range
+	// calls, file.c:1744-1798).  Interior, fully-covered blocks are freed
+	// below.
+	zeroPunched := func(blk, from, to uint64) (bool, error) {
+		ext, found := lookupExtent(exts, blk)
+		if !found || ext.Phys == 0 {
+			return false, nil // boundary was a hole: nothing to zero
+		}
+		abs := ext.Phys + (blk - ext.Offset)
+		if err := b.zeroBlockRange(abs, from, to); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	changed := false
+	if sameBoundary {
+		c, err := zeroPunched(startBlk, off%bs, end%bs)
+		if err != nil {
+			return err
+		}
+		changed = c
+	} else {
+		if needPartialStart {
+			c, err := zeroPunched(startBlk, off%bs, bs)
+			if err != nil {
+				return err
+			}
+			changed = changed || c
+		}
+		if needPartialEnd {
+			c, err := zeroPunched(endBlk-1, 0, end%bs)
+			if err != nil {
+				return err
+			}
+			changed = changed || c
+		}
+	}
 
-	var allocated []uint64
-	var drain []uint64
-	if err := b.rebuildExtentIndex(in, newExts, oldNodes, &drain, &allocated); err != nil {
-		b.rollbackAlloc(allocated)
+	// Free only the interior blocks: shrink the whole-block free range
+	// past the boundary blocks (kernel free_start++/free_end--,
+	// file.c:1825-1831).  A same-block punch frees nothing.
+	delStart, delEnd := startBlk, endBlk
+	if sameBoundary {
+		delEnd = delStart // a same-block punch frees nothing
+	} else {
+		if needPartialStart {
+			delStart = startBlk + 1
+		}
+		if needPartialEnd {
+			delEnd = endBlk - 1
+		}
+	}
+	var newExts []briefs.Extent
+	var freed []uint64
+	if delStart < delEnd {
+		newExts, freed = freeExtentRange(exts, delStart, delEnd)
+	} else {
+		newExts = exts
+	}
+	// freeExtentRange only splits extents or drops freed blocks, so a
+	// length change means the extent list changed (a full-extent removal
+	// shrinks it, a straddler split grows it).
+	extentChanged := len(freed) > 0 || len(newExts) != len(exts)
+	changed = changed || extentChanged
+
+	// Times only when the punch actually changed anything (kernel gates
+	// the mtime/ctime update on `changed`, file.c:1972) — and before the
+	// commit, so the journaled INODE_FULL carries them.
+	if changed {
+		sec, nsec := nowTime()
+		in.MtimeSec, in.MtimeNsec = sec, nsec
+		in.CtimeSec, in.CtimeNsec = sec, nsec
+	}
+
+	if extentChanged {
+		var allocated []uint64
+		var drain []uint64
+		if err := b.rebuildExtentIndex(in, newExts, oldNodes, &drain, &allocated); err != nil {
+			b.rollbackAlloc(allocated)
+			return err
+		}
+		// The punched-out blocks may have been unwritten: release their share of
+		// the shield before the commit (kernel release in briefs_do_punch_hole).
+		b.updateUnwrittenRes(in.InodeNumber, newExts)
+		return b.commitExtentChange(in, allocated, freed, oldNodes)
+	}
+
+	if !changed {
+		return nil // punch over an all-hole range: nothing to persist
+	}
+	// Boundary blocks were zeroed but the extent list is unchanged:
+	// persist the inode (times) and the zeroed blocks, metadata-only.
+	if err := b.dev.Fdatasync(); err != nil {
+		b.failWrite()
 		return err
 	}
-	// The punched-out blocks may have been unwritten: release their share of
-	// the shield before the commit (kernel release in briefs_do_punch_hole).
-	b.updateUnwrittenRes(in.InodeNumber, newExts)
-	return b.commitExtentChange(in, allocated, freed, oldNodes)
+	if err := b.journalInodeFull(in); err != nil {
+		b.failWrite()
+		return err
+	}
+	// Fix B: defer the inode block — no per-op journal sync (kernel parity:
+	// the kernel does not sync per metadata op); durable at the next journal
+	// sync after the commit point.
+	if err := b.writeInodeOwned(in); err != nil {
+		b.failWrite()
+		return err
+	}
+	return nil
 }
 
 // shiftExtents rewrites the extent list for COLLAPSE_RANGE (dir < 0) and
