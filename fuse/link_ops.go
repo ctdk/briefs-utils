@@ -20,6 +20,11 @@ const (
 	modeBlk  uint32 = 0060000 // S_IFBLK
 	modeFifo uint32 = 0010000 // S_IFIFO
 	modeSock uint32 = 0140000 // S_IFSOCK
+
+	// WHITEOUT_MODE is the permission set the kernel gives whiteouts
+	// (fs/namei.c); briefs_rename_whiteout creates them with
+	// S_IFCHR | WHITEOUT_MODE (dir.c:1036).
+	modeWhiteout uint32 = modeChr | 0600
 )
 
 // renameat2 flags (uapi/linux/fs.h).
@@ -633,8 +638,11 @@ func (b *BrieFS) renameWhiteout(oldParentIno uint64, oldName string, newParentIn
 	}
 
 	// 2. Allocate the whiteout chardev and journal its snapshot BEFORE any dir
-	//    record references it.
-	whiteout, err := b.AllocInode(modeChr, 0, 0, oldParentIno)
+	//    record references it.  S_IFCHR | 0600 like the kernel (dir.c:1036):
+	//    a zero-perm whiteout made go-fuse's reply patcher (without
+	//    NullPermissions) advertise it as drwxr-xr-x, so nothing could
+	//    remove it (generic/585).
+	whiteout, err := b.AllocInode(modeWhiteout, 0, 0, oldParentIno)
 	if err != nil {
 		b.cacheAbort()
 		return err

@@ -212,6 +212,11 @@ func Mount(imagePath string, opts MountOptions) error {
 			// fuse-created ACLs interoperate.
 			EnableAcl: true,
 		},
+		// Report modes exactly as stored.  Without this, go-fuse patches
+		// any zero-permission mode in Getattr/Lookup replies to 0644 (+0111
+		// for dirs) -- so `chmod 000` files lied about their mode, and a
+		// zero-perm whiteout looked like rwxr-xr-x (generic/585).
+		NullPermissions: true,
 		// The root is never produced by a Lookup, so without this its
 		// stableAttr.Ino is 0 and stat reports ino 0 (and ".." from the
 		// root resolves to a go-fuse virtual inode).  Pin it to the real
@@ -440,7 +445,7 @@ func (n *brieFSNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 		return nil, syscall.EIO
 	}
 
-	ino, ftype, err := TrieLookup(n.bfs.dev, diskInode.DirTrieRoot, name)
+	ino, _, err := TrieLookup(n.bfs.dev, diskInode.DirTrieRoot, name)
 	if err != nil {
 		return nil, syscall.ENOENT
 	}
@@ -454,21 +459,21 @@ func (n *brieFSNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 		return nil, syscall.EIO
 	}
 
-	var childMode uint32
-	switch ftype {
-	case briefs.NodeTypeDir:
-		childMode = uint32(briefs.ModeDir)
-	default:
-		childMode = childInode.Filemode
-	}
-
+	// The on-disk inode's mode is authoritative for the node type, like
+	// the kernel's briefs_lookup (which derives everything from the inode
+	// it igets).  go-fuse masks StableAttr.Mode down to the S_IFMT type
+	// bits (newInodeUnlocked), so passing the full Filemode is safe -- and
+	// required: the trie's ftype is S_IFMT>>12, where 2 means CHARDEV, but
+	// briefs.NodeTypeDir happens to be 0x02 too.  Switching on ftype
+	// turned every whiteout into a directory, so rm -rf could never
+	// remove it (generic/585).
 	childNode := &brieFSNode{
 		bfs: n.bfs,
 		ino: ino,
 	}
 	child := n.NewInode(ctx, childNode, fs.StableAttr{
 		Ino:  ino,
-		Mode: childMode,
+		Mode: childInode.Filemode,
 	})
 
 	return child, 0
@@ -511,20 +516,13 @@ func (n *brieFSNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 		if ino == 0 {
 			break
 		}
-		// ftype is S_IFMT >> 12 (4=dir, 8=reg, 10=symlink, etc.)
-		// Map to FUSE mode bits
-		var mode uint32
-		switch ftype {
-		case 4: // S_IFDIR
-			mode = uint32(briefs.ModeDir)
-		case 8: // S_IFREG
-			mode = uint32(briefs.ModeFile)
-		case 10: // S_IFLNK
-			mode = uint32(briefs.ModeSymlink)
-		default:
-			// Unknown type, default to regular file
-			mode = uint32(briefs.ModeFile)
-		}
+		// ftype is S_IFMT >> 12 (4=dir, 8=reg, 10=symlink, 2=chardev, ...).
+		// The kernel's readdir (dir.c:139) maps every dirent type with
+		// file_type = (entry_type << 12) & S_IFMT; do the same rather than
+		// switch on a few known values, so chardev/blockdev/fifo/socket
+		// d_types match the kernel (a wrong d_type confuses coreutils and
+		// libc readdir consumers, and misclassifies whiteouts).
+		mode := uint32(ftype) << 12
 		entries = append(entries, fuse.DirEntry{
 			Mode: mode,
 			Ino:  ino,
