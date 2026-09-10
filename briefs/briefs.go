@@ -36,13 +36,13 @@ var ErrChecksumMismatch = errors.New("CRC32C checksum mismatch")
 
 // Magic numbers for our filesystem structures.
 const (
-	MagicSuperblock = 0x504C434E        // "PLCN"
-	MagicInode      = 0x494E4F44        // "INOD"
-	MagicTrieNode   = 0x54524E20        // "TRN "
-	MagicTriePage   = 0x54524E50        // "TRNP"
-	MagicJournal    = 0x4A4E4C5A        // "JNLZ"
-	MagicCheckpoint = 0x43485053        // "CHPS"
-	MagicXattr      = 0x58415454        // "XATT" -- xattr block header magic
+	MagicSuperblock = 0x504C434E // "PLCN"
+	MagicInode      = 0x494E4F44 // "INOD"
+	MagicTrieNode   = 0x54524E20 // "TRN "
+	MagicTriePage   = 0x54524E50 // "TRNP"
+	MagicJournal    = 0x4A4E4C5A // "JNLZ"
+	MagicCheckpoint = 0x43485053 // "CHPS"
+	MagicXattr      = 0x58415454 // "XATT" -- xattr block header magic
 
 	// File mode constants. Not using the normal Go ones from io/fs because
 	// they aren't what we need for something this low level.
@@ -52,8 +52,8 @@ const (
 	ModeSymlink  = 0120000
 
 	// Default values.
-	DefaultBlockSize   = 4096
-	DefaultInodeSize   = 512
+	DefaultBlockSize        = 4096
+	DefaultInodeSize        = 512
 	DefaultJournalMinBlocks = 64   // minimum journal size in blocks
 	DefaultJournalMaxBlocks = 4096 // cap journal at 16 MiB
 
@@ -94,10 +94,10 @@ const (
 // briefs.h.
 const (
 	// Trie node types — mirrors briefs.h NODE_TYPE_* / NODE_STATUS_*
-	NodeTypeFile     = 0x01
-	NodeTypeDir      = 0x02
-	NodeTypeInterm   = 0x04
-	NodeStatusLeaf   = 0x08
+	NodeTypeFile   = 0x01
+	NodeTypeDir    = 0x02
+	NodeTypeInterm = 0x04
+	NodeStatusLeaf = 0x08
 
 	// Trie page constants — packed node pages (BrieFS >= 0.7.0)
 	TrieSlotsPerBlock = 64
@@ -106,14 +106,14 @@ const (
 	TriePageVersion   = 1
 
 	// Trie node flags — mirrors briefs.h NODE_FLAG_*
-	NodeFlagDeleted  = 0x00000004
-	NodeFlagRoot     = 0x00000008
+	NodeFlagDeleted = 0x00000004
+	NodeFlagRoot    = 0x00000008
 
 	// Inode flags
-	InodeFlagReserved    = 0x00000001
-	InodeFlagCompressed  = 0x00000002
-	InodeFlagIndexed     = 0x00000004
-	InodeFlagInlineData  = 0x00000008
+	InodeFlagReserved   = 0x00000001
+	InodeFlagCompressed = 0x00000002
+	InodeFlagIndexed    = 0x00000004
+	InodeFlagInlineData = 0x00000008
 
 	// User-visible inode flags stored in disk_inode.user_flags — mirrors
 	// the kernel's BRIEFS_USER_FLAG_* (briefs.h:383-393), which are the UAPI
@@ -183,7 +183,7 @@ const (
 
 // constants for mkfs.briefs
 const (
-	MinInodes = 100
+	MinInodes  = 100
 	InodeAlign = 32
 )
 

@@ -84,18 +84,18 @@ func (b *BrieFS) journalInodeFull(in *briefs.Inode) error {
 // (kernel commit 33e4019, generic/536).
 func (b *BrieFS) journalInodeUpdate(in *briefs.Inode) error {
 	rec := &briefs.JrnInodeUpdate{
-		Ino:       in.InodeNumber,
-		Mode:      in.Filemode,
-		Nlink:     in.Nlinks,
-		Uid:       in.Uid,
-		Gid:       in.Gid,
-		FileSize:  in.FileSize,
-		ATimeSec:  in.AtimeSec,
-		ATimeNsec: in.AtimeNsec,
-		MTimeSec:  in.MtimeSec,
-		MTimeNsec: in.MtimeNsec,
-		CTimeSec:  in.CtimeSec,
-		CTimeNsec: in.CtimeNsec,
+		Ino:        in.InodeNumber,
+		Mode:       in.Filemode,
+		Nlink:      in.Nlinks,
+		Uid:        in.Uid,
+		Gid:        in.Gid,
+		FileSize:   in.FileSize,
+		ATimeSec:   in.AtimeSec,
+		ATimeNsec:  in.AtimeNsec,
+		MTimeSec:   in.MtimeSec,
+		MTimeNsec:  in.MtimeNsec,
+		CTimeSec:   in.CtimeSec,
+		CTimeNsec:  in.CtimeNsec,
 		Flags:      in.Flags,
 		Generation: in.Generation,
 	}
@@ -415,6 +415,7 @@ func (b *BrieFS) mknodInDir(parentIno uint64, name string, mode, uid, gid uint32
 func (b *BrieFS) symlinkInDir(parentIno uint64, name string, target string, uid, gid uint32) (*briefs.Inode, error) {
 	return b.createNamedInode(parentIno, name, briefs.ModeSymlink|0o777, uid, gid, false, 0, target)
 }
+
 // mirroring briefs_unlink_common (dir.c:586).  isRmdir selects the rmdir path
 // (ENOTDIR/ENOTEMPTY checks, parent nlink drop, child nlink cleared).  When the
 // target's nlink reaches zero its inode is freed immediately, along with its

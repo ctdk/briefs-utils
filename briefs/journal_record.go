@@ -313,6 +313,7 @@ func (r *JrnXattrData) Marshal() []byte {
 	b = append(b, r.Data...)
 	return b
 }
+
 // --- Unmarshal helpers (journal replay) ---
 //
 // These parse on-disk record payloads (little-endian, explicit offsets) back

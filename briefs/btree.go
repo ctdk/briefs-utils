@@ -52,16 +52,16 @@ const BtreeMaxDepth = 16
 // Errors returned by the B-tree walk. fsck formats these with the offending
 // inode/block number.
 var (
-	ErrBtreeBadMagic       = errors.New("bad magic")
-	ErrBtreeChecksum       = errors.New("checksum mismatch")
-	ErrBtreeDepth          = errors.New("depth exceeded")
-	ErrBtreeCycle          = errors.New("cycle detected")
-	ErrBtreeUnsorted        = errors.New("extents unsorted")
-	ErrBtreeCountOverflow  = errors.New("count exceeds fanout")
-	ErrBtreeBadHighKey      = errors.New("separator high_key not strictly ascending")
-	ErrBtreeBadChild        = errors.New("bad child pointer")
+	ErrBtreeBadMagic          = errors.New("bad magic")
+	ErrBtreeChecksum          = errors.New("checksum mismatch")
+	ErrBtreeDepth             = errors.New("depth exceeded")
+	ErrBtreeCycle             = errors.New("cycle detected")
+	ErrBtreeUnsorted          = errors.New("extents unsorted")
+	ErrBtreeCountOverflow     = errors.New("count exceeds fanout")
+	ErrBtreeBadHighKey        = errors.New("separator high_key not strictly ascending")
+	ErrBtreeBadChild          = errors.New("bad child pointer")
 	ErrBtreeCrossLeafUnsorted = errors.New("cross-leaf extents unsorted")
-	ErrBtreeCountMismatch  = errors.New("extent count != num_extents_total")
+	ErrBtreeCountMismatch     = errors.New("extent count != num_extents_total")
 )
 
 // BtreeNodeHeader is the 24-byte on-disk header of a B+ tree node, matching
@@ -375,11 +375,11 @@ func walkBtreeNode(file *os.File, block uint64, opts BtreeWalkOptions, v BtreeNo
 
 	info := BtreeNodeInfo{
 		Block:         block,
-		Hdr:            hdr,
-		Buf:            buf,
-		Depth:          depth,
-		IsRoot:         isRoot,
-		ExpectedLevel:  expectedLevel,
+		Hdr:           hdr,
+		Buf:           buf,
+		Depth:         depth,
+		IsRoot:        isRoot,
+		ExpectedLevel: expectedLevel,
 	}
 
 	if hdr.IsLeaf() {

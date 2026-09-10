@@ -116,7 +116,7 @@ func (b *AllocBuilder) NbBlocks() uint64 {
 
 func (b *AllocBuilder) wordBlocks(words []uint64) uint64 {
 	bytes := len(words) * 8
-	blk := uint64(bytes + 4095) / 4096
+	blk := uint64(bytes+4095) / 4096
 	if blk < 1 {
 		return 1
 	}

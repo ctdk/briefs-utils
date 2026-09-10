@@ -25,25 +25,25 @@ func TestInodeUnmarshal(t *testing.T) {
 	data := make([]byte, 512)
 
 	// Manually construct a valid inode
-	binary.LittleEndian.PutUint64(data[0:], 1)                    // InodeNumber
-	binary.LittleEndian.PutUint64(data[8:], MagicInode)           // Magic
-	binary.LittleEndian.PutUint32(data[16:], 0x41ED)             // Filemode (dir + 0755)
-	binary.LittleEndian.PutUint32(data[20:], 1000)               // Uid
-	binary.LittleEndian.PutUint32(data[24:], 100)                // Gid
-	binary.LittleEndian.PutUint32(data[28:], 0)                  // _Pad0
-	binary.LittleEndian.PutUint64(data[32:], 4096)               // FileSize
-	binary.LittleEndian.PutUint64(data[40:], 1000000)            // CtimeSec
-	binary.LittleEndian.PutUint64(data[48:], 0)                  // CtimeNsec
-	binary.LittleEndian.PutUint64(data[56:], 1000000)            // AtimeSec
-	binary.LittleEndian.PutUint64(data[64:], 0)                  // AtimeNsec
-	binary.LittleEndian.PutUint64(data[72:], 1000000)            // MtimeSec
-	binary.LittleEndian.PutUint64(data[80:], 0)                  // MtimeNsec
-	binary.LittleEndian.PutUint64(data[88:], 1000000)            // CreationTimeSec
-	binary.LittleEndian.PutUint64(data[96:], 0)                  // CreationTimeNsec
-	binary.LittleEndian.PutUint32(data[104:], 2)                 // Nlinks
-	binary.LittleEndian.PutUint32(data[108:], 1)                 // NumExtentsInline
-	binary.LittleEndian.PutUint64(data[112:], 0)                 // ExtentInlineBase
-	binary.LittleEndian.PutUint64(data[120:], 1)                 // NumExtentsTotal
+	binary.LittleEndian.PutUint64(data[0:], 1)          // InodeNumber
+	binary.LittleEndian.PutUint64(data[8:], MagicInode) // Magic
+	binary.LittleEndian.PutUint32(data[16:], 0x41ED)    // Filemode (dir + 0755)
+	binary.LittleEndian.PutUint32(data[20:], 1000)      // Uid
+	binary.LittleEndian.PutUint32(data[24:], 100)       // Gid
+	binary.LittleEndian.PutUint32(data[28:], 0)         // _Pad0
+	binary.LittleEndian.PutUint64(data[32:], 4096)      // FileSize
+	binary.LittleEndian.PutUint64(data[40:], 1000000)   // CtimeSec
+	binary.LittleEndian.PutUint64(data[48:], 0)         // CtimeNsec
+	binary.LittleEndian.PutUint64(data[56:], 1000000)   // AtimeSec
+	binary.LittleEndian.PutUint64(data[64:], 0)         // AtimeNsec
+	binary.LittleEndian.PutUint64(data[72:], 1000000)   // MtimeSec
+	binary.LittleEndian.PutUint64(data[80:], 0)         // MtimeNsec
+	binary.LittleEndian.PutUint64(data[88:], 1000000)   // CreationTimeSec
+	binary.LittleEndian.PutUint64(data[96:], 0)         // CreationTimeNsec
+	binary.LittleEndian.PutUint32(data[104:], 2)        // Nlinks
+	binary.LittleEndian.PutUint32(data[108:], 1)        // NumExtentsInline
+	binary.LittleEndian.PutUint64(data[112:], 0)        // ExtentInlineBase
+	binary.LittleEndian.PutUint64(data[120:], 1)        // NumExtentsTotal
 
 	// Inline extent 0: offset=0, phys=100, len=1, flags=0, pad=0
 	binary.LittleEndian.PutUint64(data[128:], 0)
@@ -259,7 +259,6 @@ func TestInlineExtentsRoundTrip(t *testing.T) {
 		}
 	}
 }
-
 
 func TestInodeInlineDataRoundTrip(t *testing.T) {
 	in := NewInode(2, ModeFile|0644)

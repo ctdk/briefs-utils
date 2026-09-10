@@ -54,7 +54,7 @@ func TestSuperblockLayoutMarshalRoundTrip(t *testing.T) {
 
 	// Compare all fields
 	fields := []struct {
-		name string
+		name      string
 		want, got interface{}
 	}{
 		{"Magic", sb.Lay.Magic, got.Magic},

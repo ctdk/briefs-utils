@@ -35,7 +35,7 @@ func TestTriePageCompactNames(t *testing.T) {
 	pad := func(b byte) string {
 		s := make([]byte, 250)
 		for i := range s {
-			s[i] = 'a' + (b%26)+byte(i%13) // deterministic distinct filler
+			s[i] = 'a' + (b % 26) + byte(i%13) // deterministic distinct filler
 		}
 		s[0] = b
 		return string(s)

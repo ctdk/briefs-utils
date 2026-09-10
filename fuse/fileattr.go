@@ -42,17 +42,17 @@ const (
 	fsXflagSync      uint32 = 0x00000020
 	fsXflagNoatime   uint32 = 0x00000040
 	fsXflagNodump    uint32 = 0x00000080
-	fsXflagSupported         = fsXflagSync | fsXflagImmutable | fsXflagAppend | fsXflagNodump | fsXflagNoatime
+	fsXflagSupported        = fsXflagSync | fsXflagImmutable | fsXflagAppend | fsXflagNodump | fsXflagNoatime
 )
 
 // Linux _IOC encoding for the FS_IOC_* commands (sizeof(long)=8,
 // sizeof(struct fsxattr)=28 on amd64).
 const (
-	iocNone  uint32 = 0
-	iocWrite uint32 = 1
-	iocRead  uint32 = 2
-	sizeLong        = 8
-	sizeFsxattr     = 28
+	iocNone     uint32 = 0
+	iocWrite    uint32 = 1
+	iocRead     uint32 = 2
+	sizeLong           = 8
+	sizeFsxattr        = 28
 )
 
 func ioc(dir, typ, nr, size uint32) uint32 {

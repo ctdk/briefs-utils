@@ -10,8 +10,8 @@ func TestAllocHeaderUnmarshalBinary(t *testing.T) {
 	buf := make([]byte, 4096)
 	binary.LittleEndian.PutUint32(buf[0:], AllocMagic)
 	binary.LittleEndian.PutUint32(buf[4:], 1)
-	binary.LittleEndian.PutUint64(buf[8:], 3)   // L0Words
-	binary.LittleEndian.PutUint64(buf[16:], 5)  // L1Words
+	binary.LittleEndian.PutUint64(buf[8:], 3)    // L0Words
+	binary.LittleEndian.PutUint64(buf[16:], 5)   // L1Words
 	binary.LittleEndian.PutUint64(buf[24:], 154) // L2Words
 	binary.LittleEndian.PutUint64(buf[32:], 9845)
 	binary.LittleEndian.PutUint64(buf[40:], 9815)

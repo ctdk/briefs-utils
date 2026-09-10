@@ -48,8 +48,8 @@ import (
 
 const (
 	xattrBlockMaxEntries = 501
-	xattrMaxNameLen      = 255  // XATTR_NAME_MAX
-	xattrMaxValueLen     = 65536 // XATTR_SIZE_MAX
+	xattrMaxNameLen      = 255                      // XATTR_NAME_MAX
+	xattrMaxValueLen     = 65536                    // XATTR_SIZE_MAX
 	xattrPayloadCap      = briefs.XattrMaxUsed - 32 // 4012 (v2 header)
 )
 

@@ -11,39 +11,40 @@ import (
 
 var InlineExtentRangeErr = errors.New("index out of range for inode inline extents")
 
-//go:briefs-disk size=512
 // Inode represents a filesystem inode (512 bytes).
+//
+//go:briefs-disk size=512
 type Inode struct {
-	InodeNumber       uint64
-	Magic             uint64   // C struct has __u64 magic
-	Filemode          uint32
-	Uid               uint32
-	Gid               uint32
-	_Pad0             uint32   // explicit padding for u64 alignment
-	FileSize          uint64
-	CtimeSec          uint64
-	CtimeNsec         uint64
-	AtimeSec          uint64
-	AtimeNsec         uint64
-	MtimeSec          uint64
-	MtimeNsec         uint64
-	CreationTimeSec   uint64
-	CreationTimeNsec  uint64
-	Nlinks            uint32
-	NumExtentsInline  uint32
-	ExtentInlineBase  uint64
-	NumExtentsTotal   uint64
-	inlineRegion      [256]byte
-	XattrOffset       uint64
-	XattrSize         uint64
-	ParentInode       uint64
-	Unused            uint32
-	Flags             uint32
-	DirTrieRoot       uint64
-	Rdev              uint64
-	Generation        uint64 // inode generation for stable NFS file handles
-	UserFlags         uint32
-	Reserved          [68]byte
+	InodeNumber      uint64
+	Magic            uint64 // C struct has __u64 magic
+	Filemode         uint32
+	Uid              uint32
+	Gid              uint32
+	_Pad0            uint32 // explicit padding for u64 alignment
+	FileSize         uint64
+	CtimeSec         uint64
+	CtimeNsec        uint64
+	AtimeSec         uint64
+	AtimeNsec        uint64
+	MtimeSec         uint64
+	MtimeNsec        uint64
+	CreationTimeSec  uint64
+	CreationTimeNsec uint64
+	Nlinks           uint32
+	NumExtentsInline uint32
+	ExtentInlineBase uint64
+	NumExtentsTotal  uint64
+	inlineRegion     [256]byte
+	XattrOffset      uint64
+	XattrSize        uint64
+	ParentInode      uint64
+	Unused           uint32
+	Flags            uint32
+	DirTrieRoot      uint64
+	Rdev             uint64
+	Generation       uint64 // inode generation for stable NFS file handles
+	UserFlags        uint32
+	Reserved         [68]byte
 }
 
 // InlineData returns the 256-byte raw inline data region of the inode.
@@ -80,20 +81,20 @@ func NewInode(ino uint64, mode uint32) *Inode {
 	sec := uint64(t.Unix()) // cast to uint64
 	nsec := uint64(t.Nanosecond())
 	return &Inode{
-		InodeNumber: ino,
-		Magic:       MagicInode,
-		Filemode:    mode,
-		Uid:         0, // root
-		Gid:         0, // root
-		FileSize:    0,
-		Nlinks:      1,
-		CtimeSec:    sec,
-		CtimeNsec:   nsec,
-		AtimeSec:    sec,
-		AtimeNsec:   nsec,
-		MtimeSec:    sec,
-		MtimeNsec:   nsec,
-		CreationTimeSec: sec,
+		InodeNumber:      ino,
+		Magic:            MagicInode,
+		Filemode:         mode,
+		Uid:              0, // root
+		Gid:              0, // root
+		FileSize:         0,
+		Nlinks:           1,
+		CtimeSec:         sec,
+		CtimeNsec:        nsec,
+		AtimeSec:         sec,
+		AtimeNsec:        nsec,
+		MtimeSec:         sec,
+		MtimeNsec:        nsec,
+		CreationTimeSec:  sec,
 		CreationTimeNsec: nsec,
 	}
 }

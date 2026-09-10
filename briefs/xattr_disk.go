@@ -38,10 +38,10 @@ type XattrHeader struct {
 //
 //go:briefs-disk size=8
 type XattrEntry struct {
-	NameLen      uint16
-	ValueLen     uint16
-	NameOffset   uint16
-	ValueOffset  uint16
+	NameLen     uint16
+	ValueLen    uint16
+	NameOffset  uint16
+	ValueOffset uint16
 }
 
 // XattrHeaderSize returns the on-disk header size for an xattr block of the

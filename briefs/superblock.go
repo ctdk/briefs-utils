@@ -11,30 +11,31 @@ import (
 	"time"
 )
 
-//go:briefs-disk size=1024
 // SuperblockLayout is the on-disk format (first 1KB block).
+//
+//go:briefs-disk size=1024
 type SuperblockLayout struct {
 	// Block 0: core fields
-	Magic       uint64
-	MajorVer    uint64  // Changed from uint32 to match C struct (8 bytes)
-	MinorVer    uint64  // Changed from uint32 to match C struct (8 bytes)
-	PatchVer    uint64  // Changed from uint32 to match C struct (8 bytes)
-	TotalBlocks uint64
-	DataBlocks  uint64
-	BlockSize   uint64
-	InodeSize   uint64
-	BlocksGrp   uint64
-	InodesGrp   uint64
-	FSCreated   uint64
-	FSLastMount uint64
-	FSLastChkpt uint64
+	Magic        uint64
+	MajorVer     uint64 // Changed from uint32 to match C struct (8 bytes)
+	MinorVer     uint64 // Changed from uint32 to match C struct (8 bytes)
+	PatchVer     uint64 // Changed from uint32 to match C struct (8 bytes)
+	TotalBlocks  uint64
+	DataBlocks   uint64
+	BlockSize    uint64
+	InodeSize    uint64
+	BlocksGrp    uint64
+	InodesGrp    uint64
+	FSCreated    uint64
+	FSLastMount  uint64
+	FSLastChkpt  uint64
 	FreeDataBlks uint64
-	FreeInodes  uint64
-	RootIno     uint64
-	FeatCompat  uint64
+	FreeInodes   uint64
+	RootIno      uint64
+	FeatCompat   uint64
 	FeatROCompat uint64
 	FeatIncompat uint64
-	UUID        [16]byte
+	UUID         [16]byte
 	// C struct: __u8 uuid[16] ends at byte 168. __u64 eat_offset follows
 	// at byte 168 (8-byte aligned, no padding needed). The comments in
 	// the C header (/* 176 */) are incorrect.
@@ -83,12 +84,12 @@ func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, labe
 	sb.Lay.TotalBlocks = totalBlocks
 	sb.Lay.BlockSize = blockSize
 	sb.Lay.InodeSize = inodeSize
-	sb.Lay.BlocksGrp = 1024  // TODO
-	sb.Lay.InodesGrp = 256   // TODO
+	sb.Lay.BlocksGrp = 1024 // TODO
+	sb.Lay.InodesGrp = 256  // TODO
 	sb.Lay.FSCreated = uint64(time.Now().Unix())
 	sb.Lay.FSLastMount = 0
 	sb.Lay.FSLastChkpt = 0
-	sb.Lay.FreeInodes = 0 // set by mkfs
+	sb.Lay.FreeInodes = 0   // set by mkfs
 	sb.Lay.FreeDataBlks = 0 // set by mkfs
 	sb.Lay.RootIno = 1
 

@@ -78,15 +78,15 @@ func TestAllocCoreProperty(t *testing.T) {
 // clamps at small block counts and the ceiling at the 64:1 fanout ratio.
 func TestAllocLevelWords(t *testing.T) {
 	cases := []struct {
-		blockCount      uint64
+		blockCount uint64
 		l0, l1, l2 uint64
 	}{
 		{0, 1, 1, 1},
 		{1, 1, 1, 1},
 		{64, 1, 1, 1},
 		{65, 1, 1, 2},
-		{4096, 1, 1, 64},  // 4096/64 = 64 L2 words, 1 L1, 1 L0
-		{5000, 1, 2, 79},  // ceil(5000/64)=79 L2, ceil(79/64)=2 L1, 1 L0
+		{4096, 1, 1, 64},       // 4096/64 = 64 L2 words, 1 L1, 1 L0
+		{5000, 1, 2, 79},       // ceil(5000/64)=79 L2, ceil(79/64)=2 L1, 1 L0
 		{1 << 18, 1, 64, 4096}, // 262144 blocks
 	}
 	for _, c := range cases {
@@ -97,6 +97,7 @@ func TestAllocLevelWords(t *testing.T) {
 		}
 	}
 }
+
 // TestPackAllocWords pins the shared word packer: block count, little-endian
 // layout, and zero padding of the tail block. Both AllocBuilder.packWords
 // (whole pool images) and the FUSE Allocator's Sync (single levels) round-trip
