@@ -78,29 +78,131 @@ func triePageHasNameHeap(pg *briefs.TriePage, blockSize uint64, nameSize uint16)
 	return uint64(pg.FreeNameOff)+uint64(nameSize) <= blockSize-uint64(triePageDataEnd())
 }
 
+// triePageCompactNames reclaims dead name-heap space on a trie page.  A port
+// of trie_page_compact_names (trie_page.c:427).
+//
+// The name heap is a bump allocator whose high-water mark (FreeNameOff) grows
+// from the end of the block toward the slot array and is never decremented when
+// a node is freed: trieFreeNode zeroes the freed slot (clearing its
+// NameOffset/NameLen) but leaves its name bytes orphaned above the live names.
+// Under create/delete-heavy directories (e.g. generic/007's nametest churn) the
+// heap fills with dead space from freed nodes while only a handful of names
+// stay live, until a fresh allocation fails ENOSPC even though most of the heap
+// is unused.
+//
+// Compaction rewrites every live node's name compactly from the end of the
+// block, reclaiming all dead space, and resets FreeNameOff to the live total.
+// Only the name heap is repacked; node references (block, slot) and trie
+// structure are untouched.  The compacted layout is persisted by the caller
+// (saveBlock) regardless of whether the triggering allocation ultimately
+// succeeds — the compacted heap is a valid state either way.  Reports whether
+// the page was compacted; on any anomaly (corrupt node) it aborts without
+// modifying the page so the caller's ENOSPC surfaces a real error rather than
+// scrambling the heap.
+func triePageCompactNames(buf []byte, pg *briefs.TriePage) bool {
+	blockSize := uint64(len(buf))
+	oldOff := pg.FreeNameOff
+	if oldOff == 0 {
+		return false
+	}
+	liveSlots := ^pg.FreeSlots
+
+	// Pass 1: copy each live node's name into the scratch buffer, in slot
+	// order.  A freed slot (bit set in FreeSlots) was zeroed and has
+	// NameOffset == 0; its orphaned name bytes are the dead space skipped
+	// here and reclaimed below.  A live INTERM-only node also has
+	// NameOffset == 0 (it stores no name) and is skipped.  Validate each
+	// name against the heap bounds; on any anomaly abort without modifying
+	// the page.
+	tmp := make([]byte, oldOff)
+	tmpUsed := uint16(0)
+	for slot := uint(0); slot < briefs.TrieSlotsPerBlock; slot++ {
+		if liveSlots&(1<<slot) == 0 {
+			continue // free slot
+		}
+		n, err := briefs.ReadTrieSlot(buf, slot)
+		if err != nil {
+			return false
+		}
+		noff, nlen := n.NameOffset, n.NameLen
+		if noff == 0 || nlen == 0 {
+			continue // live node without a stored name
+		}
+		if uint64(noff) > uint64(oldOff) || uint64(nlen) > uint64(noff) ||
+			uint64(tmpUsed)+uint64(nlen) > uint64(oldOff) {
+			return false // corrupt heap; leave untouched
+		}
+		nameStart := int(blockSize) - int(noff)
+		copy(tmp[tmpUsed:], buf[nameStart:nameStart+int(nlen)])
+		tmpUsed += nlen
+	}
+
+	// Pass 2: rewrite the names compactly from the end of the block,
+	// re-iterating in the same slot order so each name is read from its
+	// scratch-buffer position.  The compact region lies within the old
+	// heap, but writes draw from the scratch buffer, so no live name is
+	// clobbered before it is copied.
+	tmpUsed = 0
+	newOff := uint16(0)
+	for slot := uint(0); slot < briefs.TrieSlotsPerBlock; slot++ {
+		if liveSlots&(1<<slot) == 0 {
+			continue
+		}
+		n, err := briefs.ReadTrieSlot(buf, slot)
+		if err != nil {
+			return false
+		}
+		noff, nlen := n.NameOffset, n.NameLen
+		if noff == 0 || nlen == 0 {
+			continue
+		}
+		newOff += nlen
+		n.NameOffset = newOff
+		putSlot(buf, slot, n)
+		nameStart := int(blockSize) - int(newOff)
+		copy(buf[nameStart:], tmp[tmpUsed:tmpUsed+nlen])
+		tmpUsed += nlen
+	}
+
+	pg.FreeNameOff = newOff
+	return true
+}
+
 // triePageAllocName allocates name-heap space for a node, reusing an existing
 // allocation if it is large enough.  Sets the node's name_offset and name_len.
-// Returns ENOSPC if the heap is full.
-func triePageAllocName(pg *briefs.TriePage, slot *briefs.TrieSlot, blockSize uint64, nameLen int) error {
+// On a full heap it first compacts dead name space (triePageCompactNames) and
+// retries, mirroring trie_page_alloc_name (trie_page.c:510); reports whether
+// compaction rewrote the page (the compacted layout must be persisted even
+// when the allocation still fails).  Returns ENOSPC only when the heap is
+// genuinely full of live names.
+func (b *BrieFS) triePageAllocName(buf []byte, pg *briefs.TriePage, slot *briefs.TrieSlot, nameLen int) (bool, error) {
 	if nameLen == 0 {
-		return nil
+		return false, nil
 	}
 	if nameLen > briefs.BrieFSMaxNameLen {
-		return syscall.ENAMETOOLONG
+		return false, syscall.ENAMETOOLONG
 	}
 	nameSize := uint16(nameLen + 2)
 	// Reuse an existing allocation that is large enough.
 	if slot.NameOffset > 0 && slot.NameLen >= nameSize {
-		return nil
+		return false, nil
 	}
-	if uint64(pg.FreeNameOff)+uint64(nameSize) > blockSize-uint64(triePageDataEnd()) {
-		return syscall.ENOSPC
+	if uint64(pg.FreeNameOff)+uint64(nameSize) > uint64(len(buf))-uint64(triePageDataEnd()) {
+		// Heap full against the slot array.  FreeNameOff is a monotonic
+		// high-water mark never decremented on free, so freed nodes'
+		// name bytes accumulate as dead space.  Compact the heap to
+		// reclaim it, then recheck; if still no room, the heap is
+		// genuinely full of live names.
+		compacted := triePageCompactNames(buf, pg)
+		if uint64(pg.FreeNameOff)+uint64(nameSize) > uint64(len(buf))-uint64(triePageDataEnd()) {
+			return compacted, syscall.ENOSPC
+		}
 	}
 	newOff := pg.FreeNameOff + nameSize
 	pg.FreeNameOff = newOff
 	slot.NameOffset = newOff
 	slot.NameLen = nameSize
-	return nil
+	return false, nil
 }
 
 // addPartial adds a block to the partial-page pool (deduped).
@@ -333,7 +435,18 @@ func (b *BrieFS) trieStoreName(ref uint64, name string) error {
 	if err != nil {
 		return err
 	}
-	if err := triePageAllocName(pg, s, b.blockSize, len(name)); err != nil {
+	compacted, err := b.triePageAllocName(buf, pg, s, len(name))
+	if err != nil {
+		if compacted {
+			// The allocation failed but compaction rewrote the heap
+			// into a valid, denser state — persist it regardless
+			// (kernel parity: trie_page_compact_names marks the
+			// buffer dirty even when its caller still fails).
+			putPage(buf, pg)
+			if serr := b.saveBlock(block, buf); serr != nil {
+				return serr
+			}
+		}
 		return err
 	}
 	if len(name) == 0 {
@@ -560,18 +673,37 @@ func (b *BrieFS) trieSplitLeaf(cur, child uint64, pos int, bval uint8, name stri
 
 	// If split at the last byte, store the new name on the internal node.
 	if pos == nameLen-1 {
-		ibuf2, inode2, err := b.trieRead(internal)
+		ibuf2, _, err := b.trieRead(internal)
 		if err == nil {
-			inode2.NodeType = briefs.NodeTypeInterm | briefs.NodeStatusLeaf
+			// Store the name before committing the LEAF bit +
+			// inode.  trieStoreName can fail (ENOSPC if the page's
+			// name heap is full of live names, EIO on a bad page).
+			// Setting the LEAF bit and inode first and ignoring that
+			// error would leave a nameless leaf (LEAF + inode,
+			// NameLen 0) that TrieLookup can never match, making the
+			// entry unfindable and orphaning its inode
+			// (generic/089).  On failure the split's structural
+			// change — a new INTERM reparenting the old leaf — is
+			// valid trie state, so just return the error and let the
+			// caller unwind the directory op.  (Kernel trie.c:587.)
+			if err := b.trieStoreName(internal, name); err != nil {
+				return 0, err
+			}
+			// trieStoreName rewrote the slot's name fields in the
+			// shared page buffer; re-parse so the LEAF-bit
+			// writeback does not clobber them with a stale
+			// snapshot.
+			inode2, rerr := briefs.ReadTrieSlot(ibuf2, uint(briefs.TrieRefSlot(internal)))
+			if rerr != nil {
+				return 0, rerr
+			}
+			inode2.NodeType |= briefs.NodeStatusLeaf
 			inode2.FType = ftype
 			inode2.Inode = ino
 			putSlot(ibuf2, uint(briefs.TrieRefSlot(internal)), inode2)
 			if err := b.saveBlock(briefs.TrieRefBlock(internal), ibuf2); err != nil {
 				return 0, err
 			}
-		}
-		if err := b.trieStoreName(internal, name); err != nil {
-			return 0, err
 		}
 	}
 	return internal, nil
@@ -622,14 +754,35 @@ func (b *BrieFS) TrieInsert(di *briefs.Inode, name string, ino uint64, ftype uin
 							return syscall.EEXIST
 						}
 					}
+					// Store the name before committing the
+					// LEAF bit + inode.  This existing INTERM
+					// node may have been freed and re-allocated
+					// (zeroed, NameOffset/NameLen == 0) since it
+					// last held a leaf, so trieStoreName may
+					// need a fresh name-heap allocation that
+					// can fail (ENOSPC, EIO).  Setting the LEAF
+					// bit and inode first would leave a
+					// nameless leaf (LEAF + inode, NameLen 0)
+					// that TrieLookup can never match,
+					// orphaning the inode (generic/089).
+					// Propagate the error so the op fails
+					// cleanly instead.  (Kernel trie.c:662.)
+					if err := b.trieStoreName(existing, name); err != nil {
+						return err
+					}
+					// trieStoreName rewrote the slot's name
+					// fields in the shared page buffer;
+					// re-parse so the LEAF-bit writeback does
+					// not clobber them with a stale snapshot.
+					cnode, err = briefs.ReadTrieSlot(cbuf, uint(briefs.TrieRefSlot(existing)))
+					if err != nil {
+						return err
+					}
 					cnode.NodeType |= briefs.NodeStatusLeaf
 					cnode.FType = ftype
 					cnode.Inode = ino
 					putSlot(cbuf, uint(briefs.TrieRefSlot(existing)), cnode)
-					if err := b.saveBlock(briefs.TrieRefBlock(existing), cbuf); err != nil {
-						return err
-					}
-					return b.trieStoreName(existing, name)
+					return b.saveBlock(briefs.TrieRefBlock(existing), cbuf)
 				}
 				// Existing pure leaf: check duplicate, then split.
 				ename, _ := briefs.ReadTrieName(cbuf, cnode.NameLen, cnode.NameOffset)
@@ -653,14 +806,32 @@ func (b *BrieFS) TrieInsert(di *briefs.Inode, name string, ino uint64, ftype uin
 				_ = b.trieFreeNode(newLeaf)
 				return err
 			}
+			// Store the name before committing the leaf.
+			// trieCreateChild pre-reserved name-heap space for this
+			// node, so the store normally reuses that reservation;
+			// but it can still fail (ENOSPC if the page's heap is
+			// full of live names, EIO on a bad page).  Committing the
+			// leaf first would leave a nameless leaf (LEAF + inode,
+			// NameLen 0) that TrieLookup can never match, orphaning
+			// the inode (generic/089).  Free the freshly created node
+			// and propagate the error.  (Kernel trie.c:720.)
+			if err := b.trieStoreName(newLeaf, name); err != nil {
+				_ = b.trieFreeNode(newLeaf)
+				return err
+			}
+			// trieStoreName rewrote the slot's name fields in the
+			// shared page buffer; re-parse before the leaf commit so
+			// the writeback carries the stored name fields, not a
+			// stale snapshot.
+			lnode, err = briefs.ReadTrieSlot(lbuf, uint(briefs.TrieRefSlot(newLeaf)))
+			if err != nil {
+				return err
+			}
 			lnode.NodeType = 0
 			lnode.FType = ftype
 			lnode.Inode = ino
 			putSlot(lbuf, uint(briefs.TrieRefSlot(newLeaf)), lnode)
-			if err := b.saveBlock(briefs.TrieRefBlock(newLeaf), lbuf); err != nil {
-				return err
-			}
-			return b.trieStoreName(newLeaf, name)
+			return b.saveBlock(briefs.TrieRefBlock(newLeaf), lbuf)
 		}
 
 		// Middle byte: find or create an INTERM child.
