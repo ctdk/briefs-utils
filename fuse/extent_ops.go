@@ -381,11 +381,13 @@ func (b *BrieFS) punchHole(in *briefs.Inode, off, size uint64) error {
 		return nil // punch over an all-hole range: nothing to persist
 	}
 	// Boundary blocks were zeroed but the extent list is unchanged:
-	// persist the inode (times) and the zeroed blocks, metadata-only.
-	if err := b.dev.Fdatasync(); err != nil {
-		b.failWrite()
-		return err
-	}
+	// persist the inode (times) and the zeroed blocks, metadata-only.  The
+	// zeroed blocks flush through the pre-commit drain (armed BEFORE the
+	// record, so a concurrent sync cannot commit it unflushed) rather than
+	// an immediate Fdatasync — kernel parity: the zeroing is a page-cache
+	// write the kernel leaves to writeback, and the drain lets concurrent
+	// ops coalesce into one device flush at the next journal sync.
+	b.markDataDrain()
 	if err := b.journalInodeFull(in); err != nil {
 		b.failWrite()
 		return err
@@ -781,11 +783,11 @@ func (b *BrieFS) zeroRangeOp(in *briefs.Inode, off, size uint64, mode uint32) er
 	}
 
 	// No extent change: persist the inode (times, possible growth) and the
-	// zeroed partial blocks via the metadata-only commit.
-	if err := b.dev.Fdatasync(); err != nil {
-		b.failWrite()
-		return err
-	}
+	// zeroed partial blocks via the metadata-only commit.  Like the punch
+	// boundary path above, the zeroed blocks flush through the pre-commit
+	// drain instead of an immediate Fdatasync (kernel parity: lazy
+	// writeback; concurrent ops coalesce into one flush at the next sync).
+	b.markDataDrain()
 	if err := b.journalInodeFull(in); err != nil {
 		b.failWrite()
 		return err
@@ -861,6 +863,13 @@ func (b *BrieFS) truncateInode(ino uint64, newSize uint64) error {
 
 // zeroEofTailBlock zeroes [size, block_end) of the block containing @size, if
 // that block is mapped and written. Mirrors briefs_zero_eof_tail (defensive).
+// The zeroing goes to the device page cache with NO flush here — kernel
+// parity: the kernel leaves the zeroed tail to writeback.  The callers own
+// durability: truncate-up arms markDataDrain at the call site (the tail is
+// inside the new size, so the next sync must flush it before the size record
+// commits), and truncate-down's tail is beyond the new EOF where a lost
+// zeroing is unobservable; its extent change (if any) commits through
+// commitExtentChange, which arms its own drain.
 func (b *BrieFS) zeroEofTailBlock(exts []briefs.Extent, size uint64) error {
 	bs := b.blockSize
 	blk := (size - 1) / bs
@@ -869,10 +878,7 @@ func (b *BrieFS) zeroEofTailBlock(exts []briefs.Extent, size uint64) error {
 		return nil
 	}
 	abs := ext.Phys + (blk - ext.Offset)
-	if err := b.zeroBlockTail(abs, size%bs); err != nil {
-		return err
-	}
-	return b.dev.Fdatasync()
+	return b.zeroBlockTail(abs, size%bs)
 }
 
 // setattrOp applies a VFS setattr (chmod/chown/utimes/truncate) to an inode,
