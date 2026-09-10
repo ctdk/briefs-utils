@@ -94,17 +94,31 @@ func (b *BrieFS) readFileData(ino uint64, dest []byte, off int64) ([]byte, error
 	}
 
 	// Walk extents (inline array or B+ tree) in ascending offset order.
+	// readBuf is zero-initialized for the whole clamped range, so holes,
+	// unwritten extents, and the tail region past the last extent read as
+	// zeros without any work here — kernel parity: generic_file_read_iter
+	// serves zero pages for iomap holes and returns the full byte count.
+	// Mapped bytes are copied at their ABSOLUTE positions in readBuf.
+	// Returning only the extent-covered byte count (a running total) would
+	// short-read any range that starts in a hole (a truncate-up tail read
+	// returned 0 bytes) and mis-offset data after a hole.
 	exts, err := collectInodeExtents(b.dev.File(), diskInode, b.blockSize)
 	if err != nil {
 		return nil, err
 	}
-	readPos := int64(0)
 	for _, ext := range exts {
 		extStart := int64(ext.Offset) * blockSize
 		extEnd := extStart + int64(ext.Len)*blockSize
 		if off >= extEnd || endOff <= extStart {
 			continue
 		}
+
+		// Hole or unwritten (fallocate) extent: reads as zeros — the buffer
+		// is already zeroed.
+		if ext.Phys == 0 || ext.Flags&briefs.ExtentFlagUnwritten != 0 {
+			continue
+		}
+
 		readStart := off
 		if readStart < extStart {
 			readStart = extStart
@@ -112,26 +126,6 @@ func (b *BrieFS) readFileData(ino uint64, dest []byte, off int64) ([]byte, error
 		readEnd := endOff
 		if readEnd > extEnd {
 			readEnd = extEnd
-		}
-
-		if ext.Phys == 0 || ext.Flags&briefs.ExtentFlagUnwritten != 0 {
-			// Hole or unwritten (fallocate) extent: the region reads as zeros.
-			zeroStart := off
-			if zeroStart < extStart {
-				zeroStart = extStart
-			}
-			zeroEnd := endOff
-			if zeroEnd > extEnd {
-				zeroEnd = extEnd
-			}
-			bufPos := zeroStart - off
-			bufLen := zeroEnd - zeroStart
-			if bufPos >= 0 && bufLen > 0 && bufPos < int64(len(readBuf)) {
-				for i := bufPos; i < bufPos+bufLen && i < int64(len(readBuf)); i++ {
-					readBuf[i] = 0
-				}
-			}
-			continue
 		}
 
 		// Iterate over block boundaries (not readStart, which may be mid-block)
@@ -152,11 +146,10 @@ func (b *BrieFS) readFileData(ino uint64, dest []byte, off int64) ([]byte, error
 			if copyEnd > blkEnd {
 				copyEnd = blkEnd
 			}
-			nc := copy(readBuf[readPos:], buf[copyStart-blkOff:copyEnd-blkOff])
-			readPos += int64(nc)
+			copy(readBuf[copyStart-off:], buf[copyStart-blkOff:copyEnd-blkOff])
 		}
 	}
-	return readBuf[:readPos], nil
+	return readBuf, nil
 }
 
 // collectInodeExtents returns every extent of an inode in ascending offset
