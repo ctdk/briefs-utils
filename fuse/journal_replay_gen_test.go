@@ -184,6 +184,12 @@ func TestCrashSlotReuseReplay(t *testing.T) {
 		t.Fatalf("create a: %v", err)
 	}
 	writeFile(t, b, a.InodeNumber, makePattern(3, 2000), 0)
+	// Fix C defers the write's journal sync; commit like an fsync would so
+	// "a"'s records are durable (and thus replayable as the stale records
+	// the guard must skip) before the slot is reused.
+	if err := b.journal.Sync(false); err != nil {
+		t.Fatalf("journal sync: %v", err)
+	}
 	if err := b.unlinkInDir(1, "a", false); err != nil {
 		t.Fatalf("unlink a: %v", err)
 	}
@@ -197,6 +203,11 @@ func TestCrashSlotReuseReplay(t *testing.T) {
 	}
 	pat := makePattern(5, 3000)
 	writeFile(t, b, bIn.InodeNumber, pat, 0)
+	// Commit "b"'s records the same way; without this the crash model says
+	// the write never happened and post-replay size is 0 (unsynced op).
+	if err := b.journal.Sync(false); err != nil {
+		t.Fatalf("journal sync: %v", err)
+	}
 
 	// "Crash": close WITHOUT the unmount checkpoint.
 	b.dev.Close()

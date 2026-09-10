@@ -63,6 +63,7 @@ func openBridge(t *testing.T, imgPath string) *BrieFS {
 	}
 	j.SetAllocatorSyncer(bfs)
 	j.SetMetaSyncer(bfs)
+	j.SetDataDrainer(bfs)
 	bfs.journal = j
 	return bfs
 }

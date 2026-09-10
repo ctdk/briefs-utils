@@ -62,15 +62,15 @@ type Journal struct {
 	blockSize uint64
 
 	// Ring buffer state.
-	curBlock     []byte // current 4096-byte journal block under construction
-	blockSeq     uint32 // monotonic per-block sequence (cur_hdr->block_seq)
-	writeOffset  uint64 // byte offset of next record within curBlock
-	writePos     uint64 // journal block number curBlock will be written to
-	syncedPos    uint64 // journal blocks before this are durably on disk
-	journalStart uint64
-	journalEnd   uint64
-	checkpointBlk uint64
-	checkpointSeq uint64
+	curBlock               []byte // current 4096-byte journal block under construction
+	blockSeq               uint32 // monotonic per-block sequence (cur_hdr->block_seq)
+	writeOffset            uint64 // byte offset of next record within curBlock
+	writePos               uint64 // journal block number curBlock will be written to
+	syncedPos              uint64 // journal blocks before this are durably on disk
+	journalStart           uint64
+	journalEnd             uint64
+	checkpointBlk          uint64
+	checkpointSeq          uint64
 	recordsSinceCheckpoint uint32
 	// blocksSinceCheckpoint counts ring positions advanced (writePos moves)
 	// since the last checkpoint.  It is the only discriminator between the
@@ -79,8 +79,8 @@ type Journal struct {
 	// live): on disk the two states are identical, so the sync-time
 	// back-pressure needs this history.  Reset wherever logStart is reset.
 	blocksSinceCheckpoint uint32
-	dirty        bool
-	inCheckpoint bool
+	dirty                 bool
+	inCheckpoint          bool
 
 	// inReplay is set during journal replay at mount. While set, WriteRecord
 	// is a no-op: replay re-derives metadata from existing records and must
@@ -92,6 +92,7 @@ type Journal struct {
 
 	allocSyncer AllocatorSyncer
 	metaSyncer  MetaSyncer
+	dataDrainer DataDrainer
 }
 
 // NewJournal initializes a Journal from an already-loaded superblock and an
@@ -107,16 +108,16 @@ func NewJournal(sb *SuperblockLayout, file *os.File, blockSize uint64) (*Journal
 		blockSize = JournalBlockSize
 	}
 	j := &Journal{
-		sb:          sb,
-		file:        file,
-		blockSize:   blockSize,
-		journalStart: sb.JournalOffset,
-		journalEnd:   sb.JournalOffset + sb.JournalBlocks,
+		sb:            sb,
+		file:          file,
+		blockSize:     blockSize,
+		journalStart:  sb.JournalOffset,
+		journalEnd:    sb.JournalOffset + sb.JournalBlocks,
 		checkpointBlk: sb.JournalOffset + sb.JournalBlocks - 1,
 		checkpointSeq: sb.CheckpointSeq,
-		writePos:    sb.JournalLogStart,
-		syncedPos:   sb.JournalLogStart,
-		curBlock:    make([]byte, JournalBlockSize),
+		writePos:      sb.JournalLogStart,
+		syncedPos:     sb.JournalLogStart,
+		curBlock:      make([]byte, JournalBlockSize),
 	}
 	if err := j.validate(); err != nil {
 		return nil, err
@@ -142,6 +143,23 @@ type MetaSyncer interface {
 
 // SetMetaSyncer wires the deferred-metadata drain after construction.
 func (j *Journal) SetMetaSyncer(s MetaSyncer) { j.metaSyncer = s }
+
+// DataDrainer flushes buffered extent-op data before the commit point.  The
+// FUSE bridge writes new data and btree node blocks to the device page cache
+// and defers their journal sync (kernel parity: the buffered-write path only
+// appends records — the JRN_EXTENT_ALLOC sites in btree.c — and the journal
+// syncs solely on explicit fsync/sync_fs, which drain the data first,
+// file.c:103-180).  The commit point below publishes those ops' INODE_FULL
+// snapshots, and replay trusts the btree root pointers without re-deriving
+// node contents, so the new blocks must reach the disk BEFORE log_end
+// advances.  The bridge's implementation is flag-gated: a no-op when no
+// buffered extent op is pending.
+type DataDrainer interface {
+	DrainPendingData() error
+}
+
+// SetDataDrainer wires the pre-commit data drain after construction.
+func (j *Journal) SetDataDrainer(s DataDrainer) { j.dataDrainer = s }
 
 func (j *Journal) validate() error {
 	if j.journalEnd <= j.journalStart {
@@ -338,6 +356,20 @@ func (j *Journal) syncLocked(checkpoint bool) error {
 	}
 	j.initCurBlock(j.blockSeq + 1)
 	j.dirty = false
+
+	// Pre-commit data drain: buffered extent ops leave new data and btree
+	// node blocks in the device page cache with their journal sync deferred
+	// (kernel parity: records-only buffered writes, btree.c).  The commit
+	// point below publishes their INODE_FULL snapshots, and replay trusts
+	// the btree root pointers without re-deriving node contents — so those
+	// blocks must be durable BEFORE log_end advances (the kernel gets this
+	// ordering from fsync's file_write_and_wait_range preceding the journal
+	// sync, file.c:103-180).
+	if j.dataDrainer != nil {
+		if err := j.dataDrainer.DrainPendingData(); err != nil {
+			return fmt.Errorf("briefs: drain pending data: %w", err)
+		}
+	}
 
 	// Commit point: advance log_end and persist the superblock BEFORE the
 	// metadata flush.  Replay is idempotent, so committing before the flush

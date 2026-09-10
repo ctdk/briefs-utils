@@ -1026,6 +1026,12 @@ func (b *BrieFS) truncateLocked(in *briefs.Inode, newSize uint64) error {
 		if err := b.zeroEofTailBlock(exts, oldSize); err != nil {
 			return err
 		}
+		// The tail zeroing is a page-cache write that the INODE_FULL record
+		// below publishes (the new size covers the zeroed tail); arm the
+		// pre-commit drain so the next journal sync flushes it before the
+		// commit point (kernel parity: fsync's file_write_and_wait_range
+		// precedes the journal sync).
+		b.markDataDrain()
 	}
 	in.FileSize = newSize
 	sec, nsec := nowTime()

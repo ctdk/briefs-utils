@@ -90,6 +90,14 @@ type BrieFS struct {
 	// references it.  Guarded by dirtyMu like dirtyBlocks.
 	pendingFrees []uint64
 
+	// dataDrainPending is set by buffered extent ops (commitExtentChange and
+	// friends, file_ops.go): new data and btree node blocks are in the device
+	// page cache while their journal records wait uncommitted.  The next
+	// journal sync drains them BEFORE its commit point (DataDrainer hook,
+	// journal_write.go) because replay trusts btree root pointers without
+	// re-deriving node contents.  Guarded by dirtyMu; cleared by the drain.
+	dataDrainPending bool
+
 	// Replay-private maps (journal_replay.go). Non-nil only during
 	// replayJournal; nil otherwise.
 	xattrFinal map[uint64]uint64 // ino -> final xattr_offset (last JRN_INODE_FULL wins)
@@ -169,6 +177,7 @@ func Mount(imagePath string, opts MountOptions) error {
 	}
 	journal.SetAllocatorSyncer(bfs)
 	journal.SetMetaSyncer(bfs)
+	journal.SetDataDrainer(bfs)
 	bfs.journal = journal
 
 	// Replay the journal before serving: a crash (or dm-flakey simulated power

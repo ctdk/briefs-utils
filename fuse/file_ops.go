@@ -31,13 +31,17 @@
 //     here the allocated blocks are returned to the allocator and the cache is
 //     aborted — nothing has been journaled, so the on-disk state is unchanged.
 //
-//  2. Journal + drain + commit: write JRN_EXTENT_ALLOC for every new block and
-//     JRN_EXTENT_FREE for the replaced btree nodes, fdatasync (drain the data
-//     and btree nodes to disk), write the JRN_INODE_FULL snapshot, commit the
-//     journal (journal.Sync), then free the old btree nodes in memory and flush
-//     the inode block. The inode block is flushed AFTER the commit because it
-//     is snapshot-trusted: replay overwrites it from JRN_INODE_FULL, so a crash
-//     before the flush leaves the old on-disk inode, which replay repairs.
+//  2. Journal + defer (fix C, kernel parity): write JRN_EXTENT_ALLOC for
+//     every new block and JRN_EXTENT_FREE for the replaced btree nodes and the
+//     JRN_INODE_FULL snapshot — records only, no per-op journal sync (the
+//     kernel's buffered-write path, btree.c).  The new data and btree-node
+//     blocks stay in the device page cache, armed for the next sync's
+//     pre-commit drain (markDataDrain / DataDrainer: the sync must flush them
+//     BEFORE its commit point because replay trusts the published btree root);
+//     the frees wait in pendingFrees for the post-commit SyncMeta, and the
+//     inode block is deferred like every metadata op (writeInodeOwned).  A
+//     crash before the next sync loses records and page cache together — the
+//     unsynced op never happened.
 //
 // Inline-data writes keep their data in the inode block itself, which the
 // JRN_INODE_FULL snapshot carries: the write journals the snapshot and defers
@@ -455,29 +459,46 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 	return len(data), nil
 }
 
-// commitExtentChange journals and durably commits an extent-index change shared
-// by the write, fallocate, and truncate paths. allocatedRels are the new data +
-// btree-node blocks (already written to the page cache); freedAbs and
-// oldNodesAbs are data blocks / old btree nodes being freed. Ordering:
-// JRN_EXTENT_ALLOC -> drain -> JRN_INODE_FULL -> JRN_EXTENT_FREE -> Sync, so a
-// partial commit by a concurrent op's Sync can never publish the new root
-// without the drained blocks nor free blocks the on-disk inode still references.
-// The inode block is written after the commit (snapshot-trusted). The caller
-// must hold the inode's inodeBlockLock and have already mutated @in (size,
-// extents, times) in memory.
+// commitExtentChange journals an extent-index change shared by the write,
+// fallocate, and truncate paths. allocatedRels are the new data + btree-node
+// blocks (already written to the page cache); freedAbs and oldNodesAbs are
+// data blocks / old btree nodes being freed. The caller must hold the inode's
+// inodeBlockLock and have already mutated @in (size, extents, times) in
+// memory.
+//
+// Fix C (kernel parity): the kernel's buffered-write path journals its extent
+// records with NO per-op sync — the JRN_EXTENT_ALLOC sites in btree.c just
+// append records, and the journal syncs only on explicit fsync/sync_fs/
+// umount (file.c:103-180, dir.c:25).  The bridge used to run a full journal
+// sync plus two device flushes per extent mutation (~2.4 device syncs per
+// buffered op; the fuse 63-HANG throughput family).  This commit now only
+// writes records:
+//
+//   - the op's new data and btree node blocks stay in the device page cache;
+//     markDataDrain arms the pre-commit drain (DataDrainer hook) so the next
+//     journal sync flushes them BEFORE its commit point — replay trusts the
+//     btree root pointer published by the INODE_FULL record and does not
+//     re-derive node contents.
+//   - the frees go to pendingFrees (deferBlockFree) and apply to the
+//     in-memory allocator only at the next sync's SyncMeta, which runs after
+//     the commit point — a freed block can never be reused while the last
+//     committed on-disk state still references it (generic/040/041 class).
+//   - the inode block is deferred (writeInodeOwned) like every metadata op
+//     (fix B) and drained after the commit point.
+//
+// Crash model: a crash before the next sync loses the records and the page
+// cache together — the unsynced op never happened.
 func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels, freedAbs, oldNodesAbs []uint64) error {
 	ino := in.InodeNumber
+	// Arm the pre-commit drain before the first record: a concurrent journal
+	// sync (fsync on another file, setxattr) must not commit these records
+	// without first flushing the new data and btree nodes they publish.
+	b.markDataDrain()
 	for _, rel := range allocatedRels {
 		if err := b.journalExtentAlloc(ino, 0, b.dataRegionStart+rel); err != nil {
 			b.failWrite()
 			return err
 		}
-	}
-	// Drain new data + btree nodes before the snapshot commits (replay trusts
-	// the btree root pointer; it does not re-derive node contents).
-	if err := b.dev.Fdatasync(); err != nil {
-		b.failWrite()
-		return err
 	}
 	if err := b.journalInodeFull(in); err != nil {
 		b.failWrite()
@@ -495,29 +516,17 @@ func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels, freedAbs, o
 			return err
 		}
 	}
-	if err := b.journal.Sync(false); err != nil {
-		b.failWrite()
-		return err
-	}
-	// The freeing records are committed by the Sync above, so the frees can
-	// apply now; freeBlockNow also drops any deferred copy a concurrent op
-	// may have merged for these blocks (a freed node must not shadow or
-	// clobber its next owner).
+	// The frees apply when their records commit: SyncMeta (after the next
+	// sync's commit point) takes them from pendingFrees.  deferBlockFree also
+	// drops any deferred copy of the block, so it cannot shadow reads of —
+	// or clobber the drain for — the block's next owner.
 	for _, abs := range freedAbs {
-		b.freeBlockNow(abs)
+		b.deferBlockFree(abs)
 	}
 	for _, abs := range oldNodesAbs {
-		b.freeBlockNow(abs)
+		b.deferBlockFree(abs)
 	}
-	if err := b.writeInodeDirect(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	if err := b.dev.Fdatasync(); err != nil {
-		b.failWrite()
-		return err
-	}
-	return nil
+	return b.writeInodeOwned(in)
 }
 
 // writeInodeDirect reads the inode-table block, patches the inode's slot with

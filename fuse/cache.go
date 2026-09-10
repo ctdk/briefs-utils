@@ -224,6 +224,45 @@ func (b *BrieFS) SyncMeta() error {
 	return nil
 }
 
+// markDataDrain records that the current op left new data and/or btree node
+// blocks in the device page cache whose journal records are not yet
+// committed.  The journal's next sync must flush them before its commit
+// point (DrainPendingData below): replay trusts the btree root pointers
+// published by the INODE_FULL records, so the blocks must be on disk before
+// log_end advances past those records.  Kernel parity: the kernel gets this
+// ordering from the fsync path itself — file_write_and_wait_range drains the
+// data before the journal sync (file.c:103-180).
+func (b *BrieFS) markDataDrain() {
+	b.dirtyMu.Lock()
+	b.dataDrainPending = true
+	b.dirtyMu.Unlock()
+}
+
+// DrainPendingData flushes the device page cache when a buffered extent op
+// marked a pending drain.  Implements briefs.DataDrainer; the journal calls
+// it before persisting its commit point.  The mark is CLAIMED (cleared) before
+// the flush, so an op that marks concurrently with the drain re-arms it for
+// the next sync — a plain read-then-clear could lose a mark that arrived
+// between the flush and the clear, leaving that op's records committable
+// without a data drain.  On flush failure the mark is restored so a later
+// sync retries.
+func (b *BrieFS) DrainPendingData() error {
+	b.dirtyMu.Lock()
+	pending := b.dataDrainPending
+	b.dataDrainPending = false
+	b.dirtyMu.Unlock()
+	if !pending {
+		return nil
+	}
+	if err := b.dev.Fdatasync(); err != nil {
+		b.dirtyMu.Lock()
+		b.dataDrainPending = true
+		b.dirtyMu.Unlock()
+		return err
+	}
+	return nil
+}
+
 // flushDirtyMeta drains the deferred-metadata map and fdatasyncs.  Used by
 // the sync entry points that can run with a clean journal (the records were
 // committed by an earlier sync but this deferred content merged after it):

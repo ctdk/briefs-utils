@@ -16,10 +16,10 @@ func setattrReq(valid uint32, opts ...func(*fuseSetAttrIn)) *fuseSetAttrIn {
 	return r
 }
 
-func withSize(s uint64) func(*fuseSetAttrIn)  { return func(r *fuseSetAttrIn) { r.size = s } }
-func withMode(m uint32) func(*fuseSetAttrIn)  { return func(r *fuseSetAttrIn) { r.mode = m } }
-func withUID(u uint32) func(*fuseSetAttrIn)   { return func(r *fuseSetAttrIn) { r.uid = u } }
-func withGID(g uint32) func(*fuseSetAttrIn)   { return func(r *fuseSetAttrIn) { r.gid = g } }
+func withSize(s uint64) func(*fuseSetAttrIn) { return func(r *fuseSetAttrIn) { r.size = s } }
+func withMode(m uint32) func(*fuseSetAttrIn) { return func(r *fuseSetAttrIn) { r.mode = m } }
+func withUID(u uint32) func(*fuseSetAttrIn)  { return func(r *fuseSetAttrIn) { r.uid = u } }
+func withGID(g uint32) func(*fuseSetAttrIn)  { return func(r *fuseSetAttrIn) { r.gid = g } }
 
 // TestFallocatePreallocate covers KEEP_SIZE preallocate (unwritten extents that
 // read as zeros and convert on write) and plain preallocate (grows size).
@@ -159,6 +159,11 @@ func TestTruncate(t *testing.T) {
 	if di.FileSize != 1000 {
 		t.Fatalf("truncate down size: want 1000, got %d", di.FileSize)
 	}
+	// Fix C defers the frees to the next journal sync's SyncMeta (records
+	// commit first); commit like an fsync would, then the blocks are free.
+	if err := b.journal.Sync(false); err != nil {
+		t.Fatalf("journal sync: %v", err)
+	}
 	if got := b.dataAlloc.FreeCount(); got <= freeBefore {
 		t.Fatalf("truncate down did not free blocks: %d -> %d", freeBefore, got)
 	}
@@ -225,7 +230,7 @@ func TestKillpriv(t *testing.T) {
 	}
 
 	// security.capability is cleared on a write.
-	if err := b.setXattr(ino, "security.capability", []byte{0,0,0,1,2,3,4,5,6,7,8,9,0,1,2,3}, 0); err != nil {
+	if err := b.setXattr(ino, "security.capability", []byte{0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3}, 0); err != nil {
 		t.Fatalf("set security.capability: %v", err)
 	}
 	if got, _ := b.getXattr(ino, "security.capability"); len(got) == 0 {
@@ -277,6 +282,11 @@ func TestFallocateCollapseRange(t *testing.T) {
 	di, _ := b.inodes.ReadInode(ino)
 	if di.FileSize != uint64(3*bs) {
 		t.Fatalf("after collapse: size want %d, got %d", 3*bs, di.FileSize)
+	}
+	// Fix C defers the free to the next journal sync's SyncMeta; commit
+	// like an fsync would, then the removed block is free.
+	if err := b.journal.Sync(false); err != nil {
+		t.Fatalf("journal sync: %v", err)
 	}
 	if got := b.dataAlloc.FreeCount(); got != freeBefore+1 {
 		t.Fatalf("collapse must free the removed block: free %d -> %d (want +1)", freeBefore, got)
