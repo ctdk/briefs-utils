@@ -36,6 +36,22 @@ type Allocator struct {
 	// whose words changed since the last Sync, so Sync rewrites only those.
 	// L0/L1 are small summaries and are rewritten wholesale whenever dirty.
 	l2Dirty map[uint64]bool
+	// reclaim, when non-nil, is called once after a failed allocation scan
+	// (BrieFS.reclaimPendingFrees on the data allocator): it commits the
+	// journal so blocks freed earlier in this session — whose frees are
+	// deferred until their records commit (BrieFS.deferBlockFree) — become
+	// reusable, and reports whether a reclaim was attempted.  The kernel
+	// needs no such hook: kjournald commits every few seconds and sync(2)
+	// reaches the fs, so a deferred free never starves an allocation for
+	// long.  The bridge syncs only on explicit fsync/umount (kernel parity,
+	// dir.c:25) and a FUSE mount never receives SYNCFS (the 6.12 client
+	// sets fc->sync_fs only for fuseblk, inode.c:1742), so delete-then-write
+	// workloads would ENOSPC with thousands of blocks pending.  The hook
+	// keeps the crash model intact: a block becomes reusable only after its
+	// freeing record is durable, because the journal sync commits the
+	// record BEFORE SyncMeta applies the free (cache.go).  nil on allocators
+	// that never see deferred frees (the inode allocator, test instances).
+	reclaim func() bool
 }
 
 // OpenAllocator reads the allocator pool from disk and initializes the in-memory bitmap.
@@ -96,8 +112,20 @@ func (a *Allocator) AllocBlockMeta() uint64 {
 
 // allocBlock is the shared single-block allocator, mirroring the kernel's
 // __briefs_alloc_block (alloc.c:193).  forMeta selects whether the metadata
-// shield applies.
+// shield applies.  A failed scan gets one reclaim retry (see Allocator.reclaim):
+// with frees deferred to their records' commit, the in-memory bitmap can be
+// exhausted while thousands of freed blocks are merely pending — the retry
+// commits them and scans again.
 func (a *Allocator) allocBlock(forMeta bool) uint64 {
+	rel := a.tryAllocBlock(forMeta)
+	if rel == 0 && a.reclaim != nil && a.reclaim() {
+		rel = a.tryAllocBlock(forMeta)
+	}
+	return rel
+}
+
+// tryAllocBlock is allocBlock's single scan pass.
+func (a *Allocator) tryAllocBlock(forMeta bool) uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -186,7 +214,15 @@ func (a *Allocator) AllocBlocks(n uint64) uint64 {
 	if a.l0 == nil || n == 0 {
 		return 0
 	}
+	rel := a.tryAllocBlocks(n)
+	if rel == 0 && a.reclaim != nil && a.reclaim() {
+		rel = a.tryAllocBlocks(n)
+	}
+	return rel
+}
 
+// tryAllocBlocks is AllocBlocks' single scan pass (the body under the lock).
+func (a *Allocator) tryAllocBlocks(n uint64) uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -425,12 +461,23 @@ func (a *Allocator) Shield() uint64 {
 // freeCount minus metaShield, clamped at zero.  Statfs reports this so df
 // shows the data-allocatable free space (kernel super.c:799-804).
 func (a *Allocator) FreeCountData() uint64 {
+	return a.FreeCountDataPlus(0)
+}
+
+// FreeCountDataPlus is FreeCountData counting extra additional blocks as
+// free — the data blocks whose freeing records are journal-committed but
+// whose frees are still pending (BrieFS.pendingFrees).  They are reusable
+// (an allocation reclaims them by committing the journal first), so df must
+// report them; the kernel gets the same effect from its commit thread and
+// wired sync(2), neither of which exists on a FUSE mount (inode.c:1742).
+func (a *Allocator) FreeCountDataPlus(extra uint64) uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.freeCount <= a.metaShield {
+	avail := a.freeCount + extra
+	if avail <= a.metaShield {
 		return 0
 	}
-	return a.freeCount - a.metaShield
+	return avail - a.metaShield
 }
 
 // Allocated reports whether the given data-relative block (or inode, for the

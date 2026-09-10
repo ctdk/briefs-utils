@@ -65,6 +65,9 @@ func openBridge(t *testing.T, imgPath string) *BrieFS {
 	j.SetMetaSyncer(bfs)
 	j.SetDataDrainer(bfs)
 	bfs.journal = j
+	// The deferred-free reclaim hook Mount wires on the data allocator
+	// (see fuse.go): a failed allocation commits pending frees and retries.
+	dataAlloc.reclaim = bfs.reclaimPendingFrees
 	return bfs
 }
 

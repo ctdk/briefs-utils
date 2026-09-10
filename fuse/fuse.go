@@ -180,6 +180,12 @@ func Mount(imagePath string, opts MountOptions) error {
 	journal.SetDataDrainer(bfs)
 	bfs.journal = journal
 
+	// Deferred-free reclaim: a failed data allocation commits the journal
+	// once and retries when frees are pending (cache.go reclaimPendingFrees).
+	// Only the data allocator sees deferred frees; the inode allocator never
+	// has a free path.
+	dataAlloc.reclaim = bfs.reclaimPendingFrees
+
 	// Replay the journal before serving: a crash (or dm-flakey simulated power
 	// failure) leaves a live range [log_start, log_end) that re-derives
 	// directory tries, restores inode/symlink/xattr blocks, and reserves
@@ -562,7 +568,11 @@ func (n *brieFSNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Er
 	// f_bfree/f_bavail exclude the meta_shield: those blocks are reserved
 	// for the future B+tree metadata of outstanding unwritten-extent
 	// reservations, not available to data writers (kernel super.c:799-804).
-	out.Bfree = n.bfs.dataAlloc.FreeCountData()
+	// Blocks with journal-recorded but uncommitted frees count as free: a
+	// writer reclaims them by committing the journal (reclaimPendingFrees),
+	// and the kernel gets the same df behavior from its commit thread and
+	// wired sync(2), neither of which a FUSE mount has (inode.c:1742).
+	out.Bfree = n.bfs.dataAlloc.FreeCountDataPlus(n.bfs.pendingFreeCount())
 	out.Bavail = out.Bfree
 	out.Files = n.bfs.inodeAlloc.TotalBlocks()
 	out.Ffree = n.bfs.inodeAlloc.FreeCount()

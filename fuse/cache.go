@@ -32,6 +32,7 @@ package fuse
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/ctdk/briefs-utils/briefs"
 )
@@ -165,6 +166,51 @@ func (b *BrieFS) deferBlockFree(abs uint64) {
 	b.pendingFrees = append(b.pendingFrees, rel)
 	delete(b.dirtyBlocks, abs)
 	b.dirtyMu.Unlock()
+}
+
+// pendingFreeCount returns the number of data blocks whose freeing records
+// are journaled but not yet committed — free to a writer (an allocation
+// reclaims them via reclaimPendingFrees) but not yet back in the allocator's
+// in-memory bitmap.  Statfs reports them so df matches what a write can
+// actually obtain.
+func (b *BrieFS) pendingFreeCount() uint64 {
+	b.dirtyMu.Lock()
+	defer b.dirtyMu.Unlock()
+	return uint64(len(b.pendingFrees))
+}
+
+// reclaimPendingFrees implements Allocator.reclaim for the data allocator:
+// called when an allocation scan found nothing.  If frees are pending, it
+// syncs the journal, which commits their freeing records and then applies
+// the frees to the in-memory bitmap (SyncMeta, called by the journal after
+// its commit point), and reports true so the allocator retries.  One shot,
+// no loop: if the retry still finds nothing the allocation fails with
+// ENOSPC, exactly like the kernel's exhausted bitmap.
+//
+// This is the structural replacement for the kernel's commit thread +
+// sync(2): a regular FUSE mount never receives SYNCFS (the 6.12 client sets
+// fc->sync_fs only for fuseblk, inode.c:1742, and go-fuse has no handler
+// either), so without this hook delete-then-write workloads ENOSPC while
+// thousands of freed blocks sit pending — the generic/275 shape (rm, sync,
+// dd still writes 0 bytes).  The crash-safety ordering is unchanged from
+// deferBlockFree's contract: the sync commits the freeing record BEFORE
+// SyncMeta applies the free, so a reused block's previous freeing is always
+// durable (no 040/041-class reuse-before-commit clobber).
+func (b *BrieFS) reclaimPendingFrees() bool {
+	if b.journal == nil {
+		return false
+	}
+	if b.pendingFreeCount() == 0 {
+		return false
+	}
+	if err := b.journal.Sync(false); err != nil {
+		// The caller fails its allocation and surfaces ENOSPC; log the
+		// underlying I/O error so the daemon log shows it is not a
+		// genuine out-of-space condition.
+		fmt.Fprintf(os.Stderr, "briefs: reclaim sync: %v\n", err)
+		return false
+	}
+	return true
 }
 
 // freeBlockNow returns a data block to the in-memory allocator immediately,
