@@ -72,3 +72,56 @@ func TestCrashRecovery(t *testing.T) {
 	_ = b2.journal.Checkpoint()
 	_ = b2.dev.Sync()
 }
+
+// TestCrashFreshSlotWriteThroughIsolation pins the slot-granularity of
+// writeThroughFreshInodeSlot: arming a fresh inode's slot must not publish
+// sibling slots' uncommitted deferred state to the device.  The unlink below
+// empties the root trie and defers the parent inode with DirTrieRoot=0 (and
+// the trie page's free); the following create's fresh-slot write-through
+// shares the parent's inode-table block.  A whole-block read-modify-write
+// read through the dirty view and wrote the parent's uncommitted state along
+// with the fresh slot, so this crash left the on-disk root pointing at no
+// trie while the trie page stayed bitmap-allocated (fsck: "allocated but NOT
+// referenced" on the slot-reuse crash test).  The kernel avoids this by
+// construction: its buffer heads are per-slot, so arming one slot never
+// writes another.
+func TestCrashFreshSlotWriteThroughIsolation(t *testing.T) {
+	mkfs := buildMkfs(t)
+	img := mkfsImage(t, mkfs, 5000)
+	b := openBridge(t, img)
+
+	a, err := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false)
+	if err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+	writeFile(t, b, a.InodeNumber, makePattern(3, 2000), 0)
+	// Unlink with NOTHING committed: the parent inode (trie emptied,
+	// DirTrieRoot=0) and the trie page free sit in the deferred map.
+	if err := b.unlinkInDir(1, "a", false); err != nil {
+		t.Fatalf("unlink a: %v", err)
+	}
+
+	// The fresh "b" slot reuses "a"'s slot, in the parent's inode-table
+	// block: the write-through must arm only the slot, not the parent's
+	// deferred state.
+	bIn, err := b.createInDir(1, "b", briefs.ModeFile|0o644, 1000, 1000, false)
+	if err != nil {
+		t.Fatalf("create b: %v", err)
+	}
+	if bIn.InodeNumber != a.InodeNumber {
+		t.Fatalf("slot not reused: b=%d a=%d", bIn.InodeNumber, a.InodeNumber)
+	}
+	writeFile(t, b, bIn.InodeNumber, makePattern(5, 3000), 0)
+
+	// "Crash" with no journal sync at all: every op above never happened, so
+	// the on-disk state must still be a consistent pristine filesystem
+	// (plus benign armed-slot and data-block residue).
+	b.dev.Close()
+
+	fsck := buildBinary(t, "github.com/ctdk/briefs-utils/cmd/fsck", "fsck.briefs")
+	if out, err := exec.Command(fsck, img).CombinedOutput(); err != nil {
+		t.Fatalf("fsck after crash: %v\n%s", err, out)
+	} else if !contains(string(out), "FSCK COMPLETE: no errors found") {
+		t.Fatalf("fsck not clean after crash:\n%s", out)
+	}
+}

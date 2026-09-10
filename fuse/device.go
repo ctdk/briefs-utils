@@ -120,6 +120,24 @@ func (bd *BlockDevice) WriteBlock(blockNum uint64, data []byte) error {
 	return nil
 }
 
+// WriteBlockSlot writes a sub-block range: len(data) bytes at offsetInBlock
+// within the given block.  Inode-table blocks pack 8 slots per 4096-byte
+// block; the write-through of a fresh inode's slot must not read-modify-
+// write the whole block, because sibling slots can hold uncommitted deferred
+// state that must not reach the page cache ahead of its journal records
+// (writeThroughFreshInodeSlot).
+func (bd *BlockDevice) WriteBlockSlot(blockNum uint64, offsetInBlock uint64, data []byte) error {
+	if offsetInBlock+uint64(len(data)) > bd.blockSize {
+		return fmt.Errorf("write slot in block %d: range [%d+%d) exceeds block size %d",
+			blockNum, offsetInBlock, len(data), bd.blockSize)
+	}
+	offset := int64(blockNum*bd.blockSize + offsetInBlock)
+	if _, err := bd.file.WriteAt(data, offset); err != nil {
+		return fmt.Errorf("write slot in block %d: %w", blockNum, err)
+	}
+	return nil
+}
+
 // BlockSize returns the device block size in bytes.
 func (bd *BlockDevice) BlockSize() uint64 {
 	return bd.blockSize

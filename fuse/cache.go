@@ -344,31 +344,41 @@ func (b *BrieFS) zeroInodeCached(ino uint64) error {
 // without the write-through, a mid-op crash (records committed by another
 // op's sync, the slot never written) would make the guard skip restoring the
 // fresh inode.  Under the FUSE crash model (kill -9; the page cache
-// survives) a plain WriteBlock is as durable as the journal block itself.
+// survives) a slot write is as durable as the journal block itself.
 //
-// Only the fresh inode's slot is patched in: the block is read through the
-// dirty view (NOT from the per-op cache, which may hold mid-op mutations of
-// OTHER inodes sharing this block — e.g. a rename target mid-removal — that
-// must not reach the page cache before the journal commits the records
-// justifying them).  The patched block is written to the page cache AND
-// upserted into the deferred-metadata map, so a later drain can never
-// regress the page cache to a version without the fresh slot; the op cache
-// is untouched, and the op's merge (which includes the fresh slot via
-// writeInodeCached) supersedes the map entry at op end.
+// The write is slot-granular (WriteBlockSlot), NOT a whole-block read-
+// modify-write: sibling slots in the same 4096-byte inode block can hold
+// uncommitted state — in the per-op cache of the running op, or deferred in
+// the write-back map by earlier ops — and a whole-block write would publish
+// it to the page cache ahead of the journal records justifying it.  That
+// was TestCrashSlotReuseReplay's failure: unlink emptied the root trie and
+// deferred the parent inode with DirTrieRoot=0; the next create's whole-block
+// write-through dragged that onto disk, so a crash left the root pointing at
+// no trie while the trie page stayed allocated (fsck: allocated but not
+// referenced).  The kernel avoids this by construction: buffer heads are
+// per-slot, so arming one slot never writes another.
+//
+// If the deferred map holds this block, the slot is also patched into the
+// stored copy: the next drain must not regress the page cache to a version
+// without the fresh slot.  The op cache is untouched, and the op's merge
+// (which includes the fresh slot via writeInodeCached) supersedes the map
+// entry at op end.
 func (b *BrieFS) writeThroughFreshInodeSlot(in *briefs.Inode) error {
 	blk, off := b.inodes.inodeLocation(in.InodeNumber)
-	buf, err := b.dev.ReadBlock(blk)
-	if err != nil {
-		return err
-	}
 	data, err := in.MarshalBinary()
 	if err != nil {
 		return err
 	}
-	copy(buf[off:], data)
-	if err := b.dev.WriteBlock(blk, buf); err != nil {
+	if err := b.dev.WriteBlockSlot(blk, off, data); err != nil {
 		return err
 	}
-	b.setDirtyBlock(blk, buf)
+	b.dirtyMu.Lock()
+	if cur, ok := b.dirtyBlocks[blk]; ok {
+		merged := make([]byte, len(cur))
+		copy(merged, cur)
+		copy(merged[off:], data)
+		b.dirtyBlocks[blk] = merged
+	}
+	b.dirtyMu.Unlock()
 	return nil
 }
