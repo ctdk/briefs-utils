@@ -195,10 +195,14 @@ func (bd *BlockDevice) Fdatasync() error {
 
 // noteWB records that blockNum was written and now holds unflushed page-cache
 // data.  WriteBlock and WriteBlockSlot call it on every write.  Once the
-// tracked set exceeds pendingWritebackCap, the excess is drained inline so a
-// write-heavy caller that never fsyncs cannot grow the set without bound; the
-// drain blocks until writeback completes, which is the same back-pressure the
-// page cache itself applies.
+// tracked set exceeds pendingWritebackCap, the excess is kicked out inline so
+// a write-heavy caller that never fsyncs cannot grow the set without bound.
+// The kick only STARTS writeback (SYNC_FILE_RANGE_WRITE, no WAIT flags): the
+// write path never stalls on disk — back-pressure is left to the kernel's own
+// dirty-page throttling, which is where the kernel module's write path gets
+// its back-pressure too.  Correctness is unaffected: a kicked block dropped
+// from the set is still flushed by the next commit-time FlushPendingWB's end
+// Fdatasync, and kill -9 never loses kernel page cache.
 func (bd *BlockDevice) noteWB(blockNum uint64) {
 	bd.wbMu.Lock()
 	if bd.pendingWB == nil {
@@ -210,8 +214,52 @@ func (bd *BlockDevice) noteWB(blockNum uint64) {
 	if over {
 		// Best-effort: an error here (e.g. writeback EIO) surfaces at the
 		// next explicit flush, where callers already handle it.
-		_ = bd.FlushPendingWB()
+		_ = bd.kickPendingWB()
 	}
+}
+
+// kickPendingWB starts writeback for every tracked block without waiting for
+// it (noteWB's over-cap path): snapshot+clear the set, then SYNC_FILE_RANGE_
+// WRITE over the coalesced runs.  This bounds the tracked set while keeping
+// the write path off the disk-queue critical path; FlushPendingWB is the
+// variant that waits.
+func (bd *BlockDevice) kickPendingWB() error {
+	blocks := bd.takePendingWB()
+	if blocks == nil {
+		return nil
+	}
+
+	var first, last uint64
+	for i, b := range blocks {
+		if i > 0 && b == last+1 {
+			last = b
+			continue
+		}
+		if i > 0 {
+			if err := bd.kickWBRange(first, last); err != nil {
+				return err
+			}
+		}
+		first, last = b, b
+	}
+	return bd.kickWBRange(first, last)
+}
+
+// kickWBRange starts (does not wait for) writeback of blocks [first,last].
+func (bd *BlockDevice) kickWBRange(first, last uint64) error {
+	off := int64(first * bd.blockSize)
+	length := int64((last - first + 1) * bd.blockSize)
+	err := unix.SyncFileRange(int(bd.file.Fd()), off, length, unix.SYNC_FILE_RANGE_WRITE)
+	if err == nil {
+		return nil
+	}
+	if err != syscall.ENOSYS && err != syscall.EINVAL {
+		return fmt.Errorf("kick writeback blocks [%d,%d]: %w", first, last, err)
+	}
+	// No sync_file_range: nothing to fall back to that starts-without-waiting;
+	// the tracked set was already cleared, so the blocks are simply untracked
+	// and the next commit-time flush's device-level sync covers them.
+	return nil
 }
 
 // FlushPendingWB starts writeback for every block written since the last flush
@@ -223,19 +271,10 @@ func (bd *BlockDevice) noteWB(blockNum uint64) {
 // lost, device cache intact), so writeback-complete is durable; the single
 // remaining device flush per fsync and at unmount covers power-fail parity.
 func (bd *BlockDevice) FlushPendingWB() error {
-	bd.wbMu.Lock()
-	if len(bd.pendingWB) == 0 {
-		bd.wbMu.Unlock()
+	blocks := bd.takePendingWB()
+	if blocks == nil {
 		return nil
 	}
-	blocks := make([]uint64, 0, len(bd.pendingWB))
-	for b := range bd.pendingWB {
-		blocks = append(blocks, b)
-	}
-	bd.pendingWB = make(map[uint64]struct{})
-	bd.wbMu.Unlock()
-
-	sort.Slice(blocks, func(i, j int) bool { return blocks[i] < blocks[j] })
 
 	// Coalesce into contiguous runs so a burst of adjacent writes (extent
 	// data, allocator pool rewrites) drains in one sync_file_range call.
@@ -273,6 +312,23 @@ func (bd *BlockDevice) syncWBRange(first, last uint64) error {
 		return fmt.Errorf("sync file range (sync fallback): %w", serr)
 	}
 	return nil
+}
+
+// takePendingWB removes and returns the sorted snapshot of tracked blocks, or
+// nil when nothing is tracked.
+func (bd *BlockDevice) takePendingWB() []uint64 {
+	bd.wbMu.Lock()
+	defer bd.wbMu.Unlock()
+	if len(bd.pendingWB) == 0 {
+		return nil
+	}
+	blocks := make([]uint64, 0, len(bd.pendingWB))
+	for b := range bd.pendingWB {
+		blocks = append(blocks, b)
+	}
+	bd.pendingWB = make(map[uint64]struct{})
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i] < blocks[j] })
+	return blocks
 }
 
 // FlushWB implements briefs.WBFlusher (the journal's targeted writeback-flush
