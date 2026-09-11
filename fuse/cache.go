@@ -335,7 +335,11 @@ func (b *BrieFS) DrainPendingData() error {
 	if !pending {
 		return nil
 	}
-	if err := b.dev.Fdatasync(); err != nil {
+	// Targeted flush (sync_file_range over the tracked blocks) instead of a
+	// whole-device Fdatasync: writeback-complete is durable under the kill-9
+	// crash model, and the per-commit device cache flush was the 074/103/
+	// 476 hang family.
+	if err := b.dev.FlushPendingWB(); err != nil {
 		b.dirtyMu.Lock()
 		b.dataDrainPending = true
 		b.dirtyMu.Unlock()
@@ -359,7 +363,10 @@ func (b *BrieFS) flushDirtyMeta() error {
 	if err := b.SyncMeta(); err != nil {
 		return err
 	}
-	return b.dev.Fdatasync()
+	// Writeback-complete flush of the just-drained blocks; Fsync's single
+	// trailing device flush (and unmount's dev.Sync) provide power-fail
+	// parity on top.
+	return b.dev.FlushPendingWB()
 }
 
 // cacheDrop removes a block from the op cache without writing it, for paths

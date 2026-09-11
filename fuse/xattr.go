@@ -300,8 +300,8 @@ func (b *BrieFS) commitXattrOp(in *briefs.Inode, absBlocks []uint64, bufs [][]by
 	}
 	// The new xattr blocks were written above (re-derivable via XATTR_DATA on
 	// crash, but flushed now so the non-crash path sees them without waiting
-	// for replay); Fdatasync below flushes the whole file.
-	if err := b.dev.Fdatasync(); err != nil {
+	// for replay); the targeted writeback flush covers just those blocks.
+	if err := b.dev.FlushPendingWB(); err != nil {
 		b.failWrite()
 		return err
 	}
@@ -309,7 +309,7 @@ func (b *BrieFS) commitXattrOp(in *briefs.Inode, absBlocks []uint64, bufs [][]by
 		b.failWrite()
 		return err
 	}
-	if err := b.dev.Fdatasync(); err != nil {
+	if err := b.dev.FlushPendingWB(); err != nil {
 		b.failWrite()
 		return err
 	}

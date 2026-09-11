@@ -178,6 +178,7 @@ func Mount(imagePath string, opts MountOptions) error {
 	journal.SetAllocatorSyncer(bfs)
 	journal.SetMetaSyncer(bfs)
 	journal.SetDataDrainer(bfs)
+	journal.SetWBFlusher(dev)
 	bfs.journal = journal
 
 	// Deferred-free reclaim: a failed data allocation commits the journal
@@ -688,23 +689,27 @@ func (n *brieFSNode) Write(ctx context.Context, f fs.FileHandle, data []byte, of
 }
 
 // Fsync flushes file data and metadata to disk.  Mirrors the kernel fsync
-// path (file.c: briefs_file_fsync): drain the data first (filemap_write_and_
-// wait equivalent), commit the journal — which drains the deferred-metadata
-// map after the commit point — then, for the case the journal was already
-// clean but deferred blocks merged after the last commit, drain those too.
-// It takes no lock: dev.Sync and journal.Sync are internally synchronized,
-// the deferred-map drain orders through dirtyMu, and Fsync mutates nothing.
+// path (file.c: briefs_file_fsync): commit the journal — which drains the
+// buffered data before the commit point and the deferred-metadata map after
+// it, each to writeback completion — then, for the case the journal was
+// already clean but deferred blocks merged after the last commit, drain those
+// too, and finish with ONE device cache flush for power-fail parity with the
+// kernel's blkdev_issue_flush (82c9a61).  The old leading dev.Sync was a
+// second whole-device fsync per fsync, on top of the per-commit ones — the
+// fsx-family hang ladder.  Fsync takes no lock: the journal, the device
+// flush, and the deferred-map drain are internally synchronized, and Fsync
+// mutates nothing.
 func (n *brieFSNode) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) syscall.Errno {
 	if n.bfs.readOnly {
 		return syscall.EROFS
-	}
-	if err := n.bfs.dev.Sync(); err != nil {
-		return syscall.EIO
 	}
 	if err := n.bfs.journal.Sync(false); err != nil {
 		return syscall.EIO
 	}
 	if err := n.bfs.flushDirtyMeta(); err != nil {
+		return syscall.EIO
+	}
+	if err := n.bfs.dev.Fdatasync(); err != nil {
 		return syscall.EIO
 	}
 	return 0

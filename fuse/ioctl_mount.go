@@ -268,5 +268,5 @@ func (b *BrieFS) fslabelSetOp(input []byte) error {
 	if err := b.dev.WriteBlock(0, buf); err != nil {
 		return err
 	}
-	return b.dev.Fdatasync()
+	return b.dev.FlushPendingWB()
 }

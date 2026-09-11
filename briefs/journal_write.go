@@ -21,6 +21,9 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // Journal ring geometry bounds (match briefs_journal.h).
@@ -93,6 +96,7 @@ type Journal struct {
 	allocSyncer AllocatorSyncer
 	metaSyncer  MetaSyncer
 	dataDrainer DataDrainer
+	wbFlusher  WBFlusher
 }
 
 // NewJournal initializes a Journal from an already-loaded superblock and an
@@ -161,6 +165,66 @@ type DataDrainer interface {
 // SetDataDrainer wires the pre-commit data drain after construction.
 func (j *Journal) SetDataDrainer(s DataDrainer) { j.dataDrainer = s }
 
+// WBFlusher flushes the caller's tracked page-cache writes to writeback
+// completion.  The FUSE bridge implements it over BlockDevice.FlushPendingWB
+// (sync_file_range over just the blocks written since the last flush) so
+// journal-commit barriers drain targeted ranges instead of whole-device
+// fsyncs — the 2026-09 fuse 63-HANG family was one device cache flush per
+// commit taking seconds on the VM's virtio disk.  Standalone users (tests,
+// fsck, mkfs) leave it nil and get the previous whole-file Sync behavior.
+type WBFlusher interface {
+	FlushWB() error
+}
+
+// SetWBFlusher wires the targeted writeback flush after construction.
+func (j *Journal) SetWBFlusher(f WBFlusher) { j.wbFlusher = f }
+
+// syncWB drains the caller's page-cache writes to writeback completion: the
+// bridge-side equivalent of the kernel's sync_dirty_buffer() flush of dirty
+// metadata buffers at commit, NOT the whole-device fsync the old
+// j.file.Sync() issued.  Writeback-complete is durable under the crash model
+// (kill -9 loses the page cache, not the device cache); the bridge issues one
+// device flush per fsync and at unmount for power-fail parity.
+func (j *Journal) syncWB() error {
+	if j.wbFlusher != nil {
+		if err := j.wbFlusher.FlushWB(); err != nil {
+			return fmt.Errorf("briefs: flush tracked writeback: %w", err)
+		}
+		return nil
+	}
+	return j.file.Sync()
+}
+
+// writeThrough writes data at off and waits for its writeback to complete:
+// WriteAt + sync_file_range(WAIT_BEFORE|WRITE|WAIT_AFTER).  The kernel writes
+// journal and superblock blocks via mark_buffer_dirty and completes each at
+// commit with sync_dirty_buffer (journal.c:426 comment); the bridge has no
+// buffer cache, so the equivalent is a write whose writeback is waited for.
+// sync_file_range deliberately does NOT flush the device cache (unlike
+// RWF_SYNC/RWF_DSYNC pwritev2, which the kernel routes through
+// vfs_fsync_range → blkdev_issue_flush).  Platforms without sync_file_range
+// fall back to WriteAt + whole-file Sync.
+func (j *Journal) writeThrough(off int64, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if _, err := j.file.WriteAt(data, off); err != nil {
+		return err
+	}
+	err := unix.SyncFileRange(int(j.file.Fd()), off, int64(len(data)),
+		unix.SYNC_FILE_RANGE_WAIT_BEFORE|unix.SYNC_FILE_RANGE_WRITE|unix.SYNC_FILE_RANGE_WAIT_AFTER)
+	if err == nil {
+		return nil
+	}
+	if err != syscall.ENOSYS && err != syscall.EINVAL {
+		return err
+	}
+	if serr := j.file.Sync(); serr != nil {
+		return fmt.Errorf("write-through (sync fallback): %w", serr)
+	}
+	return nil
+}
+
 func (j *Journal) validate() error {
 	if j.journalEnd <= j.journalStart {
 		return fmt.Errorf("briefs: invalid journal geometry [start=%d end=%d)",
@@ -205,7 +269,11 @@ func (j *Journal) writeBlock(block uint64, data []byte) error {
 			block, j.journalStart, j.journalEnd)
 	}
 	off := int64(block * j.blockSize)
-	if _, err := j.file.WriteAt(data, off); err != nil {
+	// Write-through: the block must be writeback-complete before the commit
+	// point (log_end) advances past it, so replay never trusts a record whose
+	// block is still only in the page cache.  The kernel gets this ordering
+	// from sync_dirty_buffer over [sync_start, sync_end] at commit.
+	if err := j.writeThrough(off, data); err != nil {
 		return fmt.Errorf("briefs: write journal block %d: %w", block, err)
 	}
 	return nil
@@ -411,10 +479,12 @@ func (j *Journal) syncLocked(checkpoint bool) error {
 		}
 	}
 
-	// Metadata flush (= sync_blockdev): the FUSE bridge has no buffer cache,
-	// so the handler's metadata WriteAt calls are already in the page cache;
-	// a single fdatasync flushes both them and the journal block above.
-	if err := j.file.Sync(); err != nil {
+	// Metadata flush (= sync_blockdev, targeted): the deferred-metadata drain
+	// and allocator persist above wrote blocks into the page cache; complete
+	// their writeback (syncWB → the bridge's tracked-block sync_file_range,
+	// or whole-file Sync for standalone users).  The old j.file.Sync() here
+	// was a whole-device fsync per commit — the fsync-path hang family.
+	if err := j.syncWB(); err != nil {
 		return fmt.Errorf("briefs: metadata flush: %w", err)
 	}
 	j.syncedPos = j.writePos
@@ -511,12 +581,21 @@ func (j *Journal) checkpointLocked(flushPending bool) error {
 	// AB-BA with alloc->lock.  The FUSE bridge holds the global fs mutex
 	// across each op, so the journal mu is uncontended; we keep it held
 	// (the release/re-acquire would be a no-op for correctness).
-	if err := j.file.Sync(); err != nil {
+	if err := j.syncWB(); err != nil {
 		return fmt.Errorf("briefs: checkpoint metadata flush: %w", err)
 	}
 	if j.allocSyncer != nil {
 		if err := j.allocSyncer.SyncAllocators(); err != nil {
 			return fmt.Errorf("briefs: sync allocators: %w", err)
+		}
+		// The checkpoint block snapshots the allocator pools (free counts,
+		// trie root); those pool blocks must be durable BEFORE the checkpoint
+		// block is written, or a crash after the checkpoint leaves it
+		// referencing pool blocks whose old contents are still on disk.  The
+		// old code ordered this correctly only by accident: its whole-device
+		// Sync below flushed pools and checkpoint block together, after.
+		if err := j.syncWB(); err != nil {
+			return fmt.Errorf("briefs: checkpoint allocator flush: %w", err)
 		}
 	}
 
@@ -559,10 +638,9 @@ func (j *Journal) checkpointLocked(flushPending bool) error {
 	j.recordsSinceCheckpoint = 0
 	j.blocksSinceCheckpoint = 0
 
-	// Persist the updated superblock (free counts + new log boundaries).
-	if err := j.file.Sync(); err != nil {
-		return fmt.Errorf("briefs: checkpoint block flush: %w", err)
-	}
+	// The checkpoint block itself was written write-through above and the
+	// allocator pools were flushed before it, so no barrier is needed here;
+	// persist the updated superblock (free counts + new log boundaries).
 	return j.syncSuperblock()
 }
 
@@ -579,10 +657,14 @@ func (j *Journal) syncSuperblock() error {
 		return fmt.Errorf("briefs: marshal superblock: %w", err)
 	}
 	copy(buf, data)
-	if _, err := j.file.WriteAt(buf, 0); err != nil {
+	// Write-through: the superblock write IS the commit point (log_end /
+	// checkpoint state), so it must not sit in the page cache while replay
+	// could act on it.  The old file.Sync() here was a whole-device fsync
+	// per commit — the 521/522/642/748/750 fsync-path hang family.
+	if err := j.writeThrough(0, buf); err != nil {
 		return fmt.Errorf("briefs: write superblock: %w", err)
 	}
-	return j.file.Sync()
+	return nil
 }
 
 // Close flushes any pending records.  Callers that want a clean unmount

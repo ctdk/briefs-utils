@@ -10,10 +10,10 @@
 //
 // BrieFS has no buffer cache, so the kernel's "mark_buffer_dirty + lazy
 // writeback" becomes direct WriteBlock into the backing file's page cache,
-// and the kernel's sync_dirty_buffer in briefs_trie_page_init becomes
-// dev.Sync() (fdatasync) so a freshly allocated trie page is durable before
-// any later journal record that traverses into it can be committed (the
-// generic/065 bad-magic family).
+// and the kernel's sync_dirty_buffer in briefs_trie_page_init becomes the
+// deferred-metadata drain at the next journal sync, so a freshly allocated
+// trie page is writeback-complete before any later journal record that
+// traverses into it can be committed (the generic/065 bad-magic family).
 //
 // All slot/page reads and writes go through the shared briefs.TrieSlot /
 // briefs.TriePage codec (briefs/trie_disk.go). Mutations load a *TrieSlot /
