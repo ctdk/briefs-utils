@@ -982,6 +982,12 @@ func (b *BrieFS) setattrOp(ino uint64, in *fuseSetAttrIn) error {
 // truncateLocked is the size-change path assuming the inode-block lock is held
 // (shared with truncateInode, which also locks). Mirrors briefs_setattr truncate.
 func (b *BrieFS) truncateLocked(in *briefs.Inode, newSize uint64) error {
+	// s_maxbytes: truncate past MAX_LFS_FILESIZE fails with EFBIG (kernel
+	// parity: inode_newsize_ok against sb->s_maxbytes = MAX_LFS_FILESIZE,
+	// super.c:495).
+	if newSize > uint64(maxFileSize) {
+		return syscall.EFBIG
+	}
 	if userFlagsImmutable(in) {
 		return syscall.EPERM
 	}

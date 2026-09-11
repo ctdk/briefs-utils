@@ -64,6 +64,13 @@ import (
 // carry their data in the inode.
 const inlineDataMax = 256
 
+// maxFileSize mirrors the kernel's s_maxbytes = MAX_LFS_FILESIZE (super.c:495):
+// no offset or file size may address past 2^63-1. Writes whose end would
+// exceed it fail with EFBIG (generic_write_checks parity, file.c:3483) and
+// the wrap-safe headroom comparison below is the file.c:3520 form — off +
+// len(data) itself would overflow int64 at these offsets.
+const maxFileSize = int64(^uint64(0) >> 1)
+
 // readFileData reads up to len(dest) bytes starting at off, mirroring the
 // kernel's briefs_read_iter (inline-data bypass + extent walk with zero-filled
 // holes). Returns the (possibly short) read buffer, clamped to the file size.
@@ -77,6 +84,12 @@ func (b *BrieFS) readFileData(ino uint64, dest []byte, off int64) ([]byte, error
 	}
 	blockSize := int64(b.blockSize)
 	endOff := off + int64(len(dest))
+	// Wrap-safe end: at the MAX_LFS_FILESIZE tail an off + len(dest) sum that
+	// spills past 2^63-1 would clamp to a negative endOff and size the read
+	// buffer negative (see the writeFileData s_maxbytes gate).
+	if endOff < off {
+		endOff = maxFileSize
+	}
 	if endOff > int64(diskInode.FileSize) {
 		endOff = int64(diskInode.FileSize)
 	}
@@ -113,6 +126,14 @@ func (b *BrieFS) readFileData(ino uint64, dest []byte, off int64) ([]byte, error
 	for _, ext := range exts {
 		extStart := int64(ext.Offset) * blockSize
 		extEnd := extStart + int64(ext.Len)*blockSize
+		// Wrap-safe final extent: the block past the MAX_LFS_FILESIZE tail
+		// overflows extStart + len*blockSize to negative, which the range
+		// tests below would read as "extent ends before the read" — the
+		// tail bytes would silently read as zeros (writeExtentData clamps
+		// the same sum; see its blockEnd wrap guard).
+		if extEnd < extStart {
+			extEnd = maxFileSize
+		}
 		if off >= extEnd || endOff <= extStart {
 			continue
 		}
@@ -133,15 +154,22 @@ func (b *BrieFS) readFileData(ino uint64, dest []byte, off int64) ([]byte, error
 		}
 
 		// Iterate over block boundaries (not readStart, which may be mid-block)
-		// so the within-block offset (copyStart - blkOff) is correct.
+		// so the within-block offset (copyStart - blkOff) is correct. The
+		// blkOff >= 0 guard stops the increment at the final block: past
+		// MAX_LFS_FILESIZE the next blkOff += blockSize wraps to INT64_MIN,
+		// which is still < readEnd and would process a phantom block whose
+		// within-block offsets go negative (generic/525 tail).
 		firstBlk := (readStart / blockSize) * blockSize
-		for blkOff := firstBlk; blkOff < readEnd; blkOff += blockSize {
+		for blkOff := firstBlk; blkOff < readEnd && blkOff >= 0; blkOff += blockSize {
 			absBlock := ext.Phys + uint64((blkOff-extStart)/blockSize)
 			buf, err := b.dev.ReadBlock(absBlock)
 			if err != nil {
 				return nil, err
 			}
 			blkEnd := blkOff + blockSize
+			if blkEnd < blkOff {
+				blkEnd = maxFileSize
+			}
 			copyStart := readStart
 			if copyStart < blkOff {
 				copyStart = blkOff
@@ -217,6 +245,18 @@ func (b *BrieFS) writeFileData(ino uint64, data []byte, off int64) (int, error) 
 		return 0, err
 	}
 	oldSize := int64(in.FileSize)
+	// s_maxbytes gate (kernel parity: generic_write_checks rejects at
+	// sb->s_maxbytes = MAX_LFS_FILESIZE, file.c:3483; the headroom form is
+	// file.c:3520's — the sum would wrap). The fuse kernel client clamps
+	// overlong writes itself, so this is the daemon's backstop: past this
+	// point writeExtentData's blockEnd arithmetic wraps at the final block
+	// (blockStart + blockSize overflows to INT64_MIN), the segEnd clamp
+	// takes the negative blockEnd, and cur walks to INT64_MIN — the daemon
+	// then writes garbage blocks from beyond the request buffer until the
+	// slice bounds panic kills it (generic/525 daemon death, 2026-09-11).
+	if off > maxFileSize || int64(len(data)) > maxFileSize-off {
+		return 0, syscall.EFBIG
+	}
 	totalSize := off + int64(len(data))
 
 	// Inline-data path: the file is inline (or empty) and the whole write fits
@@ -369,6 +409,15 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 		iblock := uint64(cur / blockSize)
 		blockStart := int64(iblock) * blockSize
 		blockEnd := blockStart + blockSize
+		// Wrap-safe final block: at the MAX_LFS_FILESIZE tail the last
+		// block's blockStart + blockSize overflows to INT64_MIN, which the
+		// segEnd clamp below would take as "block ends before end" —
+		// wrapping segEnd, segLen, and then cur negative (generic/525
+		// daemon panic; see the writeFileData s_maxbytes gate). The final
+		// block simply ends at the write's end.
+		if blockEnd < blockStart {
+			blockEnd = end
+		}
 		segStart := cur
 		if segStart < blockStart {
 			segStart = blockStart
@@ -388,8 +437,12 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 			case ext.Flags&briefs.ExtentFlagUnwritten != 0:
 				// Unwritten (fallocate) block reads as zeros; write converts it.
 				buf = make([]byte, blockSize)
-			case segStart == blockStart && segEnd == blockEnd:
-				buf = make([]byte, blockSize) // full-block overwrite: no read needed
+			case segStart == blockStart && segEnd-segStart == blockSize:
+				// Full-block overwrite: no read needed. Tested by segment
+				// length, not segEnd == blockEnd — at the wrap-clamped
+				// final block blockEnd is the write's end, and a partial
+				// tail must still read-modify-write the bytes it leaves.
+				buf = make([]byte, blockSize)
 			default:
 				buf, err = b.dev.ReadBlock(abs)
 				if err != nil {
