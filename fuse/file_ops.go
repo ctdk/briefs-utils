@@ -120,10 +120,16 @@ func (b *BrieFS) readFileData(ino uint64, dest []byte, off int64) ([]byte, error
 	// Returning only the extent-covered byte count (a running total) would
 	// short-read any range that starts in a hole (a truncate-up tail read
 	// returned 0 bytes) and mis-offset data after a hole.
-	exts, err := collectInodeExtents(b.dev.File(), diskInode, b.blockSize)
+	//
+	// The walked extents come from the per-inode cache (collectExtentTree):
+	// reads on a fragmented file fire per request, and the list is used
+	// read-only here.  A cache miss walks and warms the cache like any
+	// other caller.
+	tree, err := b.collectExtentTree(diskInode)
 	if err != nil {
 		return nil, err
 	}
+	exts := tree.exts
 	for _, ext := range exts {
 		extStart := int64(ext.Offset) * blockSize
 		extEnd := extStart + int64(ext.Len)*blockSize
@@ -186,8 +192,9 @@ func (b *BrieFS) readFileData(ino uint64, dest []byte, off int64) ([]byte, error
 }
 
 // collectInodeExtents returns every extent of an inode in ascending offset
-// order via briefs.IterateInodeExtents. (Shorthand for the read path, which
-// does not need the node-block list.)
+// order via briefs.IterateInodeExtents. Used by the one-shot paths that
+// neither need the node-block list nor benefit from the walked-tree cache
+// (symlink reads; the hot paths go through collectExtentTree instead).
 func collectInodeExtents(file *os.File, in *briefs.Inode, blockSize uint64) ([]briefs.Extent, error) {
 	var exts []briefs.Extent
 	err := briefs.IterateInodeExtents(file, in, blockSize, briefs.InodeExtentVisitor{
@@ -197,12 +204,6 @@ func collectInodeExtents(file *os.File, in *briefs.Inode, blockSize uint64) ([]b
 		},
 	})
 	return exts, err
-}
-
-// collectExtents is the per-BrieFS bound form of collectInodeExtents, used by
-// the FUSE attr fillers (fuse.go).
-func (b *BrieFS) collectExtents(in *briefs.Inode) ([]briefs.Extent, error) {
-	return collectInodeExtents(b.dev.File(), in, b.blockSize)
 }
 
 // writeFileData writes data at off, mirroring briefs_write_iter. It selects the

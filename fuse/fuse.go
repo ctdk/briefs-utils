@@ -471,15 +471,6 @@ var _ = (fs.NodeReadlinker)((*brieFSNode)(nil))
 var _ = (fs.NodeAllocater)((*brieFSNode)(nil))
 var _ = (fs.NodeSetattrer)((*brieFSNode)(nil))
 
-// collectExtents returns every extent of an inode in ascending offset order,
-// via briefs.IterateInodeExtents (which dispatches on InodeFlagIndexed: inline
-// array for inline-only inodes, B+ tree leaves for tree-backed inodes, and no
-// extents for inline-data inodes). Replaces the old chain-block walk; the chain
-// format no longer exists on v0.9 images.
-func (n *brieFSNode) collectExtents(diskInode *briefs.Inode) ([]briefs.Extent, error) {
-	return n.bfs.collectExtents(diskInode)
-}
-
 func (n *brieFSNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	diskInode, err := n.bfs.inodes.ReadInode(n.ino)
 	if err != nil {
@@ -657,13 +648,7 @@ func (n *brieFSNode) fillEntryOut(out *fuse.EntryOut, in *briefs.Inode) error {
 	out.Ctime = in.CtimeSec
 	out.Ctimensec = uint32(in.CtimeNsec)
 
-	var totalBlocks uint64
-	exts, err := n.collectExtents(in)
-	if err == nil {
-		for _, ext := range exts {
-			totalBlocks += ext.Len
-		}
-	}
+	totalBlocks, err := n.bfs.extentBlocksOf(in)
 	out.Blocks = totalBlocks * (n.bfs.blockSize / 512)
 	out.Blksize = uint32(n.bfs.blockSize)
 	return err
@@ -887,13 +872,7 @@ func (n *brieFSNode) fillAttrOut(out *fuse.AttrOut, in *briefs.Inode) error {
 	out.Mtimensec = uint32(in.MtimeNsec)
 	out.Ctime = in.CtimeSec
 	out.Ctimensec = uint32(in.CtimeNsec)
-	var totalBlocks uint64
-	exts, err := n.collectExtents(in)
-	if err == nil {
-		for _, ext := range exts {
-			totalBlocks += ext.Len
-		}
-	}
+	totalBlocks, err := n.bfs.extentBlocksOf(in)
 	out.Blocks = totalBlocks * (n.bfs.blockSize / 512)
 	out.Blksize = uint32(n.bfs.blockSize)
 	return err

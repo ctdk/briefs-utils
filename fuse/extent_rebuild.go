@@ -181,6 +181,25 @@ func (b *BrieFS) collectExtentTree(in *briefs.Inode) (*extentTree, error) {
 	return t, nil
 }
 
+// extentBlocksOf returns @in's allocated data-block count (the sum of
+// its extents' lengths), the value the FUSE attr fillers report as
+// st_blocks.  Tree-backed inodes are served from the walked-tree cache
+// like collectExtentTree's own callers: GETATTR/LOOKUP fire on every
+// step of a fragmented workload, and a full CRC-verified walk per
+// request was the CPU sink that hung generic/074 after the write-path
+// amplification was fixed.
+func (b *BrieFS) extentBlocksOf(in *briefs.Inode) (uint64, error) {
+	tree, err := b.collectExtentTree(in)
+	if err != nil {
+		return 0, err
+	}
+	var total uint64
+	for _, ext := range tree.exts {
+		total += ext.Len
+	}
+	return total, nil
+}
+
 // allNodes returns every node block of the walked tree (leaves and
 // index), the free set for the full-rebuild and dismantle cases.
 func (t *extentTree) allNodes() []uint64 {
