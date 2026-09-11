@@ -268,6 +268,12 @@ func (b *BrieFS) writeFileData(ino uint64, data []byte, off int64) (int, error) 
 // of the op. The caller must hold the inode's inodeBlockLock.
 func (b *BrieFS) writeInlineData(in *briefs.Inode, data []byte, off, totalSize int64) {
 	region := in.InlineData()
+	// Zero the hole this write exposes between the old EOF and off (kernel
+	// parity: a buffered write past EOF leaves zeros in the gap). The region
+	// can hold stale bytes below the inline cap from a prior truncate.
+	for i := int64(in.FileSize); i < off; i++ {
+		region[i] = 0
+	}
 	copy(region[off:], data)
 	in.SetInlineData(region)
 	in.Flags |= briefs.InodeFlagInlineData

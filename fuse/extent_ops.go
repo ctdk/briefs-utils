@@ -997,6 +997,43 @@ func (b *BrieFS) truncateLocked(in *briefs.Inode, newSize uint64) error {
 	bs := b.blockSize
 	oldSize := in.FileSize
 	if newSize < oldSize {
+		// Inline-data truncates manage their bytes directly in the region
+		// (kernel parity: file.c:1236 "Inline-data truncate is handled
+		// separately") — the generic extent path below would run
+		// collect+rebuild with zero extents, and rebuildExtentIndex's
+		// SetInlineExtents([8]Extent{}) CLOBBERS the inline data region (the
+		// inline_extents array and the inline_data region are the same 256
+		// bytes), wiping the surviving head of a down-truncate.  Truncate to
+		// 0 also drops the inline flag (kernel parity: the flag means "region
+		// holds data", and an empty non-inline file re-enters the inline path
+		// on its next small write).
+		if in.Flags&briefs.InodeFlagInlineData != 0 {
+			if newSize == 0 {
+				in.Flags &^= briefs.InodeFlagInlineData
+				in.SetInlineData([256]byte{})
+			} else {
+				region := in.InlineData()
+				for i := newSize; i < oldSize; i++ {
+					region[i] = 0
+				}
+				in.SetInlineData(region)
+			}
+			in.FileSize = newSize
+			sec, nsec := nowTime()
+			in.MtimeSec, in.MtimeNsec = sec, nsec
+			in.CtimeSec, in.CtimeNsec = sec, nsec
+			if err := b.journalInodeFull(in); err != nil {
+				b.failWrite()
+				return err
+			}
+			// Fix B: defer the inode block — durable at the next journal sync
+			// after the commit point, like every other metadata op.
+			if err := b.writeInodeOwned(in); err != nil {
+				b.failWrite()
+				return err
+			}
+			return nil
+		}
 		startFree := (newSize + bs - 1) / bs
 		exts, oldNodes, err := b.collectExtentsAndNodes(in)
 		if err != nil {
@@ -1039,10 +1076,43 @@ func (b *BrieFS) truncateLocked(in *briefs.Inode, newSize uint64) error {
 		// precedes the journal sync).
 		b.markDataDrain()
 	}
+	// An inline file truncated past the 256-byte region must promote to
+	// extent-backed BEFORE the size grows: leaving InodeFlagInlineData set
+	// with FileSize > 256 breaks the region invariant — every later read or
+	// write slices the 256-byte inline region by FileSize (the
+	// readFileData/promoteInlineData daemon panics, generic/551, 2026-09-11).
+	// A truncate up that stays within the region zeroes the tail it exposes
+	// (truncate_setsize parity): the region can hold stale bytes from
+	// before a down-truncate.
+	var allocated []uint64
+	if in.Flags&briefs.InodeFlagInlineData != 0 && newSize > inlineDataMax {
+		var drain []uint64
+		if err := b.promoteInlineData(in, &drain, &allocated); err != nil {
+			b.rollbackAlloc(allocated)
+			return err
+		}
+	} else if in.Flags&briefs.InodeFlagInlineData != 0 && newSize > oldSize {
+		region := in.InlineData()
+		for i := oldSize; i < newSize; i++ {
+			region[i] = 0
+		}
+		// InlineData() returns the region by value — store it back or the
+		// zeroing is lost.
+		in.SetInlineData(region)
+	}
 	in.FileSize = newSize
 	sec, nsec := nowTime()
 	in.MtimeSec, in.MtimeNsec = sec, nsec
 	in.CtimeSec, in.CtimeNsec = sec, nsec
+	if len(allocated) > 0 {
+		// The promotion moved the inline tail to a freshly allocated data
+		// block: journal a JRN_EXTENT_ALLOC for it (allocator parity —
+		// without the record, replay re-assigns the in-use block, the
+		// generic/040/041 family) instead of the plain inode-only commit
+		// below.  commitExtentChange also arms the pre-commit drain for the
+		// promoted block and snapshots the inode with its new extent list.
+		return b.commitExtentChange(in, allocated, nil, nil)
+	}
 	if err := b.journalInodeFull(in); err != nil {
 		b.failWrite()
 		return err
