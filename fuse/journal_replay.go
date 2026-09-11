@@ -76,10 +76,14 @@ func (b *BrieFS) replayJournal() error {
 	b.xattrFinal = make(map[uint64]uint64)
 	b.xattrNext = make(map[uint64]uint64)
 	b.xattrLive = make(map[uint64]bool)
+	b.trieSeeded = make(map[uint64]bool)
+	b.replayTrieBlocks = nil
 	defer func() {
 		b.xattrFinal = nil
 		b.xattrNext = nil
 		b.xattrLive = nil
+		b.trieSeeded = nil
+		b.replayTrieBlocks = nil
 	}()
 
 	b.journal.SetInReplay(true)
@@ -250,7 +254,7 @@ func (b *BrieFS) applyRecord(rtype uint32, data []byte, reserveOnly bool) error 
 		return b.replayExtentFree(briefs.UnmarshalExtentFree(data))
 
 	case briefs.JRN_TRIE_ALLOC:
-		return b.replayTrieAlloc(briefs.UnmarshalTrieAlloc(data))
+		return b.replayTrieAlloc(briefs.UnmarshalTrieAlloc(data), reserveOnly)
 
 	case briefs.JRN_INODE_FULL:
 		ino := briefs.UnmarshalInodeFullIno(data)
@@ -384,6 +388,16 @@ func (b *BrieFS) replayDirUpdate(rec *briefs.JrnDirUpdate) error {
 	di, err := briefs.UnmarshalInode(buf[off : off+b.inodes.sb.InodeSize])
 	if err != nil {
 		return nil
+	}
+
+	// Seed the partial-page pool from the parent's on-disk trie the first
+	// time replay touches this directory (the kernel seeds per parent under
+	// binfo->trie_pool_seeded, journal.c:938): replay's alloc-vs-reuse
+	// decisions must match the live path's or it over-allocates trie pages
+	// and ENOSPCs on a full fs (generic/475 / the 073 family).
+	if !b.trieSeeded[rec.ParentIno] {
+		b.trieSeeded[rec.ParentIno] = true
+		b.trieSeedPool(di.DirTrieRoot)
 	}
 
 	if rec.Op == 0 {
@@ -547,12 +561,21 @@ func (b *BrieFS) replayExtentFree(rec *briefs.JrnExtentFree) error {
 
 // replayTrieAlloc reserves (op=0) or frees (op=1) a trie page block in the
 // data bitmap. Idempotent. Mirrors replay_trie_alloc() (journal.c:758).
-func (b *BrieFS) replayTrieAlloc(rec *briefs.JrnTrieAlloc) error {
+func (b *BrieFS) replayTrieAlloc(rec *briefs.JrnTrieAlloc, collect bool) error {
 	if rec == nil {
 		return nil
 	}
 	if rec.Op == 0 {
-		b.dataAlloc.ReserveBlock(rec.Block - b.dataRegionStart)
+		rel := rec.Block - b.dataRegionStart
+		b.dataAlloc.ReserveBlock(rel)
+		// In the pass-1 reservation pre-scan also record the block in the
+		// replay pool so pass-2's triePageInit can reuse it instead of
+		// re-allocating (generic/475; the kernel's collect flag).  Pass-2
+		// re-reserves idempotently but must NOT re-push, or a block could be
+		// consumed twice.
+		if collect {
+			b.replayTrieBlocks = append(b.replayTrieBlocks, rel)
+		}
 	} else {
 		b.dataAlloc.FreeBlock(rec.Block - b.dataRegionStart)
 	}

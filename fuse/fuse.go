@@ -104,6 +104,22 @@ type BrieFS struct {
 	xattrNext  map[uint64]uint64 // phys xattr block -> next_block link
 	xattrLive  map[uint64]bool   // phys xattr blocks still referenced by a final chain
 	inReplay   bool              // true during replayJournal (trie page-init logging/gating)
+	// trieSeeded tracks directories whose partial-page pool has been seeded
+	// from the on-disk trie during replay (trieSeedPool — the kernel's
+	// generic/475 briefs_trie_seed_pool fix, ported for the 073-family
+	// replay ENOSPC). Non-nil only during replayJournal; nil otherwise.
+	trieSeeded map[uint64]bool
+
+	// replayTrieBlocks holds the data-relative blocks the journal's
+	// JRN_TRIE_ALLOC records named, in journal order (pass 1), for pass-2's
+	// triePageInit to reuse LIFO instead of re-allocating — the kernel's
+	// replay_trie_blocks pool (journal.c:2082, generic/475): re-allocating
+	// ENOSPCs on a full fs (the recorded blocks are pass-1-reserved and so
+	// invisible to AllocBlock) and risks aliasing a later-reserved data
+	// block.  Popping tail-first consumes the unsynced-tail orphans before
+	// the synced (still-referenced) blocks, so re-derivation never clobbers
+	// a -EEXIST record's page.  Empty (not nil) outside replayJournal.
+	replayTrieBlocks []uint64
 
 	// readOnly is set after a post-journal (phase-2) write error leaves the
 	// journal with uncommitted records referencing in-flight allocations.

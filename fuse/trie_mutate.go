@@ -230,7 +230,27 @@ func (b *BrieFS) removePartial(block uint64) {
 // slot 0 holding the requested node, journals JRN_TRIE_ALLOC, makes it
 // durable, and adds it to the partial pool.  Returns the node ref (slot 0).
 func (b *BrieFS) triePageInit(depth, byteVal, nodeType uint8) (uint64, error) {
-	rel := b.dataAlloc.AllocBlock()
+	// During journal replay, reuse a trie block pass 1 reserved from a
+	// JRN_TRIE_ALLOC record instead of re-allocating from the data
+	// allocator.  Re-allocating would (a) ENOSPC on a full fs — the
+	// recorded blocks are reserved and thus invisible to AllocBlock's
+	// free-scan (generic/475), and (b) risk aliasing a later-reserved data
+	// block.  The pool holds exactly the trie blocks the journal recorded;
+	// popping one in replay page-init order yields a self-consistent
+	// re-derived trie (parent child-pointers reference whatever block we
+	// return) even though the physical block number need not match the
+	// live path's assignment.  Popping tail-first consumes the unsynced-tail
+	// orphans before the synced (still-referenced) blocks, so re-derivation
+	// never clobbers a -EEXIST record's page.  If the pool is empty (more
+	// page-inits than recorded allocs), fall back to the normal allocator.
+	var rel uint64
+	if b.inReplay && len(b.replayTrieBlocks) > 0 {
+		last := len(b.replayTrieBlocks) - 1
+		rel = b.replayTrieBlocks[last]
+		b.replayTrieBlocks = b.replayTrieBlocks[:last]
+	} else {
+		rel = b.dataAlloc.AllocBlock()
+	}
 	if rel == 0 {
 		return 0, syscall.ENOSPC
 	}
@@ -273,6 +293,39 @@ func (b *BrieFS) triePageInit(depth, byteVal, nodeType uint8) (uint64, error) {
 	// in briefs_trie_page_init; generic/065).
 	b.addPartial(block)
 	return briefs.TrieMakeRef(block, 0), nil
+}
+
+// trieSeedPool populates the partial-page pool from a directory's on-disk
+// trie.  Port of briefs_trie_seed_pool (trie.c:341), the generic/475 replay
+// fix: during replay, replayDirUpdate re-derives a directory trie by
+// re-running TrieInsert, but the per-superblock partial pool starts EMPTY
+// (live mutations build it lazily; nothing scans existing pages for free
+// slots), so replay's first trieAllocNode per insert takes the fresh-alloc
+// branch where the live path reused a free slot — replay over-allocates trie
+// pages and ENOSPCs on a full fs (the generic/073 replay family, 2026-09-11).
+//
+// Walking every page reachable from rootRef and adding each page that still
+// has room (free slot AND name-heap space — briefs_trie_page_has_room)
+// reproduces the pool state the live path would have had at this trie.
+// addPartial dedups by block, so the several nodes a page hosts are
+// harmless.  Unreadable/corrupt pages are skipped silently (nil Note): a
+// later re-derivation step surfaces the error, and the TrieWalker's
+// visited-set and sibling-cap cycle protection replaces the kernel's visit
+// cap as the "never hang on a corrupt trie" guarantee.
+func (b *BrieFS) trieSeedPool(rootRef uint64) {
+	if briefs.TrieRefIsNull(rootRef) {
+		return
+	}
+	w := briefs.NewTrieWalker(b.loadBlock, rootRef)
+	for {
+		ref, _, _, pg, _, ok := w.Next()
+		if !ok {
+			return
+		}
+		if pg.FreeSlots != 0 && triePageHasNameHeap(pg, b.blockSize, 1) {
+			b.addPartial(briefs.TrieRefBlock(ref))
+		}
+	}
 }
 
 // trieAllocNode allocates a node (and name-heap space if nameLen > 0) from a
