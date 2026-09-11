@@ -31,6 +31,7 @@
 package fuse
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 
@@ -226,6 +227,14 @@ func (b *BrieFS) freeBlockNow(abs uint64) {
 	b.dataAlloc.FreeBlock(abs - b.dataRegionStart)
 }
 
+// syncMetaPause is a test seam: SyncMeta calls it (nothing locked) after
+// snapshotting the deferred map and before writing the snapshot blocks to
+// the device.  A test uses it to hold the drain window open deterministically
+// — the interval in which a concurrent same-block op reads the block, which
+// the generic/127 race wins only by microsecond timing in production.  nil
+// in production; set only from tests, restored before the test returns.
+var syncMetaPause func()
+
 // SyncMeta drains the deferred-metadata map to the device page cache (no
 // fdatasync — the enclosing journal sync flushes) and applies the block
 // frees deferred since the last commit.  Implements briefs.MetaSyncer; the
@@ -236,6 +245,19 @@ func (b *BrieFS) freeBlockNow(abs uint64) {
 // the transaction commits.  The enclosing sync then persists the allocator
 // bitmaps (SyncAllocators runs after this), so a completed sync leaves the
 // on-disk bitmap converged with the committed records.
+//
+// The drain never empties the map up front.  Entries are copied out, written
+// to the device, and only then deleted — and only the ones no concurrent op
+// re-stored meanwhile (CAS-delete).  Removing a block from the map before
+// its content reaches the device page cache would open a window in which the
+// dirty view no longer serves the block, so a concurrent same-block op (an
+// op on a sibling inode: file writes serialize on the inode-block shard
+// lock, which this drain does not hold) would base its whole-block
+// read-modify-write on the stale page-cache copy and regress every sibling
+// slot — the generic/127 race (a file's size reverting to an older drain's
+// value mid-run).  While a newer copy is in the map, readers see it through
+// the dirty view and the next drain rewrites the page cache, so the
+// temporarily-regressed page cache is invisible.
 func (b *BrieFS) SyncMeta() error {
 	b.dirtyMu.Lock()
 	frees := b.pendingFrees
@@ -247,26 +269,39 @@ func (b *BrieFS) SyncMeta() error {
 		}
 		return nil
 	}
-	snap := b.dirtyBlocks
-	b.dirtyBlocks = make(map[uint64][]byte)
+	snap := make(map[uint64][]byte, len(b.dirtyBlocks))
+	for blk, buf := range b.dirtyBlocks {
+		snap[blk] = buf
+	}
 	b.dirtyMu.Unlock()
+	if syncMetaPause != nil {
+		// Test seam (drain_race_test.go): hold the drain open between the
+		// snapshot and the block writes — the window in which a concurrent
+		// same-block op reads the block, which the generic/127 race wins
+		// only by microsecond timing in production.
+		syncMetaPause()
+	}
 	for _, rel := range frees {
 		b.dataAlloc.FreeBlock(rel)
 	}
 	for block, buf := range snap {
 		if err := b.dev.WriteBlock(block, buf); err != nil {
-			// Restore this block and every unwritten one (the failed
-			// block is still in snap; written ones were deleted) so a
-			// later sync retries them.
-			b.dirtyMu.Lock()
-			for blk2, buf2 := range snap {
-				b.dirtyBlocks[blk2] = buf2
-			}
-			b.dirtyMu.Unlock()
+			// Nothing was removed from the deferred map, so a later sync
+			// retries every block of this drain, including the ones this
+			// loop already wrote (their content is unchanged and the map
+			// copy is the one that counts for readers).
 			return fmt.Errorf("briefs: drain deferred block %d: %w", block, err)
 		}
-		delete(snap, block)
 	}
+	b.dirtyMu.Lock()
+	for blk, buf := range snap {
+		if cur, ok := b.dirtyBlocks[blk]; ok && bytes.Equal(cur, buf) {
+			delete(b.dirtyBlocks, blk)
+		}
+		// else: a concurrent op stored a newer whole-block copy after the
+		// snapshot; keep it — the next drain writes it.
+	}
+	b.dirtyMu.Unlock()
 	return nil
 }
 
