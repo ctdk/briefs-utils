@@ -174,10 +174,29 @@ func (j *Journal) SetDataDrainer(s DataDrainer) { j.dataDrainer = s }
 // fsck, mkfs) leave it nil and get the previous whole-file Sync behavior.
 type WBFlusher interface {
 	FlushWB() error
+	// KickWB starts writeback of the tracked blocks WITHOUT waiting for it
+	// (the bridge's over-cap path).  The journal uses it where the kernel
+	// would leave a dirty page to its own writeback and never wait.
+	KickWB() error
 }
 
 // SetWBFlusher wires the targeted writeback flush after construction.
 func (j *Journal) SetWBFlusher(f WBFlusher) { j.wbFlusher = f }
+
+// kickWB starts writeback of the caller's tracked page-cache writes without
+// waiting for completion.  Kernel parity for the checkpoint's data half:
+// __briefs_journal_checkpoint_locked (journal.c:705) flushes only the
+// journal-owned metadata buffers and the allocator bitmaps — user data is
+// left to the kernel's own dirty-page writeback, and nothing waits for it.
+func (j *Journal) kickWB() error {
+	if j.wbFlusher == nil {
+		return nil
+	}
+	if err := j.wbFlusher.KickWB(); err != nil {
+		return fmt.Errorf("briefs: kick tracked writeback: %w", err)
+	}
+	return nil
+}
 
 // syncWB drains the caller's page-cache writes to writeback completion: the
 // bridge-side equivalent of the kernel's sync_dirty_buffer() flush of dirty
@@ -575,14 +594,25 @@ func (j *Journal) checkpointLocked(flushPending bool) error {
 		}
 	}
 
-	// Flush all dirty metadata buffers before discarding the journal records
-	// that reference them, then persist the allocator bitmaps (journal.c:394).
-	// The kernel releases write_lock here for concurrency and to avoid an
-	// AB-BA with alloc->lock.  The FUSE bridge holds the global fs mutex
-	// across each op, so the journal mu is uncontended; we keep it held
-	// (the release/re-acquire would be a no-op for correctness).
-	if err := j.syncWB(); err != nil {
-		return fmt.Errorf("briefs: checkpoint metadata flush: %w", err)
+	// Kick the tracked page-cache writes instead of waiting for them
+	// (journal.c:394's "flush all dirty metadata buffers" covers only the
+	// metadata the checkpoint retires records for; the kernel never waits
+	// for user data at checkpoint — it is left to dirty-page writeback).
+	// Retiring JRN_EXTENT_ALLOC/INODE_FULL records while their data and
+	// btree blocks are merely in the page cache is safe under the crash
+	// model: the blocks were WriteAt'd the moment they were noted, kill -9
+	// keeps the kernel page cache, and power-fail durability is promised
+	// only at fsync and unmount, which still wait.  The old WAIT here
+	// stalled every ring wrap behind up to pendingWritebackCap (32 MB) of
+	// mixed data+metadata writeback under j.mu; with ~5 records per
+	// buffered extent add the wrap fires every few hundred fragmented
+	// writes, and those stalls were the dominant per-op cost of
+	// generic/074 (900s+ for a workload the write path itself finishes in
+	// seconds).  The allocator pools below are still flushed with a wait —
+	// only the blocks SyncAllocators just wrote remain in the set after
+	// the kick, so that wait is a handful of blocks, not the data set.
+	if err := j.kickWB(); err != nil {
+		return fmt.Errorf("briefs: checkpoint writeback kick: %w", err)
 	}
 	if j.allocSyncer != nil {
 		if err := j.allocSyncer.SyncAllocators(); err != nil {

@@ -335,6 +335,11 @@ func (bd *BlockDevice) takePendingWB() []uint64 {
 // hook, set with SetWBFlusher in Mount).
 func (bd *BlockDevice) FlushWB() error { return bd.FlushPendingWB() }
 
+// KickWB implements briefs.WBFlusher's no-wait variant: start writeback of
+// the tracked blocks (the journal's checkpoint path, kernel parity for the
+// checkpoint never waiting for user data).
+func (bd *BlockDevice) KickWB() error { return bd.kickPendingWB() }
+
 // ReadAt implements io.ReaderAt, allowing briefs.ReadSuperblock and
 // briefs.ReadAllocatorHeader to work with a BlockDevice.
 func (bd *BlockDevice) ReadAt(p []byte, off int64) (int, error) {
