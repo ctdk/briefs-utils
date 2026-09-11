@@ -53,6 +53,7 @@ package fuse
 
 import (
 	"os"
+	"slices"
 	"sort"
 	"syscall"
 
@@ -390,7 +391,11 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 		b.rollbackAlloc(*allocated)
 		return 0, err
 	}
-	exts := tree.exts
+	// Clone: the tree (possibly a shared cache entry) is reused read-only
+	// downstream — the localized rebuild diffs its leaf chunks against the
+	// pre-op state — while insertExtentSorted/splitUnwrittenAt below
+	// mutate the extent list in place.
+	exts := slices.Clone(tree.exts)
 
 	// Defensive EOF-tail zero (generic/363): a write starting past EOF must zero
 	// the tail of the old EOF block so stale bytes do not leak when i_size grows
@@ -712,6 +717,11 @@ func (b *BrieFS) zeroEofTail(exts []briefs.Extent, oldSize int64, drain *[]uint6
 // generalized to a full rebuild on every index change (valid under
 // drain-before-snapshot; the incremental insert is deferred).
 func (b *BrieFS) rebuildExtentIndex(in *briefs.Inode, exts []briefs.Extent, oldNodes []uint64, drain, allocated *[]uint64) error {
+	// The tree this rebuild replaces is no longer the on-disk tree once the
+	// new one publishes; drop any cached walk of it (the localized path
+	// stores its own replacement instead).
+	b.invalidateExtentTree(in.InodeNumber)
+
 	// No extents: clear the index (truncate to 0). oldNodes are freed by the
 	// caller's commitExtentChange.
 	if len(exts) == 0 {

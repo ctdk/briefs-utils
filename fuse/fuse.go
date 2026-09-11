@@ -121,6 +121,25 @@ type BrieFS struct {
 	// a -EEXIST record's page.  Empty (not nil) outside replayJournal.
 	replayTrieBlocks []uint64
 
+	// extentTrees caches the walked on-disk extent index of tree-backed
+	// inodes (extent_rebuild.go), keyed by inode number: the localized
+	// rebuild diffs per-leaf chunks against it, so without the cache every
+	// WRITE request would re-walk and CRC-verify the whole B+tree (for a
+	// 30 MB fragmented file ~65 node blocks per 512-byte request — the
+	// remaining CPU sink of generic/074 after the write amplification fix).
+	// Entries carry (root, total) captured from the inode at walk time;
+	// collectExtentTree validates against the freshly-read inode, and
+	// every rebuild allocates fresh root blocks, so a mutation by any
+	// other path is detected on the next lookup.  Full rebuilds
+	// (rebuildExtentIndex) also invalidate eagerly.  Entries are shared
+	// read-only: the write path clones the extent list before its
+	// in-place insert mutations.  Bounded by extentTreeCacheMax; guarded
+	// by extentTreesMu (the map itself — entry contents are only touched
+	// under the inode's inodeBlockLock, which serializes all ops on one
+	// inode).
+	extentTrees   map[uint64]*extentTree
+	extentTreesMu sync.Mutex
+
 	// readOnly is set after a post-journal (phase-2) write error leaves the
 	// journal with uncommitted records referencing in-flight allocations.
 	// Further mutations are refused (EROFS) so a later Sync cannot commit them
@@ -173,6 +192,7 @@ func Mount(imagePath string, opts MountOptions) error {
 		blockSize:       blockSize,
 		dataRegionStart: dataRegionStart,
 		dirtyBlocks:     make(map[uint64][]byte),
+		extentTrees:     make(map[uint64]*extentTree),
 	}
 
 	// Deferred-metadata reads: blocks held in dirtyBlocks (daemon memory

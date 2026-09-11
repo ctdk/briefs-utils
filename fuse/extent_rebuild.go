@@ -67,16 +67,68 @@ type extentLeaf struct {
 // extent in ascending offset order, the per-leaf chunks (the reuse
 // candidates for the localized rebuild), and the internal node blocks.
 // For inline-data and inline-only inodes leaves and idx are empty.
+// root and total are the inode fields the tree was walked under; they
+// validate cache entries against a freshly-read inode (see
+// collectExtentTree).  A cached entry is SHARED read-only: callers that
+// mutate the extent list must clone it first (writeExtentData does).
 type extentTree struct {
 	exts   []briefs.Extent
 	leaves []extentLeaf
 	idx    []uint64
+	root   uint64
+	total  uint64
+}
+
+// extentTreeCacheMax bounds the walked-tree cache (BrieFS.extentTrees).
+// An entry for a heavily fragmented file is the full extent list (24
+// bytes per extent; ~720 KB for a 30 MB sparse file), so the cache is
+// capped rather than unbounded.  Eviction drops an arbitrary entry —
+// the hot file re-walks on its next op, an O(tree) blip, not a
+// correctness event.
+const extentTreeCacheMax = 64
+
+// lookupExtentTree returns the cached walked tree for @ino, or nil.
+func (b *BrieFS) lookupExtentTree(ino uint64) *extentTree {
+	b.extentTreesMu.Lock()
+	defer b.extentTreesMu.Unlock()
+	return b.extentTrees[ino]
+}
+
+// storeExtentTree caches @t as @ino's walked tree.  The caller must
+// have filled t.root/t.total from the inode the tree describes.
+func (b *BrieFS) storeExtentTree(ino uint64, t *extentTree) {
+	b.extentTreesMu.Lock()
+	defer b.extentTreesMu.Unlock()
+	if b.extentTrees == nil {
+		b.extentTrees = make(map[uint64]*extentTree)
+	}
+	if len(b.extentTrees) >= extentTreeCacheMax && b.extentTrees[ino] == nil {
+		for k := range b.extentTrees { // arbitrary victim; map order is random
+			delete(b.extentTrees, k)
+			break
+		}
+	}
+	b.extentTrees[ino] = t
+}
+
+// invalidateExtentTree drops @ino's cached walked tree.  Called by every
+// full rebuild (the tree it describes is about to be replaced) and by
+// paths that change an inode's index state without a localized rebuild.
+func (b *BrieFS) invalidateExtentTree(ino uint64) {
+	b.extentTreesMu.Lock()
+	defer b.extentTreesMu.Unlock()
+	delete(b.extentTrees, ino)
 }
 
 // collectExtentTree walks @in's extent index with the same structure
 // checks collectExtentsAndNodes goes through (WalkBtree behind
 // IterateInodeExtents, checksums on), capturing the per-leaf chunks
-// the localized rebuild diffs against.
+// the localized rebuild diffs against.  Tree-backed inodes are served
+// from the walked-tree cache when the entry validates against @in:
+// every rebuild allocates a fresh root block, so (root, total)
+// matching the freshly-read inode means the cached tree IS the
+// on-disk tree (a mutation by punch/truncate/collapse or this path
+// itself always moved the root).
 func (b *BrieFS) collectExtentTree(in *briefs.Inode) (*extentTree, error) {
 	t := &extentTree{}
 	if in.Flags&briefs.InodeFlagInlineData != 0 {
@@ -97,6 +149,10 @@ func (b *BrieFS) collectExtentTree(in *briefs.Inode) (*extentTree, error) {
 	root := in.ExtentInlineBase
 	if root == 0 {
 		return t, nil
+	}
+	if cached := b.lookupExtentTree(in.InodeNumber); cached != nil &&
+		cached.root == root && cached.total == in.NumExtentsTotal {
+		return cached, nil
 	}
 	err := briefs.WalkBtree(b.dev.File(), root, briefs.BtreeWalkOptions{
 		BlockSize: b.blockSize,
@@ -119,6 +175,9 @@ func (b *BrieFS) collectExtentTree(in *briefs.Inode) (*extentTree, error) {
 	if err != nil {
 		return nil, err
 	}
+	t.root = root
+	t.total = in.NumExtentsTotal
+	b.storeExtentTree(in.InodeNumber, t)
 	return t, nil
 }
 
@@ -261,6 +320,16 @@ func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, ext
 	in.ExtentInlineBase = root
 	in.NumExtentsInline = 0
 	in.NumExtentsTotal = uint64(len(exts))
+
+	// Cache the new tree: the next write op on this inode validates it
+	// against the inode (root/total) and skips the walk.  exts and the
+	// chunks alias one backing that no caller mutates (the write path
+	// clones before its in-place inserts).
+	newTree := &extentTree{exts: exts, idx: idxBlocks, root: root, total: uint64(len(exts))}
+	for i, chunk := range newChunks {
+		newTree.leaves = append(newTree.leaves, extentLeaf{block: leafBlocks[i], chunk: chunk})
+	}
+	b.storeExtentTree(in.InodeNumber, newTree)
 
 	// Free set: the replaced old leaves plus every old index block.
 	freed := make([]uint64, 0, len(oldLeaves)-reuseCount+len(tree.idx))

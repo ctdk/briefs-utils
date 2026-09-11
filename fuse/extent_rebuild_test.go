@@ -166,6 +166,109 @@ func TestExtentRebuildMiddleShiftReusesNothing(t *testing.T) {
 	fsckClean(t, b, img)
 }
 
+// TestExtentRebuildMergeDoesNotCorruptCachedChunks: filling a hole between
+// two fragments MERGES extents in place (insertExtentSorted's
+// merge-with-left/right paths).  The cached tree the localized rebuild
+// diffs against must not alias the list being mutated: without the
+// write path's clone, the in-place merge would rewrite the cached
+// chunk's tail to look like the NEW chunk, the prefix compare would
+// falsely match it, and a reused leaf block would keep its pre-merge
+// on-disk content under a root that describes the merged state.
+func TestExtentRebuildMergeDoesNotCorruptCachedChunks(t *testing.T) {
+	mkfs := buildMkfs(t)
+	img := mkfsImage(t, mkfs, 20000)
+	b := openBridge(t, img)
+
+	in, err := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	ino := in.InodeNumber
+
+	// Fragments at blocks 0,2,4,...  (one extent each, holes between).
+	var blocks []uint64
+	for i := 0; i < 300; i++ {
+		blocks = append(blocks, uint64(2*i))
+	}
+	writeFragments(t, b, ino, blocks, 1)
+	oldLeaves := leafBlocksOf(t, b, ino)
+
+	// Fill the hole at block 1: extent bridges 0 and 2 -> merged into the
+	// left neighbor (insertExtentSorted merge-with-left), in place.
+	writeFragments(t, b, ino, []uint64{1}, 500)
+
+	// The merged-on-disk extent must read back as one contiguous run:
+	// blocks 0,1,2 all mapped with data (no hole where the merge happened).
+	readFragment(t, b, ino, 0, 1)
+	readFragment(t, b, ino, 1, 500) // the hole fill itself
+	readFragment(t, b, ino, 2, 2)
+
+	// A second localized op on the same inode exercises the cached tree
+	// built by the merge op: any corruption the in-place merge introduced
+	// would surface as a wrong prefix reuse here.
+	writeFragments(t, b, ino, []uint64{600}, 700)
+	newLeaves := leafBlocksOf(t, b, ino)
+	if newLeaves[0] == 0 {
+		t.Fatal("unreachable")
+	}
+	for i, ib := range blocks {
+		readFragment(t, b, ino, ib, uint64(1+i))
+	}
+	readFragment(t, b, ino, 1, 500)
+	readFragment(t, b, ino, 600, 700)
+	_ = oldLeaves
+
+	fsckClean(t, b, img)
+}
+
+// TestExtentTreeCacheInvalidatedByPunch: a punch goes through the full
+// rebuild, which must drop the cached walked tree — a stale entry would
+// validate against nothing (the root moved) but also must not survive to
+// feed a bogus prefix compare on the next write.
+func TestExtentTreeCacheInvalidatedByPunch(t *testing.T) {
+	mkfs := buildMkfs(t)
+	img := mkfsImage(t, mkfs, 20000)
+	b := openBridge(t, img)
+
+	in, err := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	ino := in.InodeNumber
+
+	var blocks []uint64
+	for i := 0; i < 300; i++ {
+		blocks = append(blocks, uint64(2*i))
+	}
+	writeFragments(t, b, ino, blocks, 1)
+
+	// Punch a hole over fragments [10, 290): those extents drop out via
+	// the full rebuild (extent_ops), invalidating the cache entry.
+	bs := int64(b.blockSize)
+	if err := b.fallocateOp(ino, uint64(10*bs), uint64(280*bs), fallocPunchHole|fallocKeepSize); err != nil {
+		t.Fatalf("punch: %v", err)
+	}
+
+	// The next write rebuilds locally against a FRESH walk.  A stale
+	// cached entry would compare against the pre-punch chunks and reuse
+	// freed leaf blocks whose extent lists include the punched fragments.
+	writeFragments(t, b, ino, []uint64{400}, 700)
+
+	// Punched blocks read as zeros; survivors keep their data.
+	got := readFile(t, b, ino, 10*bs, 2*bs)
+	for i := range got {
+		if got[i] != 0 {
+			t.Fatalf("punched fragment at block %d: byte %d not zero", 10+i/4096, i%4096)
+		}
+	}
+	for _, ib := range []uint64{0, 2, 4, 8} {
+		readFragment(t, b, ino, ib, 1+ib/2)
+	}
+	readFragment(t, b, ino, 400, 700)
+
+	fsckClean(t, b, img)
+}
+
 // TestExtentRebuildCrashReplayReusedBlocks: a committed localized rebuild
 // (with reused prefix leaves) must survive a simulated kill -9 — the
 // INODE_FULL-published root resolves through the reused blocks, the fresh
