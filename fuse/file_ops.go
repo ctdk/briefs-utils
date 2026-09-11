@@ -385,11 +385,12 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 	blockSize := int64(b.blockSize)
 
 	// --- Phase 1: allocate + write (no journaling) ---
-	exts, oldNodes, err := b.collectExtentsAndNodes(in)
+	tree, err := b.collectExtentTree(in)
 	if err != nil {
 		b.rollbackAlloc(*allocated)
 		return 0, err
 	}
+	exts := tree.exts
 
 	// Defensive EOF-tail zero (generic/363): a write starting past EOF must zero
 	// the tail of the old EOF block so stale bytes do not leak when i_size grows
@@ -487,8 +488,15 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 		cur = segEnd
 	}
 
+	// Localized (leaf-diff) rebuild: only the leaves whose chunks changed
+	// are re-emitted; equal-prefix leaf blocks are kept and the returned
+	// free list is just the replaced leaves + the old index blocks.  The
+	// full rewrite per extent-adding op was the 074 write-amplification
+	// hang (~61 leaf blocks rewritten per 512 B fragmented WRITE).
+	var oldNodesToFree []uint64
 	if rebuildNeeded {
-		if err := b.rebuildExtentIndex(in, exts, oldNodes, drain, allocated); err != nil {
+		oldNodesToFree, err = b.rebuildExtentIndexWrite(in, tree, exts, drain, allocated)
+		if err != nil {
 			b.rollbackAlloc(*allocated)
 			return 0, err
 		}
@@ -503,10 +511,6 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 	in.CtimeSec, in.CtimeNsec = sec, nsec
 
 	// --- Phase 2: journal + drain + commit + free old + write inode ---
-	var oldNodesToFree []uint64
-	if rebuildNeeded {
-		oldNodesToFree = oldNodes
-	}
 	// A conversion shrank the unwritten region: lower the metadata shield
 	// before the commit so a concurrent op cannot grab the surplus blocks
 	// (the kernel releases per converted block under extent_lock; here the
