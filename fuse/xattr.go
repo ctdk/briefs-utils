@@ -209,7 +209,7 @@ func (b *BrieFS) setXattrLocked(in *briefs.Inode, name string, value []byte, fla
 
 	// Allocate a block for every descriptor, serialize, and write to the page
 	// cache. Track allocated rels (for rollback / journaling) and abs blocks.
-	allocated := make([]uint64, 0, len(descs))
+	var allocated runAccum
 	absBlocks := make([]uint64, 0, len(descs))
 	bufs := make([][]byte, 0, len(descs))
 	for range descs {
@@ -218,7 +218,7 @@ func (b *BrieFS) setXattrLocked(in *briefs.Inode, name string, value []byte, fla
 			b.rollbackAlloc(allocated)
 			return syscall.ENOSPC
 		}
-		allocated = append(allocated, rel)
+		allocated.addBlock(rel)
 		abs := b.dataRegionStart + rel
 		absBlocks = append(absBlocks, abs)
 	}

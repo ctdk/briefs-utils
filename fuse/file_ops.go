@@ -284,7 +284,8 @@ func (b *BrieFS) writeFileData(ino uint64, data []byte, off int64) (int, error) 
 			return len(data), nil
 		}
 		// Write exceeds inline capacity: promote to extent-backed first.
-		var drain, allocated []uint64
+		var drain []uint64
+		var allocated runAccum
 		if err := b.promoteInlineData(in, &drain, &allocated); err != nil {
 			b.rollbackAlloc(allocated)
 			return 0, err
@@ -296,7 +297,8 @@ func (b *BrieFS) writeFileData(ino uint64, data []byte, off int64) (int, error) 
 		return n, nil
 	}
 
-	var drain, allocated []uint64
+	var drain []uint64
+	var allocated runAccum
 	n, err := b.writeExtentData(in, data, off, oldSize, &drain, &allocated)
 	if err != nil {
 		return 0, err
@@ -335,7 +337,7 @@ func (b *BrieFS) writeInlineData(in *briefs.Inode, data []byte, off, totalSize i
 // before the commit by writeExtentData). The inode is mutated in memory only;
 // the caller persists it once at the end of the op. The caller must hold the
 // inode's inodeBlockLock.
-func (b *BrieFS) promoteInlineData(in *briefs.Inode, drain, allocated *[]uint64) error {
+func (b *BrieFS) promoteInlineData(in *briefs.Inode, drain *[]uint64, allocated *runAccum) error {
 	oldSize := in.FileSize
 	// Capture the old inline content BEFORE clearing the region.
 	oldRegion := in.InlineData()
@@ -355,7 +357,7 @@ func (b *BrieFS) promoteInlineData(in *briefs.Inode, drain, allocated *[]uint64)
 	if rel == 0 {
 		return syscall.ENOSPC
 	}
-	*allocated = append(*allocated, rel)
+	allocated.addBlock(rel)
 	abs := b.dataRegionStart + rel
 
 	// Copy the captured old inline content into a zeroed block.
@@ -383,7 +385,7 @@ func (b *BrieFS) promoteInlineData(in *briefs.Inode, drain, allocated *[]uint64)
 // needs only the file's inodeBlockLock, not the global dir lock. The caller
 // must hold the inode's inodeBlockLock and pass the in-memory inode @in (mutated
 // in place; persisted once at the end).
-func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int64, drain, allocated *[]uint64) (int, error) {
+func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int64, drain *[]uint64, allocated *runAccum) (int, error) {
 	blockSize := int64(b.blockSize)
 
 	// --- Phase 1: allocate + write (no journaling) ---
@@ -478,7 +480,7 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 				b.rollbackAlloc(*allocated)
 				return 0, syscall.ENOSPC
 			}
-			*allocated = append(*allocated, rel)
+			allocated.addBlock(rel)
 			abs := b.dataRegionStart + rel
 			buf := make([]byte, blockSize) // zeroed
 			copy(buf[segStart-blockStart:], segData)
@@ -522,7 +524,7 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 	// (the kernel releases per converted block under extent_lock; here the
 	// recompute from the final extent list covers all conversion at once).
 	b.updateUnwrittenRes(in.InodeNumber, exts)
-	if err := b.commitExtentChange(in, *allocated, nil, oldNodesToFree); err != nil {
+	if err := b.commitExtentChange(in, allocated, nil, oldNodesToFree); err != nil {
 		return 0, err
 	}
 	return len(data), nil
@@ -530,10 +532,11 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 
 // commitExtentChange journals an extent-index change shared by the write,
 // fallocate, and truncate paths. allocatedRels are the new data + btree-node
-// blocks (already written to the page cache); freedAbs and oldNodesAbs are
-// data blocks / old btree nodes being freed. The caller must hold the inode's
-// inodeBlockLock and have already mutated @in (size, extents, times) in
-// memory.
+// blocks (already written to the page cache, data-relative, run-encoded);
+// freedAbs are the freed data blocks as absolute runs; oldNodesAbs are the
+// old btree nodes (absolute, per-block — bounded by the node count, never
+// O(#blocks)). The caller must hold the inode's inodeBlockLock and have
+// already mutated @in (size, extents, times) in memory.
 //
 // Fix C (kernel parity): the kernel's buffered-write path journals its extent
 // records with NO per-op sync — the JRN_EXTENT_ALLOC sites in btree.c just
@@ -557,19 +560,20 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 //
 // Crash model: a crash before the next sync loses the records and the page
 // cache together — the unsynced op never happened.
-func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels, freedAbs, oldNodesAbs []uint64) error {
+func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels *runAccum, freedAbs []blockRun, oldNodesAbs []uint64) error {
 	ino := in.InodeNumber
 	// Arm the pre-commit drain before the first record: a concurrent journal
 	// sync (fsync on another file, setxattr) must not commit these records
 	// without first flushing the new data and btree nodes they publish.
 	b.markDataDrain()
-	// Run-encode the block lists: one record per maximal contiguous run,
-	// not one per block.  The kernel journals extents run-encoded
-	// (btree.c briefs_journal_extent_alloc(..., ext->len, ...)); per-block
-	// records made a whole-device falloc emit ~26M EXTENT_ALLOC records —
-	// the ring filled ~9300x (a back-pressure checkpoint each time) and
-	// the transient record buffers OOM'd the daemon (generic/299).
-	if err := journalContigRuns(allocatedRels, func(first, length uint64) error {
+	// Journal the block lists one record per contiguous run, not one per
+	// block — kernel parity (btree.c briefs_journal_extent_alloc(...,
+	// ext->len, ...)).  The lists themselves are run-encoded all the way
+	// back to their builders (runlist.go): per-block materialization made a
+	// whole-device falloc hold ~26M-entry []uint64 lists for the rollback,
+	// free, and journal paths at once — ~600 MB live, doubled by append
+	// growth — which OOM'd the daemon at a ~3.2 GB ceiling (generic/299).
+	if err := allocatedRels.forEach(func(first, length uint64) error {
 		return b.journalExtentAlloc(ino, 0, b.dataRegionStart+first, length)
 	}); err != nil {
 		b.failWrite()
@@ -579,11 +583,11 @@ func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels, freedAbs, o
 		b.failWrite()
 		return err
 	}
-	if err := journalContigRuns(freedAbs, func(first, length uint64) error {
-		return b.journalExtentFree(ino, first, length)
-	}); err != nil {
-		b.failWrite()
-		return err
+	for _, run := range freedAbs {
+		if err := b.journalExtentFree(ino, run.first, run.n); err != nil {
+			b.failWrite()
+			return err
+		}
 	}
 	if err := journalContigRuns(oldNodesAbs, func(first, length uint64) error {
 		return b.journalExtentFree(ino, first, length)
@@ -595,8 +599,8 @@ func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels, freedAbs, o
 	// sync's commit point) takes them from pendingFrees, draining any
 	// deferred copy of the block BEFORE the free enters the allocator (see
 	// deferBlockFree — the deferred copy is kept for full-window replay).
-	for _, abs := range freedAbs {
-		b.deferBlockFree(abs)
+	for _, run := range freedAbs {
+		b.deferBlockFreeRun(run.first, run.n)
 	}
 	for _, abs := range oldNodesAbs {
 		b.deferBlockFree(abs)
@@ -723,7 +727,7 @@ func (b *BrieFS) zeroEofTail(exts []briefs.Extent, oldSize int64, drain *[]uint6
 // *allocated for journaling/rollback. Mirrors btree_spill_inline (btree.c:861)
 // generalized to a full rebuild on every index change (valid under
 // drain-before-snapshot; the incremental insert is deferred).
-func (b *BrieFS) rebuildExtentIndex(in *briefs.Inode, exts []briefs.Extent, oldNodes []uint64, drain, allocated *[]uint64) error {
+func (b *BrieFS) rebuildExtentIndex(in *briefs.Inode, exts []briefs.Extent, oldNodes []uint64, drain *[]uint64, allocated *runAccum) error {
 	// The tree this rebuild replaces is no longer the on-disk tree once the
 	// new one publishes; drop any cached walk of it (the localized path
 	// stores its own replacement instead).
@@ -760,7 +764,7 @@ func (b *BrieFS) rebuildExtentIndex(in *briefs.Inode, exts []briefs.Extent, oldN
 		if rel == 0 {
 			return 0, syscall.ENOSPC
 		}
-		*allocated = append(*allocated, rel)
+		allocated.addBlock(rel)
 		return b.dataRegionStart + rel, nil
 	}
 
@@ -918,12 +922,15 @@ func (b *BrieFS) journalExtentFree(ino, phys, length uint64) error {
 		(&briefs.JrnExtentFree{Ino: ino, Offset: 0, PhysStart: phys, Length: length}).Marshal())
 }
 
-// rollbackAlloc returns a list of data-relative blocks to the allocator. Used
-// on phase-1 errors, before any journal record is written.
-func (b *BrieFS) rollbackAlloc(allocated []uint64) {
-	for _, rel := range allocated {
-		b.dataAlloc.FreeBlock(rel)
-	}
+// rollbackAlloc returns the op's run-encoded list of data-relative blocks to
+// the allocator. Used on phase-1 errors, before any journal record is written.
+func (b *BrieFS) rollbackAlloc(allocated runAccum) {
+	allocated.forEach(func(first, n uint64) error {
+		for i := uint64(0); i < n; i++ {
+			b.dataAlloc.FreeBlock(first + i)
+		}
+		return nil
+	})
 }
 
 // failWrite marks the filesystem read-only after a post-journal (phase-2)

@@ -250,7 +250,7 @@ func (b *BrieFS) buildLeafBuf(chunk []briefs.Extent, next uint64) []byte {
 // JRN_EXTENT_FREE and free after the commit: for a localized rebuild
 // the replaced leaf blocks plus the old index blocks; for the fallback
 // shapes every old node block.
-func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, exts []briefs.Extent, drain, allocated *[]uint64) ([]uint64, error) {
+func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, exts []briefs.Extent, drain *[]uint64, allocated *runAccum) ([]uint64, error) {
 	// The full rebuild's dismantle and inline cases, verbatim.
 	if len(exts) == 0 || len(exts) <= 8 && in.Flags&briefs.InodeFlagIndexed == 0 {
 		if err := b.rebuildExtentIndex(in, exts, tree.allNodes(), drain, allocated); err != nil {
@@ -295,7 +295,7 @@ func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, ext
 		if rel == 0 {
 			return nil, syscall.ENOSPC
 		}
-		*allocated = append(*allocated, rel)
+		allocated.addBlock(rel)
 		leafBlocks[i] = b.dataRegionStart + rel
 	}
 
@@ -322,7 +322,7 @@ func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, ext
 			if rel == 0 {
 				return 0, syscall.ENOSPC
 			}
-			*allocated = append(*allocated, rel)
+			allocated.addBlock(rel)
 			return b.dataRegionStart + rel, nil
 		})
 	if err != nil {

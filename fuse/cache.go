@@ -153,7 +153,9 @@ func (b *BrieFS) dirtyView(block uint64) ([]byte, bool) {
 
 // deferBlockFree returns a data block to the allocator only once its freeing
 // record commits: the rel is queued in pendingFrees (applied by SyncMeta at
-// journal-sync time, after the commit point).  Any deferred content for the
+// journal-sync time, after the commit point).  The queue is run-encoded
+// (blockRun): addBlock tail-merges, so freeing a whole-device file queues one
+// run instead of ~26M per-block entries (generic/299).  Any deferred content for the
 // block is KEPT — a trie page or btree node emptied this window is dead to the
 // live path (the records re-derive the structure without it), but its content
 // must still reach the disk at the next commit: journal replay of a window
@@ -174,9 +176,15 @@ func (b *BrieFS) dirtyView(block uint64) ([]byte, bool) {
 // (the generic/040/041 free-vs-commit class, seen in TestCrashSlotReuseReplay:
 // a reused trie page clobbered the new file's data).
 func (b *BrieFS) deferBlockFree(abs uint64) {
+	b.deferBlockFreeRun(abs, 1)
+}
+
+// deferBlockFreeRun is deferBlockFree for a whole contiguous run of absolute
+// data blocks [abs, abs+n): one queue entry per run, not per block.
+func (b *BrieFS) deferBlockFreeRun(abs, n uint64) {
 	rel := abs - b.dataRegionStart
 	b.dirtyMu.Lock()
-	b.pendingFrees = append(b.pendingFrees, rel)
+	b.pendingFrees.addRun(rel, n)
 	b.dirtyMu.Unlock()
 }
 
@@ -188,7 +196,7 @@ func (b *BrieFS) deferBlockFree(abs uint64) {
 func (b *BrieFS) pendingFreeCount() uint64 {
 	b.dirtyMu.Lock()
 	defer b.dirtyMu.Unlock()
-	return uint64(len(b.pendingFrees))
+	return b.pendingFrees.count()
 }
 
 // reclaimPendingFrees implements Allocator.reclaim for the data allocator:
@@ -277,11 +285,13 @@ var syncMetaPause func()
 func (b *BrieFS) SyncMeta() error {
 	b.dirtyMu.Lock()
 	frees := b.pendingFrees
-	b.pendingFrees = nil
+	b.pendingFrees = runAccum{}
 	if len(b.dirtyBlocks) == 0 {
 		b.dirtyMu.Unlock()
-		for _, rel := range frees {
-			b.dataAlloc.FreeBlock(rel)
+		for _, run := range frees.runs {
+			for i := uint64(0); i < run.n; i++ {
+				b.dataAlloc.FreeBlock(run.first + i)
+			}
 		}
 		return nil
 	}
@@ -311,13 +321,15 @@ func (b *BrieFS) SyncMeta() error {
 			// taken from pendingFrees above — restore them, or the blocks
 			// leak from the allocator until remount.
 			b.dirtyMu.Lock()
-			b.pendingFrees = append(frees, b.pendingFrees...)
+			b.pendingFrees.runs = append(frees.runs, b.pendingFrees.runs...)
 			b.dirtyMu.Unlock()
 			return fmt.Errorf("briefs: drain deferred block %d: %w", block, err)
 		}
 	}
-	for _, rel := range frees {
-		b.dataAlloc.FreeBlock(rel)
+	for _, run := range frees.runs {
+		for i := uint64(0); i < run.n; i++ {
+			b.dataAlloc.FreeBlock(run.first + i)
+		}
 	}
 	b.dirtyMu.Lock()
 	for blk, buf := range snap {

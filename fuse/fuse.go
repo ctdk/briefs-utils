@@ -83,14 +83,14 @@ type BrieFS struct {
 	dirtyBlocks map[uint64][]byte
 	dirtyMu     sync.Mutex
 
-	// pendingFrees holds data blocks (data-relative) whose freeing records
-	// (JRN_EXTENT_FREE / JRN_TRIE_ALLOC op=1) have been journaled but not
-	// yet committed.  The free is applied to the in-memory allocator only
-	// when the journal commits (SyncMeta, cache.go) — the same gate
-	// commitExtentChange applies to extent frees — so a freed block can
-	// never be reallocated while the last committed on-disk state still
+	// pendingFrees holds data blocks (data-relative, run-encoded) whose
+	// freeing records (JRN_EXTENT_FREE / JRN_TRIE_ALLOC op=1) have been
+	// journaled but not yet committed.  The free is applied to the in-memory
+	// allocator only when the journal commits (SyncMeta, cache.go) — the
+	// same gate commitExtentChange applies to extent frees — so a freed block
+	// can never be reallocated while the last committed on-disk state still
 	// references it.  Guarded by dirtyMu like dirtyBlocks.
-	pendingFrees []uint64
+	pendingFrees runAccum
 
 	// dataDrainPending is set by buffered extent ops (commitExtentChange and
 	// friends, file_ops.go): new data and btree node blocks are in the device

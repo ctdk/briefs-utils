@@ -121,7 +121,7 @@ func (b *BrieFS) fallocateOp(ino uint64, off, size uint64, mode uint32) error {
 	// block joins preallocate's rollback/journal list so a later failure
 	// frees it and the commit journals a JRN_EXTENT_ALLOC for it.
 	end := off + size
-	var allocated []uint64
+	var allocated runAccum
 	if in.Flags&briefs.InodeFlagInlineData != 0 && end > inlineDataMax {
 		var drain []uint64
 		if err := b.promoteInlineData(in, &drain, &allocated); err != nil {
@@ -130,7 +130,7 @@ func (b *BrieFS) fallocateOp(ino uint64, off, size uint64, mode uint32) error {
 		}
 	}
 
-	return b.preallocate(in, off, end, mode, allocated)
+	return b.preallocate(in, off, end, mode, &allocated)
 }
 
 // allocUnwrittenHole allocates unwritten extent(s) covering the hole blocks
@@ -138,17 +138,16 @@ func (b *BrieFS) fallocateOp(ino uint64, off, size uint64, mode uint32) error {
 // bitmap pass) and falling back to per-block allocation when the bitmap is too
 // fragmented for a run — the kernel's briefs_zero_alloc_hole pattern
 // (file.c:2797), which replaced per-block hole allocation in 0fd1448.
-// Allocated data-relative blocks are appended to *allocated (the caller's
-// rollback list); on ENOSPC the partial allocations are left in *allocated for
-// the caller to roll back. The returned extents are unwritten and sorted; the
-// caller inserts them via insertExtentSorted (which merges adjacent
-// phys-contiguous runs).
-func (b *BrieFS) allocUnwrittenHole(startBlk, endBlk uint64, allocated *[]uint64) ([]briefs.Extent, error) {
+// Allocated data-relative blocks are accumulated into *allocated (the
+// caller's rollback list, run-encoded — addRun for the run path, tail-merged
+// addBlock for the fallback); on ENOSPC the partial allocations are left in
+// *allocated for the caller to roll back. The returned extents are unwritten
+// and sorted; the caller inserts them via insertExtentSorted (which merges
+// adjacent phys-contiguous runs).
+func (b *BrieFS) allocUnwrittenHole(startBlk, endBlk uint64, allocated *runAccum) ([]briefs.Extent, error) {
 	seg := endBlk - startBlk
 	if rel := b.dataAlloc.AllocBlocks(seg); rel != 0 {
-		for i := uint64(0); i < seg; i++ {
-			*allocated = append(*allocated, rel+i)
-		}
+		allocated.addRun(rel, seg)
 		return []briefs.Extent{{
 			Offset: startBlk,
 			Phys:   b.dataRegionStart + rel,
@@ -164,7 +163,7 @@ func (b *BrieFS) allocUnwrittenHole(startBlk, endBlk uint64, allocated *[]uint64
 		if rel == 0 {
 			return nil, syscall.ENOSPC
 		}
-		*allocated = append(*allocated, rel)
+		allocated.addBlock(rel)
 		exts = append(exts, briefs.Extent{
 			Offset: blk,
 			Phys:   b.dataRegionStart + rel,
@@ -180,7 +179,7 @@ func (b *BrieFS) allocUnwrittenHole(startBlk, endBlk uint64, allocated *[]uint64
 // is unchanged; otherwise it grows to end. allocated carries any blocks already
 // allocated by the caller this op (inline-data promotion) so they are journaled
 // and rolled back with the preallocate's own allocations.
-func (b *BrieFS) preallocate(in *briefs.Inode, start, end uint64, mode uint32, allocated []uint64) error {
+func (b *BrieFS) preallocate(in *briefs.Inode, start, end uint64, mode uint32, allocated *runAccum) error {
 	bs := b.blockSize
 	startBlk := start / bs
 	endBlk := (end + bs - 1) / bs // ceiling
@@ -204,9 +203,9 @@ func (b *BrieFS) preallocate(in *briefs.Inode, start, end uint64, mode uint32, a
 			}
 			holeEnd++
 		}
-		newExts, err := b.allocUnwrittenHole(blk, holeEnd, &allocated)
+		newExts, err := b.allocUnwrittenHole(blk, holeEnd, allocated)
 		if err != nil {
-			b.rollbackAlloc(allocated)
+			b.rollbackAlloc(*allocated)
 			return err
 		}
 		for _, e := range newExts {
@@ -227,8 +226,8 @@ func (b *BrieFS) preallocate(in *briefs.Inode, start, end uint64, mode uint32, a
 
 	// Rebuild the index (new btree nodes are added to allocated) and commit.
 	var drain []uint64
-	if err := b.rebuildExtentIndex(in, exts, oldNodes, &drain, &allocated); err != nil {
-		b.rollbackAlloc(allocated)
+	if err := b.rebuildExtentIndex(in, exts, oldNodes, &drain, allocated); err != nil {
+		b.rollbackAlloc(*allocated)
 		return err
 	}
 	// Raise the metadata shield for the unwritten blocks this preallocate
@@ -343,7 +342,7 @@ func (b *BrieFS) punchHole(in *briefs.Inode, off, size uint64) error {
 		}
 	}
 	var newExts []briefs.Extent
-	var freed []uint64
+	var freed []blockRun
 	if delStart < delEnd {
 		newExts, freed = freeExtentRange(exts, delStart, delEnd)
 	} else {
@@ -365,7 +364,7 @@ func (b *BrieFS) punchHole(in *briefs.Inode, off, size uint64) error {
 	}
 
 	if extentChanged {
-		var allocated []uint64
+		var allocated runAccum
 		var drain []uint64
 		if err := b.rebuildExtentIndex(in, newExts, oldNodes, &drain, &allocated); err != nil {
 			b.rollbackAlloc(allocated)
@@ -374,7 +373,7 @@ func (b *BrieFS) punchHole(in *briefs.Inode, off, size uint64) error {
 		// The punched-out blocks may have been unwritten: release their share of
 		// the shield before the commit (kernel release in briefs_do_punch_hole).
 		b.updateUnwrittenRes(in.InodeNumber, newExts)
-		return b.commitExtentChange(in, allocated, freed, oldNodes)
+		return b.commitExtentChange(in, &allocated, freed, oldNodes)
 	}
 
 	if !changed {
@@ -416,7 +415,7 @@ func (b *BrieFS) punchHole(in *briefs.Inode, off, size uint64) error {
 // to S+L. No blocks are freed or allocated. The returned list is folded
 // through insertExtentSorted so adjacent phys-contiguous same-flag pieces
 // merge, like the kernel's rebuild.
-func shiftExtents(exts []briefs.Extent, S, L uint64, dir int) (newExts []briefs.Extent, freed []uint64) {
+func shiftExtents(exts []briefs.Extent, S, L uint64, dir int) (newExts []briefs.Extent, freed []blockRun) {
 	var raw []briefs.Extent
 	for _, e := range exts {
 		o, eend := e.Offset, e.Offset+e.Len
@@ -430,11 +429,10 @@ func shiftExtents(exts []briefs.Extent, S, L uint64, dir int) (newExts []briefs.
 				e.Offset = o - L
 				raw = append(raw, e)
 			case o >= S && eend <= S+L:
-				// Wholly inside the removed range: free, drop.
+				// Wholly inside the removed range: free, drop. One run per
+				// extent (phys-contiguous within it), not per block.
 				if e.Phys != 0 {
-					for blk := o; blk < eend; blk++ {
-						freed = append(freed, e.Phys+(blk-o))
-					}
+					freed = append(freed, blockRun{first: e.Phys, n: eend - o})
 				}
 			default:
 				// Straddles S and/or S+L.
@@ -449,9 +447,10 @@ func shiftExtents(exts []briefs.Extent, S, L uint64, dir int) (newExts []briefs.
 					midEnd = S + L
 				}
 				if midStart < midEnd && e.Phys != 0 {
-					for blk := midStart; blk < midEnd; blk++ {
-						freed = append(freed, e.Phys+(blk-o))
-					}
+					freed = append(freed, blockRun{
+						first: e.Phys + (midStart - o),
+						n:     midEnd - midStart,
+					})
 				}
 				if eend > S+L {
 					raw = append(raw, briefs.Extent{
@@ -516,7 +515,7 @@ func (b *BrieFS) collapseRangeOp(in *briefs.Inode, off, size uint64) error {
 	in.MtimeSec, in.MtimeNsec = sec, nsec
 	in.CtimeSec, in.CtimeNsec = sec, nsec
 
-	var allocated []uint64
+	var allocated runAccum
 	var drain []uint64
 	if err := b.rebuildExtentIndex(in, newExts, oldNodes, &drain, &allocated); err != nil {
 		b.rollbackAlloc(allocated)
@@ -525,7 +524,7 @@ func (b *BrieFS) collapseRangeOp(in *briefs.Inode, off, size uint64) error {
 	// Freed collapsed blocks may have been unwritten: shrink the shield for
 	// the remainder (kernel release in briefs_do_collapse_range).
 	b.updateUnwrittenRes(in.InodeNumber, newExts)
-	return b.commitExtentChange(in, allocated, freed, oldNodes)
+	return b.commitExtentChange(in, &allocated, freed, oldNodes)
 }
 
 // insertRangeOp mirrors briefs_do_insert_range (file.c:3316): open a
@@ -563,13 +562,13 @@ func (b *BrieFS) insertRangeOp(in *briefs.Inode, off, size uint64) error {
 	in.MtimeSec, in.MtimeNsec = sec, nsec
 	in.CtimeSec, in.CtimeNsec = sec, nsec
 
-	var allocated []uint64
+	var allocated runAccum
 	var drain []uint64
 	if err := b.rebuildExtentIndex(in, newExts, oldNodes, &drain, &allocated); err != nil {
 		b.rollbackAlloc(allocated)
 		return err
 	}
-	return b.commitExtentChange(in, allocated, nil, oldNodes)
+	return b.commitExtentChange(in, &allocated, nil, oldNodes)
 }
 
 // zeroRangeOp mirrors briefs_do_zero_range (file.c:2846): zero the contents
@@ -594,7 +593,7 @@ func (b *BrieFS) zeroRangeOp(in *briefs.Inode, off, size uint64, mode uint32) er
 	bs := b.blockSize
 	end := off + size
 
-	var allocated []uint64
+	var allocated runAccum
 
 	// Inline-data file whose range fits the 256-byte region: zero in place.
 	if in.Flags&briefs.InodeFlagInlineData != 0 {
@@ -779,7 +778,7 @@ func (b *BrieFS) zeroRangeOp(in *briefs.Inode, off, size uint64, mode uint32) er
 		// for every block that ends the op unwritten but did not start it,
 		// file.c:3017-3019) and keep it (unwritten->unwritten stays counted).
 		b.updateUnwrittenRes(in.InodeNumber, newExts)
-		return b.commitExtentChange(in, allocated, nil, oldNodes)
+		return b.commitExtentChange(in, &allocated, nil, oldNodes)
 	}
 
 	// No extent change: persist the inode (times, possible growth) and the
@@ -1055,7 +1054,7 @@ func (b *BrieFS) truncateLocked(in *briefs.Inode, newSize uint64) error {
 		sec, nsec := nowTime()
 		in.MtimeSec, in.MtimeNsec = sec, nsec
 		in.CtimeSec, in.CtimeNsec = sec, nsec
-		var allocated []uint64
+		var allocated runAccum
 		var drain []uint64
 		if err := b.rebuildExtentIndex(in, newExts, oldNodes, &drain, &allocated); err != nil {
 			b.rollbackAlloc(allocated)
@@ -1064,7 +1063,7 @@ func (b *BrieFS) truncateLocked(in *briefs.Inode, newSize uint64) error {
 		// Truncated-away blocks may have been unwritten: shrink the shield
 		// for the remainder (kernel release in briefs_setattr truncate).
 		b.updateUnwrittenRes(in.InodeNumber, newExts)
-		return b.commitExtentChange(in, allocated, freed, oldNodes)
+		return b.commitExtentChange(in, &allocated, freed, oldNodes)
 	}
 	// Truncate up.
 	if oldSize%bs != 0 && oldSize > 0 && in.Flags&briefs.InodeFlagInlineData == 0 {
@@ -1090,7 +1089,7 @@ func (b *BrieFS) truncateLocked(in *briefs.Inode, newSize uint64) error {
 	// A truncate up that stays within the region zeroes the tail it exposes
 	// (truncate_setsize parity): the region can hold stale bytes from
 	// before a down-truncate.
-	var allocated []uint64
+	var allocated runAccum
 	if in.Flags&briefs.InodeFlagInlineData != 0 && newSize > inlineDataMax {
 		var drain []uint64
 		if err := b.promoteInlineData(in, &drain, &allocated); err != nil {
@@ -1110,14 +1109,14 @@ func (b *BrieFS) truncateLocked(in *briefs.Inode, newSize uint64) error {
 	sec, nsec := nowTime()
 	in.MtimeSec, in.MtimeNsec = sec, nsec
 	in.CtimeSec, in.CtimeNsec = sec, nsec
-	if len(allocated) > 0 {
+	if allocated.count() > 0 {
 		// The promotion moved the inline tail to a freshly allocated data
 		// block: journal a JRN_EXTENT_ALLOC for it (allocator parity —
 		// without the record, replay re-assigns the in-use block, the
 		// generic/040/041 family) instead of the plain inode-only commit
 		// below.  commitExtentChange also arms the pre-commit drain for the
 		// promoted block and snapshots the inode with its new extent list.
-		return b.commitExtentChange(in, allocated, nil, nil)
+		return b.commitExtentChange(in, &allocated, nil, nil)
 	}
 	if err := b.journalInodeFull(in); err != nil {
 		b.failWrite()
@@ -1155,7 +1154,7 @@ func (b *BrieFS) removePrivs(in *briefs.Inode) error {
 // freeing any mapped blocks in the range and splitting overlapping extents. The
 // range becomes a hole (a gap in the returned list). Returns the new list and
 // the freed absolute block numbers.
-func freeExtentRange(exts []briefs.Extent, startBlk, endBlk uint64) (newExts []briefs.Extent, freed []uint64) {
+func freeExtentRange(exts []briefs.Extent, startBlk, endBlk uint64) (newExts []briefs.Extent, freed []blockRun) {
 	for _, ext := range exts {
 		extEnd := ext.Offset + ext.Len
 		if extEnd <= startBlk || ext.Offset >= endBlk {
@@ -1170,11 +1169,14 @@ func freeExtentRange(exts []briefs.Extent, startBlk, endBlk uint64) (newExts []b
 		if ovEnd > endBlk {
 			ovEnd = endBlk
 		}
-		// Free the overlapping mapped blocks.
-		if ext.Phys != 0 {
-			for blk := ovStart; blk < ovEnd; blk++ {
-				freed = append(freed, ext.Phys+(blk-ext.Offset))
-			}
+		// Free the overlapping mapped blocks: one run per overlapping
+		// portion of an extent (the blocks are phys-contiguous within it),
+		// never per-block entries (generic/299's ~26M-entry free lists).
+		if ext.Phys != 0 && ovStart < ovEnd {
+			freed = append(freed, blockRun{
+				first: ext.Phys + (ovStart - ext.Offset),
+				n:     ovEnd - ovStart,
+			})
 		}
 		// Keep the portion before the overlap.
 		if ext.Offset < ovStart {

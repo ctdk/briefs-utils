@@ -163,14 +163,13 @@ func (b *BrieFS) freeInodeData(in *briefs.Inode) error {
 		if ext.Phys == 0 {
 			continue // hole
 		}
-		for k := uint64(0); k < ext.Len; k++ {
-			b.deferBlockFree(ext.Phys + k)
-		}
-		// One record per extent, run-encoded — the kernel's
-		// briefs_btree_free_all journals e->len once per extent
-		// (btree.c).  A large unlinked file would otherwise emit one
-		// EXTENT_FREE record per block, the same amplification that
-		// OOM'd the daemon on generic/299's whole-device falloc.
+		// One queued run + one journal record per extent, run-encoded —
+		// the kernel's briefs_btree_free_all journals e->len once per
+		// extent (btree.c).  A large unlinked file would otherwise queue
+		// and emit one pending-free entry and EXTENT_FREE record per
+		// block — the same per-block amplification that OOM'd the daemon
+		// on generic/299's whole-device falloc/truncate cycle.
+		b.deferBlockFreeRun(ext.Phys, ext.Len)
 		if err := b.journalExtentFree(in.InodeNumber, ext.Phys, ext.Len); err != nil {
 			return err
 		}
