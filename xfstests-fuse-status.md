@@ -417,7 +417,12 @@ The FUSE bridge implements all BrieFS operations at full kernel parity
   NOT RUN), and the file-range exchange ioctls (XFS_IOC_EXCHANGE_RANGE/
   SWAP_RANGE, COMMIT_RANGE — deferred, rationale in `fuse/ioctl_mount.go`).
   O_TMPFILE is not bridge-addressable: the 6.12 FUSE client has no O_TMPFILE
-  support.
+  support.  `sync(2)` on the mount is a silent no-op: the 6.12 FUSE client
+  only wires `fc->sync_fs` for fuseblk mounts (`ctx->is_bdev`,
+  fs/fuse/inode.c:1742) so FUSE_SYNCFS is never sent, and go-fuse has no
+  dispatch for it regardless — accepted as a documented limitation
+  (generic/520's sync-only cases fail; every fsync case passes).  Fix shape
+  if ever needed: fuseblk mount plus a patched go-fuse FUSE_SYNCFS dispatch.
 
 ## Repository layout
 
