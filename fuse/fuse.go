@@ -3,6 +3,7 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -624,16 +625,21 @@ func (n *brieFSNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Er
 	return 0
 }
 
-// errToErrno maps a Go error to a FUSE errno.  syscall.Errno values pass through
-// unchanged; anything else is treated as an I/O error and logged — these are
-// unexpected internal failures (btree parse, checksum, device I/O), and the
-// raw error text is the only lead for diagnosing them (generic/300's transient
-// fio EIOs carried no daemon-side trace).
+// errToErrno maps a Go error to a FUSE errno.  syscall.Errno values pass
+// through unchanged — including one buried in fmt.Errorf("%w") chains, so a
+// wrapped ENOSPC reaches the caller as ENOSPC, not as the EIO a bare type
+// switch would report (generic/300: fio tolerates ENOSPC via ignore_error,
+// but the bridge's wrapped "alloc leaf N: no space left on device" arrived as
+// err=5 Input/output error and poisoned the run).  Errors carrying no errno
+// at all are unexpected internal failures (btree parse, checksum, device
+// I/O) and are logged before returning EIO — the raw error text is the only
+// lead for diagnosing them.
 func errToErrno(err error) syscall.Errno {
 	if err == nil {
 		return 0
 	}
-	if e, ok := err.(syscall.Errno); ok {
+	var e syscall.Errno
+	if errors.As(err, &e) {
 		return e
 	}
 	fmt.Fprintf(os.Stderr, "fuse.briefs: EIO: %v\n", err)
@@ -744,13 +750,13 @@ func (n *brieFSNode) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) s
 		return syscall.EROFS
 	}
 	if err := n.bfs.journal.Sync(false); err != nil {
-		return syscall.EIO
+		return errToErrno(fmt.Errorf("fsync: journal sync: %w", err))
 	}
 	if err := n.bfs.flushDirtyMeta(); err != nil {
-		return syscall.EIO
+		return errToErrno(fmt.Errorf("fsync: dirty meta drain: %w", err))
 	}
 	if err := n.bfs.dev.Fdatasync(); err != nil {
-		return syscall.EIO
+		return errToErrno(fmt.Errorf("fsync: fdatasync: %w", err))
 	}
 	return 0
 }
