@@ -19,12 +19,21 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"syscall"
+	"time"
 )
 
 // startMemDebug installs the SIGUSR1 dumper and the SIGUSR2 heap profiler.
 // Cheap when unused: one goroutine parked in select.  Wired by Mount for the
 // life of the mount.
+//
+// BRIEFS_MEM_TICK=<seconds> additionally self-dumps every tick from inside
+// the daemon — external pollers have repeatedly failed to survive the very
+// memory pressure they are trying to observe (two runs, zero ticks), and an
+// OOM kill leaves nothing behind.  Each tick past a new heapAlloc threshold
+// (1G .. 3G in 512M steps) also writes a heap profile, so the growth sites
+// are captured before the kill instead of after it.
 func (b *BrieFS) startMemDebug(stop <-chan struct{}) {
 	ch := make(chan os.Signal, 4)
 	signal.Notify(ch, syscall.SIGUSR1, syscall.SIGUSR2)
@@ -49,6 +58,45 @@ func (b *BrieFS) startMemDebug(stop <-chan struct{}) {
 			}
 		}
 	}()
+
+	if secs := os.Getenv("BRIEFS_MEM_TICK"); secs != "" {
+		interval, err := strconv.Atoi(secs)
+		if err != nil || interval <= 0 {
+			interval = 5
+		}
+		go b.memTickLoop(stop, time.Duration(interval)*time.Second)
+	}
+}
+
+// memTickLoop self-dumps memstats on a fixed interval and writes a heap
+// profile each time heapAlloc crosses a fresh 512M threshold above 1G —
+// the 299 daemon dies at ~3.2G anon-rss, so the last profiles land just
+// before the kill.
+func (b *BrieFS) memTickLoop(stop <-chan struct{}, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	const step = 512 << 20
+	nextThreshold := int64(2 * step) // first profile at 1G heapAlloc
+	profiles := 0
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			b.dumpMemStats()
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			for int64(ms.HeapAlloc) >= nextThreshold {
+				profiles++
+				path := fmt.Sprintf("/tmp/briefs-heap-%d-tick%d.pprof", os.Getpid(), profiles)
+				if f, err := os.Create(path); err == nil {
+					pprof.WriteHeapProfile(f)
+					f.Close()
+				}
+				nextThreshold += step
+			}
+		}
+	}
 }
 
 // dumpMemStats prints one line of live counter values.

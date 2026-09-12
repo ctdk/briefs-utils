@@ -79,9 +79,16 @@ pidfile="/tmp/fuse-briefs-$(echo "$target" | tr / _).pid"
 # systems, non-root callers, or a lingering unit name collision).
 pid=""
 unit="fuse-briefs-$(echo "$target" | tr / _ | tr -cd '[:alnum:]_.-')-$$"
+# systemd-run starts the unit with a clean environment, so any daemon
+# debug knobs set in the caller's environment must be forwarded
+# explicitly (currently just the BRIEFS_MEM_TICK memstats self-dumper).
+prop=()
+[ -n "${BRIEFS_MEM_TICK:-}" ] && \
+  prop+=(-p "Environment=BRIEFS_MEM_TICK=$BRIEFS_MEM_TICK")
 if [ "$(id -u)" = 0 ] && command -v systemd-run >/dev/null 2>&1; then
   if systemd-run --unit="$unit" --collect --quiet \
        -p StandardOutput="append:$log" -p StandardError="append:$log" \
+       "${prop[@]}" \
        "$daemon" -i "$src" -m "$target" >/dev/null 2>&1; then
     # systemd-run returns once the unit is started; MainPID should be set
     # by then, but retry briefly in case we race the service's fork.
