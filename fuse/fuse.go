@@ -270,6 +270,14 @@ func Mount(imagePath string, opts MountOptions) error {
 		return fmt.Errorf("journal replay: %w", err)
 	}
 
+	// SIGUSR1 dumps deferred-state counters to stderr (mem_debug.go): the
+	// daemon's write-back map / free queue only shrink at a journal sync, so
+	// a never-syncing workload can turn a growth bug into a bare OOM kill
+	// with nothing in the log.  Parked when unused; stops at unmount.
+	memStop := make(chan struct{})
+	defer close(memStop)
+	bfs.startMemDebug(memStop)
+
 	root := &brieFSNode{
 		bfs: bfs,
 		ino: sb.RootIno,
