@@ -153,19 +153,30 @@ func (b *BrieFS) dirtyView(block uint64) ([]byte, bool) {
 
 // deferBlockFree returns a data block to the allocator only once its freeing
 // record commits: the rel is queued in pendingFrees (applied by SyncMeta at
-// journal-sync time, after the commit point), and any deferred content for
-// the block is dropped — an emptied trie page or a dropped btree node is dead
-// (the records re-derive the structure without it), and a stale deferred copy
-// would shadow reads of — and a later drain clobber — whatever the block's
-// next owner writes into it.  Freeing at op time instead, before the record
-// commits, let the block be reallocated for data whose fresh content the drain
-// then overwrote (the generic/040/041 free-vs-commit class, seen in
-// TestCrashSlotReuseReplay: a reused trie page clobbered the new file's data).
+// journal-sync time, after the commit point).  Any deferred content for the
+// block is KEPT — a trie page or btree node emptied this window is dead to the
+// live path (the records re-derive the structure without it), but its content
+// must still reach the disk at the next commit: journal replay of a window
+// that spans the block's whole life re-derives the earlier DIR_UPDATEs against
+// the parent's on-disk trie root as of that record, and a root freed later in
+// the window is still WALKED for the earlier adds (generic/335: the mv that
+// empties a/b frees its trie root mid-window; the replayed create-time
+// dir-add of a/b/foo walks that root, and a never-written page is garbage —
+// bad trie page magic, which TrieInsert collapses into a spurious ENOSPC).
+// The kernel gets this for free: freed-but-dirty metadata buffers stay
+// pinned and journal-owned until the transaction's flush_owned writes them
+// (the Phase 2 pin-survives-free design).  Safe against the next owner
+// because SyncMeta drains the deferred content BEFORE applying the frees —
+// a freed block is not in the allocator until after its stale content is
+// written, so the drain cannot clobber a new owner.
+// Freeing at op time instead, before the record commits, let the block be
+// reallocated for data whose fresh content the drain then overwrote
+// (the generic/040/041 free-vs-commit class, seen in TestCrashSlotReuseReplay:
+// a reused trie page clobbered the new file's data).
 func (b *BrieFS) deferBlockFree(abs uint64) {
 	rel := abs - b.dataRegionStart
 	b.dirtyMu.Lock()
 	b.pendingFrees = append(b.pendingFrees, rel)
-	delete(b.dirtyBlocks, abs)
 	b.dirtyMu.Unlock()
 }
 
@@ -258,6 +269,11 @@ var syncMetaPause func()
 // value mid-run).  While a newer copy is in the map, readers see it through
 // the dirty view and the next drain rewrites the page cache, so the
 // temporarily-regressed page cache is invisible.
+//
+// The frees apply only AFTER the drain writes: freed blocks keep a deferred
+// copy until here (deferBlockFree), so releasing one to the allocator before
+// its stale content is written would let the drain clobber the block's next
+// owner — the free-vs-commit class the deferral exists to prevent.
 func (b *BrieFS) SyncMeta() error {
 	b.dirtyMu.Lock()
 	frees := b.pendingFrees
@@ -281,17 +297,27 @@ func (b *BrieFS) SyncMeta() error {
 		// only by microsecond timing in production.
 		syncMetaPause()
 	}
-	for _, rel := range frees {
-		b.dataAlloc.FreeBlock(rel)
-	}
+	// Drain BEFORE applying the frees: a freed block's deferred content is
+	// deliberately kept until here (deferBlockFree), so the free must not
+	// enter the allocator while the stale copy is still pending — the
+	// allocator could hand the block to a new owner whose fresh content this
+	// drain would then clobber (the generic/040/041 free-vs-commit class).
 	for block, buf := range snap {
 		if err := b.dev.WriteBlock(block, buf); err != nil {
 			// Nothing was removed from the deferred map, so a later sync
 			// retries every block of this drain, including the ones this
 			// loop already wrote (their content is unchanged and the map
-			// copy is the one that counts for readers).
+			// copy is the one that counts for readers).  The frees were
+			// taken from pendingFrees above — restore them, or the blocks
+			// leak from the allocator until remount.
+			b.dirtyMu.Lock()
+			b.pendingFrees = append(frees, b.pendingFrees...)
+			b.dirtyMu.Unlock()
 			return fmt.Errorf("briefs: drain deferred block %d: %w", block, err)
 		}
+	}
+	for _, rel := range frees {
+		b.dataAlloc.FreeBlock(rel)
 	}
 	b.dirtyMu.Lock()
 	for blk, buf := range snap {
@@ -370,9 +396,11 @@ func (b *BrieFS) flushDirtyMeta() error {
 }
 
 // cacheDrop removes a block from the op cache without writing it, for paths
-// that free a metadata block mid-op (an emptied trie page): the block's
-// content is dead and must not survive into the deferred map, where it would
-// shadow reads and be drained over the block's next owner.
+// that free a metadata block mid-op (an emptied trie page): the block is dead
+// to the live path, so a later saveBlock in this op must not re-enter a copy
+// into the deferred map.  Any copy already in the deferred map survives on
+// purpose — replay of an earlier window record may still walk the block
+// (deferBlockFree), and SyncMeta drains before frees apply.
 func (b *BrieFS) cacheDrop(block uint64) {
 	delete(b.cache, block)
 	delete(b.cacheDirty, block)

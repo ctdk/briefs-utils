@@ -586,9 +586,9 @@ func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels, freedAbs, o
 		}
 	}
 	// The frees apply when their records commit: SyncMeta (after the next
-	// sync's commit point) takes them from pendingFrees.  deferBlockFree also
-	// drops any deferred copy of the block, so it cannot shadow reads of —
-	// or clobber the drain for — the block's next owner.
+	// sync's commit point) takes them from pendingFrees, draining any
+	// deferred copy of the block BEFORE the free enters the allocator (see
+	// deferBlockFree — the deferred copy is kept for full-window replay).
 	for _, abs := range freedAbs {
 		b.deferBlockFree(abs)
 	}

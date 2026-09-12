@@ -454,12 +454,15 @@ func (b *BrieFS) trieFreeNode(ref uint64) error {
 		return b.saveBlock(block, buf)
 	}
 
-	// Page is empty: the page's content is dead — the parent no longer
-	// references the block, and replay re-derives the trie from the dir
-	// records without it.  Drop it from the op cache (a saveBlock here would
-	// re-enter the deferred map, and a later drain would clobber whatever the
-	// block's next owner writes), journal the free, and defer returning the
-	// block to the allocator until that record commits.
+	// Page is empty: the parent no longer references the block, so it is
+	// dead to the live path — but NOT to replay, which re-derives earlier
+	// window ops against on-disk state that may still point here
+	// (generic/335), so any deferred copy stays in the map for the next
+	// drain (deferBlockFree).  Drop it from the op cache only: a saveBlock
+	// here would re-enter a newer empty copy into the deferred map, and the
+	// block must not re-enter the allocator before that map drains
+	// (SyncMeta drains before applying frees).  Journal the free and defer
+	// returning the block to the allocator until that record commits.
 	b.cacheDrop(block)
 	b.removePartial(block)
 	if err := b.journal.WriteRecord(briefs.JRN_TRIE_ALLOC,
