@@ -4,6 +4,7 @@ package fuse
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"syscall"
 
@@ -624,7 +625,10 @@ func (n *brieFSNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Er
 }
 
 // errToErrno maps a Go error to a FUSE errno.  syscall.Errno values pass through
-// unchanged; anything else is treated as an I/O error.
+// unchanged; anything else is treated as an I/O error and logged — these are
+// unexpected internal failures (btree parse, checksum, device I/O), and the
+// raw error text is the only lead for diagnosing them (generic/300's transient
+// fio EIOs carried no daemon-side trace).
 func errToErrno(err error) syscall.Errno {
 	if err == nil {
 		return 0
@@ -632,6 +636,7 @@ func errToErrno(err error) syscall.Errno {
 	if e, ok := err.(syscall.Errno); ok {
 		return e
 	}
+	fmt.Fprintf(os.Stderr, "fuse.briefs: EIO: %v\n", err)
 	return syscall.EIO
 }
 
