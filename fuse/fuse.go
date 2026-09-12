@@ -126,6 +126,26 @@ type BrieFS struct {
 	// still exists").  Non-nil only during replayJournal; nil otherwise.
 	replayParents map[uint64]*briefs.Inode
 
+	// replayParentsPristine preserves the PRE-replay content of a parent
+	// inode slot: the first JRN_INODE_FULL restore of an inode not yet
+	// cached overwrites the on-disk block with a mid-window snapshot, so a
+	// later first-touch read of the block would anchor re-derivation at that
+	// stale snapshot's DirTrieRoot instead of the state the live path left
+	// (generic/341: an early snapshot restored root=old over root=final, and
+	// the window's re-derived adds linked a second copy of the entries into
+	// a slot the live path had freed and reused for a live leaf — every
+	// entry doubled after replay).  The kernel cannot hit this: its iget
+	// reads the inode block only at the first DIR_UPDATE, and an inode
+	// restored before that point stays un-cached, so the first iget still
+	// sees restored content — but the kernel's crash cut loses unflushed
+	// metadata, leaving the block at the window's START, while the FUSE
+	// bridge drains all metadata at every fsync, leaving the block at the
+	// window's END.  For the bridge the pre-replay state is the correct
+	// anchor: drained names EEXIST/ENOENT as no-ops, undrained-tail records
+	// re-derive genuinely, and every rename's delete/add pair stays on one
+	// root.  Non-nil only during replayJournal; nil otherwise.
+	replayParentsPristine map[uint64][]byte
+
 	// replayTrieBlocks holds the data-relative blocks the journal's
 	// JRN_TRIE_ALLOC records named, in journal order (pass 1), for pass-2's
 	// triePageInit to reuse LIFO instead of re-allocating — the kernel's

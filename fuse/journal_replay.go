@@ -78,6 +78,7 @@ func (b *BrieFS) replayJournal() error {
 	b.xattrLive = make(map[uint64]bool)
 	b.trieSeeded = make(map[uint64]bool)
 	b.replayParents = make(map[uint64]*briefs.Inode)
+	b.replayParentsPristine = make(map[uint64][]byte)
 	b.replayTrieBlocks = nil
 	defer func() {
 		b.xattrFinal = nil
@@ -85,6 +86,7 @@ func (b *BrieFS) replayJournal() error {
 		b.xattrLive = nil
 		b.trieSeeded = nil
 		b.replayParents = nil
+		b.replayParentsPristine = nil
 		b.replayTrieBlocks = nil
 	}()
 
@@ -376,15 +378,17 @@ func (b *BrieFS) buildXattrLiveSet() {
 // replay_dir_update() (journal.c:898).
 //
 // The parent's disk inode is read from its block ONCE per replay (first touch)
-// and kept in replayParents for the rest of the window — the port of the
-// kernel's iget-cached binfo->disk_inode.  JRN_INODE_FULL snapshot restores
-// (replayInodeFull) write the raw block and deliberately do NOT refresh this
-// copy: a rename that empties a directory trie frees the old root and its
-// addDirEntry journals a fresh one, so the window's records alternate between
-// the stale and final DirTrieRoot.  Re-reading the block per record would
-// re-point re-derivation mid-window and apply the old name's delete to the
-// stale root while the re-derived add already landed on the final root — the
-// old name then survives replay (generic/534 "file name 'foo' still exists").
+// and kept in replayParents — the port of the kernel's iget-cached
+// binfo->disk_inode.  Re-reading the block per record would re-point
+// re-derivation at whatever an interleaved JRN_INODE_FULL restore most
+// recently wrote there, splitting a rename's delete/add pair across the stale
+// and final roots (generic/534: the old name survives replay).  The cached
+// anchor is the PRE-replay on-disk state: when an INODE_FULL restore has
+// already overwritten the block before the first DIR_UPDATE, the pristine
+// stashed slot (replayParentsPristine) is used instead of the restored
+// content, so re-derivation never anchors at a mid-window snapshot's stale
+// DirTrieRoot (generic/341: the stale root's freed slot was live-reused and
+// re-derivation linked a second copy of every entry into it).
 func (b *BrieFS) replayDirUpdate(rec *briefs.JrnDirUpdate) error {
 	if rec == nil {
 		return nil
@@ -392,18 +396,25 @@ func (b *BrieFS) replayDirUpdate(rec *briefs.JrnDirUpdate) error {
 	blk, off := b.inodes.inodeLocation(rec.ParentIno)
 	di, ok := b.replayParents[rec.ParentIno]
 	if !ok {
-		buf, err := b.loadBlock(blk)
-		if err != nil {
-			return err
+		var slot []byte
+		if pristine, seen := b.replayParentsPristine[rec.ParentIno]; seen {
+			slot = pristine
+		} else {
+			buf, err := b.loadBlock(blk)
+			if err != nil {
+				return err
+			}
+			slot = buf[off : off+b.inodes.sb.InodeSize]
 		}
 		// Freed parent inode (magic 0): skippable (kernel iget -EINVAL).
-		if binary.LittleEndian.Uint64(buf[off+8:]) != briefs.MagicInode {
+		if binary.LittleEndian.Uint64(slot[8:]) != briefs.MagicInode {
 			return nil
 		}
-		di, err = briefs.UnmarshalInode(buf[off : off+b.inodes.sb.InodeSize])
+		pdi, err := briefs.UnmarshalInode(slot)
 		if err != nil {
 			return nil
 		}
+		di = pdi
 		b.replayParents[rec.ParentIno] = di
 	}
 
@@ -468,16 +479,33 @@ func (b *BrieFS) replayInodeFull(ino uint64, data []byte) error {
 	if raw == nil {
 		return nil
 	}
-	// Log the DirTrieRoot carried in the snapshot (offset 384).
+	// Log the DirTrieRoot carried in the snapshot (offset 416; 384 is
+	// XattrOffset).
 	var snapRoot uint64
-	if len(raw) >= 384+8 {
-		snapRoot = binary.LittleEndian.Uint64(raw[384:])
+	if len(raw) >= 416+8 {
+		snapRoot = binary.LittleEndian.Uint64(raw[416:])
 	}
 	rlog("  inode-full ino=%d snapDirTrieRoot=%d", ino, snapRoot)
 	blk, off := b.inodes.inodeLocation(ino)
 	buf, err := b.loadBlock(blk)
 	if err != nil {
 		return err
+	}
+	// Preserve the pre-replay slot content the first time this replay
+	// restores an inode that no DIR_UPDATE has cached yet (see
+	// replayParentsPristine): the restore below overwrites the block with a
+	// mid-window snapshot, and without the stash a later first-touch read
+	// would anchor that parent's whole re-derivation at the snapshot's
+	// stale DirTrieRoot instead of the state the live path drained
+	// (generic/341).  Stash even when the guards below skip the restore —
+	// the slot then still holds the pre-replay content, which is what the
+	// stash is for.
+	if _, cached := b.replayParents[ino]; !cached && b.replayParentsPristine != nil {
+		if _, seen := b.replayParentsPristine[ino]; !seen {
+			slot := make([]byte, b.inodes.sb.InodeSize)
+			copy(slot, buf[off:off+b.inodes.sb.InodeSize])
+			b.replayParentsPristine[ino] = slot
+		}
 	}
 	// Freed/empty slot: skip (kernel -EINVAL path).
 	if binary.LittleEndian.Uint64(buf[off+8:]) != briefs.MagicInode {
