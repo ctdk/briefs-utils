@@ -77,12 +77,14 @@ func (b *BrieFS) replayJournal() error {
 	b.xattrNext = make(map[uint64]uint64)
 	b.xattrLive = make(map[uint64]bool)
 	b.trieSeeded = make(map[uint64]bool)
+	b.replayParents = make(map[uint64]*briefs.Inode)
 	b.replayTrieBlocks = nil
 	defer func() {
 		b.xattrFinal = nil
 		b.xattrNext = nil
 		b.xattrLive = nil
 		b.trieSeeded = nil
+		b.replayParents = nil
 		b.replayTrieBlocks = nil
 	}()
 
@@ -371,23 +373,38 @@ func (b *BrieFS) buildXattrLiveSet() {
 // replayDirUpdate re-derives a directory trie entry. Add -> TrieInsert (EEXIST
 // tolerated); delete -> TrieRemove (ENOENT tolerated). The parent inode is
 // re-persisted so the replayed trie root reaches its inode block. Mirrors
-// replay_dir_update() (journal.c:548).
+// replay_dir_update() (journal.c:898).
+//
+// The parent's disk inode is read from its block ONCE per replay (first touch)
+// and kept in replayParents for the rest of the window — the port of the
+// kernel's iget-cached binfo->disk_inode.  JRN_INODE_FULL snapshot restores
+// (replayInodeFull) write the raw block and deliberately do NOT refresh this
+// copy: a rename that empties a directory trie frees the old root and its
+// addDirEntry journals a fresh one, so the window's records alternate between
+// the stale and final DirTrieRoot.  Re-reading the block per record would
+// re-point re-derivation mid-window and apply the old name's delete to the
+// stale root while the re-derived add already landed on the final root — the
+// old name then survives replay (generic/534 "file name 'foo' still exists").
 func (b *BrieFS) replayDirUpdate(rec *briefs.JrnDirUpdate) error {
 	if rec == nil {
 		return nil
 	}
 	blk, off := b.inodes.inodeLocation(rec.ParentIno)
-	buf, err := b.loadBlock(blk)
-	if err != nil {
-		return err
-	}
-	// Freed parent inode (magic 0): skippable.
-	if binary.LittleEndian.Uint64(buf[off+8:]) != briefs.MagicInode {
-		return nil
-	}
-	di, err := briefs.UnmarshalInode(buf[off : off+b.inodes.sb.InodeSize])
-	if err != nil {
-		return nil
+	di, ok := b.replayParents[rec.ParentIno]
+	if !ok {
+		buf, err := b.loadBlock(blk)
+		if err != nil {
+			return err
+		}
+		// Freed parent inode (magic 0): skippable (kernel iget -EINVAL).
+		if binary.LittleEndian.Uint64(buf[off+8:]) != briefs.MagicInode {
+			return nil
+		}
+		di, err = briefs.UnmarshalInode(buf[off : off+b.inodes.sb.InodeSize])
+		if err != nil {
+			return nil
+		}
+		b.replayParents[rec.ParentIno] = di
 	}
 
 	// Seed the partial-page pool from the parent's on-disk trie the first
@@ -422,6 +439,10 @@ func (b *BrieFS) replayDirUpdate(rec *briefs.JrnDirUpdate) error {
 
 	// Persist the parent disk inode (replayed trie root) into the cached block.
 	raw, err := di.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	buf, err := b.loadBlock(blk)
 	if err != nil {
 		return err
 	}

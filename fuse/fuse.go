@@ -110,6 +110,20 @@ type BrieFS struct {
 	// replay ENOSPC). Non-nil only during replayJournal; nil otherwise.
 	trieSeeded map[uint64]bool
 
+	// replayParents is the replay-side copy of each directory's disk inode
+	// that replayDirUpdate mutates — the port of the kernel's iget-cached
+	// binfo->disk_inode (generic/534): the first DIR_UPDATE touching a parent
+	// reads its block once, and every later re-derivation for that parent in
+	// the window runs against that same copy.  JRN_INODE_FULL snapshot
+	// restores write the raw block directly (replayInodeFull) and must NOT
+	// re-point the cached copy: a rename that empties a directory trie frees
+	// the old root and journals a fresh one, so re-reading the block per
+	// record applies the window's dir-delete to the stale pre-rename root
+	// while the re-derived add lands on the final root — the old name
+	// reappears after replay (observed as generic/534 "file name 'foo'
+	// still exists").  Non-nil only during replayJournal; nil otherwise.
+	replayParents map[uint64]*briefs.Inode
+
 	// replayTrieBlocks holds the data-relative blocks the journal's
 	// JRN_TRIE_ALLOC records named, in journal order (pass 1), for pass-2's
 	// triePageInit to reuse LIFO instead of re-allocating — the kernel's
