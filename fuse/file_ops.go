@@ -563,27 +563,33 @@ func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels, freedAbs, o
 	// sync (fsync on another file, setxattr) must not commit these records
 	// without first flushing the new data and btree nodes they publish.
 	b.markDataDrain()
-	for _, rel := range allocatedRels {
-		if err := b.journalExtentAlloc(ino, 0, b.dataRegionStart+rel); err != nil {
-			b.failWrite()
-			return err
-		}
+	// Run-encode the block lists: one record per maximal contiguous run,
+	// not one per block.  The kernel journals extents run-encoded
+	// (btree.c briefs_journal_extent_alloc(..., ext->len, ...)); per-block
+	// records made a whole-device falloc emit ~26M EXTENT_ALLOC records —
+	// the ring filled ~9300x (a back-pressure checkpoint each time) and
+	// the transient record buffers OOM'd the daemon (generic/299).
+	if err := journalContigRuns(allocatedRels, func(first, length uint64) error {
+		return b.journalExtentAlloc(ino, 0, b.dataRegionStart+first, length)
+	}); err != nil {
+		b.failWrite()
+		return err
 	}
 	if err := b.journalInodeFull(in); err != nil {
 		b.failWrite()
 		return err
 	}
-	for _, abs := range freedAbs {
-		if err := b.journalExtentFree(ino, abs); err != nil {
-			b.failWrite()
-			return err
-		}
+	if err := journalContigRuns(freedAbs, func(first, length uint64) error {
+		return b.journalExtentFree(ino, first, length)
+	}); err != nil {
+		b.failWrite()
+		return err
 	}
-	for _, abs := range oldNodesAbs {
-		if err := b.journalExtentFree(ino, abs); err != nil {
-			b.failWrite()
-			return err
-		}
+	if err := journalContigRuns(oldNodesAbs, func(first, length uint64) error {
+		return b.journalExtentFree(ino, first, length)
+	}); err != nil {
+		b.failWrite()
+		return err
 	}
 	// The frees apply when their records commit: SyncMeta (after the next
 	// sync's commit point) takes them from pendingFrees, draining any
@@ -878,18 +884,38 @@ func insertExtentSorted(exts []briefs.Extent, ext briefs.Extent) []briefs.Extent
 
 // --- journal + rollback helpers ---
 
-// journalExtentAlloc writes a JRN_EXTENT_ALLOC record for a single block so
-// replay reserves it in the bitmap. ExtentIndex is sentinel (replay ignores it).
-func (b *BrieFS) journalExtentAlloc(ino, offset, phys uint64) error {
-	return b.journal.WriteRecord(briefs.JRN_EXTENT_ALLOC,
-		(&briefs.JrnExtentAlloc{Ino: ino, Offset: offset, Length: 1, PhysStart: phys, ExtentIndex: ^uint32(0)}).Marshal())
+// journalContigRuns calls write once per maximal contiguous run of blocks:
+// adjacent list entries whose numbers are consecutive form one run.  The
+// allocator's run path (allocUnwrittenHole) and the extent walker both
+// produce sorted, phys-contiguous lists, so a whole-device allocation or
+// truncate collapses to a handful of write calls.
+func journalContigRuns(blocks []uint64, write func(first, length uint64) error) error {
+	for i := 0; i < len(blocks); {
+		end := i + 1
+		for end < len(blocks) && blocks[end] == blocks[end-1]+1 {
+			end++
+		}
+		if err := write(blocks[i], uint64(end-i)); err != nil {
+			return err
+		}
+		i = end
+	}
+	return nil
 }
 
-// journalExtentFree writes a JRN_EXTENT_FREE record for a single block so replay
-// frees it in the bitmap.
-func (b *BrieFS) journalExtentFree(ino, phys uint64) error {
+// journalExtentAlloc writes a JRN_EXTENT_ALLOC record covering length blocks
+// from phys so replay reserves them in the bitmap. ExtentIndex is sentinel
+// (replay ignores it).
+func (b *BrieFS) journalExtentAlloc(ino, offset, phys, length uint64) error {
+	return b.journal.WriteRecord(briefs.JRN_EXTENT_ALLOC,
+		(&briefs.JrnExtentAlloc{Ino: ino, Offset: offset, Length: length, PhysStart: phys, ExtentIndex: ^uint32(0)}).Marshal())
+}
+
+// journalExtentFree writes a JRN_EXTENT_FREE record covering length blocks
+// from phys so replay frees them in the bitmap.
+func (b *BrieFS) journalExtentFree(ino, phys, length uint64) error {
 	return b.journal.WriteRecord(briefs.JRN_EXTENT_FREE,
-		(&briefs.JrnExtentFree{Ino: ino, Offset: 0, PhysStart: phys, Length: 1}).Marshal())
+		(&briefs.JrnExtentFree{Ino: ino, Offset: 0, PhysStart: phys, Length: length}).Marshal())
 }
 
 // rollbackAlloc returns a list of data-relative blocks to the allocator. Used

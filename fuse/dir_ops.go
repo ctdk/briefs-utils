@@ -322,7 +322,7 @@ func (b *BrieFS) createNamedInode(parentIno uint64, name string, mode, uid, gid 
 				abort()
 				return nil, err
 			}
-			if err := b.journalExtentAlloc(child.InodeNumber, 0, abs); err != nil {
+			if err := b.journalExtentAlloc(child.InodeNumber, 0, abs, 1); err != nil {
 				b.dataAlloc.FreeBlock(rel)
 				abort()
 				return nil, err

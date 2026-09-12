@@ -142,7 +142,8 @@ func (b *BrieFS) readSymlink(ino uint64) (string, error) {
 }
 
 // freeInodeData frees every data block and btree node an inode owns and journals
-// JRN_EXTENT_FREE for each, mirroring briefs_btree_free_all (extent.c). Inline-
+// JRN_EXTENT_FREE per extent (run-encoded), mirroring briefs_btree_free_all
+// (extent.c). Inline-
 // data inodes own no blocks. Used when an inode reaches nlink 0 (unlink, rename
 // over a target). The frees are deferred until the records commit
 // (deferBlockFree): the block must not be reusable while the last committed
@@ -163,16 +164,20 @@ func (b *BrieFS) freeInodeData(in *briefs.Inode) error {
 			continue // hole
 		}
 		for k := uint64(0); k < ext.Len; k++ {
-			abs := ext.Phys + k
-			b.deferBlockFree(abs)
-			if err := b.journalExtentFree(in.InodeNumber, abs); err != nil {
-				return err
-			}
+			b.deferBlockFree(ext.Phys + k)
+		}
+		// One record per extent, run-encoded — the kernel's
+		// briefs_btree_free_all journals e->len once per extent
+		// (btree.c).  A large unlinked file would otherwise emit one
+		// EXTENT_FREE record per block, the same amplification that
+		// OOM'd the daemon on generic/299's whole-device falloc.
+		if err := b.journalExtentFree(in.InodeNumber, ext.Phys, ext.Len); err != nil {
+			return err
 		}
 	}
 	for _, blk := range nodes {
 		b.deferBlockFree(blk)
-		if err := b.journalExtentFree(in.InodeNumber, blk); err != nil {
+		if err := b.journalExtentFree(in.InodeNumber, blk, 1); err != nil {
 			return err
 		}
 	}

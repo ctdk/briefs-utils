@@ -253,7 +253,7 @@ func (b *BrieFS) commitXattrOp(in *briefs.Inode, absBlocks []uint64, bufs [][]by
 	ino := in.InodeNumber
 	// Journal new blocks: bitmap reservation + content.
 	for i, abs := range absBlocks {
-		if err := b.journalExtentAlloc(ino, 0, abs); err != nil {
+		if err := b.journalExtentAlloc(ino, 0, abs, 1); err != nil {
 			b.failWrite()
 			return err
 		}
@@ -278,7 +278,7 @@ func (b *BrieFS) commitXattrOp(in *briefs.Inode, absBlocks []uint64, bufs [][]by
 			return oerr
 		}
 		for _, blk := range oldBlocks {
-			if err := b.journalExtentFree(ino, blk); err != nil {
+			if err := b.journalExtentFree(ino, blk, 1); err != nil {
 				b.failWrite()
 				return err
 			}
