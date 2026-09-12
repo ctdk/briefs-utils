@@ -330,6 +330,168 @@ found:
 	return runStart
 }
 
+// AllocRunsUpTo allocates up to n data blocks as a list of maximal
+// contiguous runs (data-relative first/length pairs), in a single bitmap
+// pass, and returns them; the total may fall short of n (ENOSPC class —
+// the caller rolls back what it got).  It is the fragmentation fallback
+// behind AllocBlocks: allocUnwrittenHole uses it when no single run
+// satisfies the request, so a hole spanning many free-space fragments
+// costs one run entry per fragment instead of one block list entry per
+// block (generic/299: the per-block fallback materialized ~26M one-block
+// extent structs per whole-device fallocate — a multi-GB transient the
+// Go GC amplifies into an OOM kill where the kernel's 24-byte C arrays
+// fit).  A failed scan gets the same one-shot reclaim retry as the other
+// allocation entry points.
+func (a *Allocator) AllocRunsUpTo(n uint64) []blockRun {
+	if a.l0 == nil || n == 0 {
+		return nil
+	}
+	runs := a.tryAllocRunsUpTo(n)
+	if len(runs) == 0 && a.reclaim != nil && a.reclaim() {
+		runs = a.tryAllocRunsUpTo(n)
+	}
+	return runs
+}
+
+// tryAllocRunsUpTo is AllocRunsUpTo's single scan pass: it walks the L2
+// bitmap harvesting maximal free runs (TrimFreeRuns' scan shape) until n
+// blocks are gathered or the bitmap is exhausted, taking only a prefix
+// of the final run when it overshoots the request.
+func (a *Allocator) tryAllocRunsUpTo(n uint64) []blockRun {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Data allocations respect the metadata shield (tryAllocBlocks).
+	dataAvail := a.freeCount
+	if dataAvail > a.metaShield {
+		dataAvail -= a.metaShield
+	} else {
+		dataAvail = 0
+	}
+	if dataAvail == 0 {
+		return nil
+	}
+	remaining := n
+	if remaining > dataAvail {
+		remaining = dataAvail
+	}
+	if remaining > a.blockCount {
+		return nil
+	}
+
+	// Reserve the data-relative block-0 sentinel so no run starts there
+	// (tryAllocBlocks does the same; mkfs normally did this already).
+	if a.l2[0]&1 != 0 {
+		a.l2[0] &^= 1
+		a.freeCount--
+		dataAvail--
+		if a.l2[0] == 0 {
+			a.l1[0] &^= 1
+			if a.l1[0] == 0 {
+				a.l0[0] &^= 1
+			}
+		}
+		a.dirty = true
+		a.markL2Word(0)
+	}
+
+	var runs []blockRun
+	runStart, runLen := uint64(0), uint64(0)
+	// take records the pending maximal run, truncated to the remaining
+	// request, and consumes it so the scan can start the next run.
+	take := func() {
+		if runLen == 0 {
+			return
+		}
+		if remaining == 0 {
+			runLen = 0
+			return
+		}
+		if runLen > remaining {
+			runLen = remaining
+		}
+		runs = append(runs, blockRun{first: runStart, n: runLen})
+		remaining -= runLen
+		runLen = 0
+	}
+	for w2 := uint64(0); w2 < a.l2Words && remaining > 0; w2++ {
+		word := a.l2[w2]
+		base := w2 * 64
+
+		// Mask trailing bits beyond blockCount in the last word.
+		if w2 == a.l2Words-1 {
+			if rem := a.blockCount % 64; rem != 0 {
+				word &= (1 << rem) - 1
+			}
+		}
+		if word == 0 {
+			take() // the current run cannot continue past a zero word
+			continue
+		}
+
+		wbits := word
+		for wbits != 0 && remaining > 0 {
+			b := uint64(bits.TrailingZeros64(wbits))
+			s := base + b
+			// TrailingZeros64(0) == 64: an all-ones-from-b run
+			// (only possible at b == 0) yields cnt == 64.
+			cnt := uint64(bits.TrailingZeros64(^(wbits >> b)))
+			if runLen > 0 && s == runStart+runLen {
+				runLen += cnt // contiguous with the previous word's run
+			} else {
+				take()
+				runStart, runLen = s, cnt
+			}
+			if cnt >= 64 {
+				wbits = 0
+			} else {
+				wbits &^= ((1 << cnt) - 1) << b
+			}
+		}
+	}
+	take()
+
+	if len(runs) == 0 {
+		return nil
+	}
+
+	// Clear the allocated bits word-wise and propagate L2 -> L1 -> L0 for
+	// every L2 word that became all-zero (tryAllocBlocks' found path).
+	total := uint64(0)
+	for _, r := range runs {
+		total += r.n
+		w2First := r.first / 64
+		w2Last := (r.first + r.n - 1) / 64
+		for w2 := w2First; w2 <= w2Last; w2++ {
+			lo := uint64(0)
+			if r.first > w2*64 {
+				lo = r.first - w2*64
+			}
+			hi := r.first + r.n - w2*64
+			mask := ^uint64(0)
+			if lo > 0 {
+				mask &^= (1 << lo) - 1
+			}
+			if hi < 64 {
+				mask &= (1 << hi) - 1
+			}
+			a.l2[w2] &^= mask
+			a.markL2Word(w2)
+			if a.l2[w2] == 0 {
+				w1, b1 := w2/64, w2%64
+				a.l1[w1] &^= 1 << b1
+				if a.l1[w1] == 0 {
+					w0, b0 := w1/64, w1%64
+					a.l0[w0] &^= 1 << b0
+				}
+			}
+		}
+	}
+	a.freeCount -= total
+	a.dirty = true
+	return runs
+}
+
 // TrimFreeRuns walks the L2 leaf bitmap read-only for maximal free runs,
 // invoking visit for each (runStart, runLen) pair in data-relative blocks,
 // possibly spanning L2 word boundaries. The allocator mutex is held across

@@ -508,3 +508,82 @@ func TestFallocateZeroRange(t *testing.T) {
 
 	fsckClean(t, b, img)
 }
+
+// TestFallocateFragmentedHole covers allocUnwrittenHole's fragmentation
+// fallback: with the data region carved into short free runs, a hole larger
+// than any single run is covered by run harvesting — one extent per
+// free-space fragment, never one per block.  An oversized hole ENOSPCs and
+// rolls back the partially harvested runs.
+func TestFallocateFragmentedHole(t *testing.T) {
+	mkfs := buildMkfs(t)
+	img := mkfsImage(t, mkfs, 5000)
+	b := openBridge(t, img)
+
+	bs := b.blockSize
+	// The file is created first (its dir trie page takes a low data block),
+	// then everything except data-relative runs [100,103), [200,202),
+	// [300,303) is reserved: 8 free blocks, no contiguous run longer than 3.
+	in, _ := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false)
+	ino := in.InodeNumber
+	free := map[uint64]bool{}
+	for blk := uint64(100); blk < 103; blk++ {
+		free[blk] = true
+	}
+	for blk := uint64(200); blk < 202; blk++ {
+		free[blk] = true
+	}
+	for blk := uint64(300); blk < 303; blk++ {
+		free[blk] = true
+	}
+	for blk := uint64(0); blk < b.dataAlloc.blockCount; blk++ {
+		if !free[blk] {
+			b.dataAlloc.ReserveBlock(blk)
+		}
+	}
+	if got := b.dataAlloc.FreeCount(); got != 8 {
+		t.Fatalf("fragmented setup: FreeCount = %d, want 8", got)
+	}
+
+	// 16 blocks wanted, 8 free: ENOSPC with the partial harvest rolled
+	// back (the free count must come home unchanged).
+	if err := b.fallocateOp(ino, 0, 16*bs, 0); err != syscall.ENOSPC {
+		t.Fatalf("oversized fragmented fallocate: err = %v, want ENOSPC", err)
+	}
+	if got := b.dataAlloc.FreeCount(); got != 8 {
+		t.Fatalf("after ENOSPC rollback: FreeCount = %d, want 8", got)
+	}
+
+	// 8 blocks across three fragments: three unwritten extents, in offset
+	// order, covering exactly the three free runs.
+	if err := b.fallocateOp(ino, 0, 8*bs, 0); err != nil {
+		t.Fatalf("fragmented fallocate: %v", err)
+	}
+	di, _ := b.inodes.ReadInode(ino)
+	if di.FileSize != 8*bs {
+		t.Fatalf("size after fragmented fallocate = %d, want %d", di.FileSize, 8*bs)
+	}
+	if got := b.dataAlloc.FreeCount(); got != 0 {
+		t.Fatalf("FreeCount after fallocate = %d, want 0", got)
+	}
+	exts, _, _ := b.collectExtentsAndNodes(di)
+	type wantExt struct{ off, rel, n uint64 }
+	want := []wantExt{{0, 100, 3}, {3, 200, 2}, {5, 300, 3}}
+	if len(exts) != len(want) {
+		t.Fatalf("fragmented extents: got %d, want %d (%+v)", len(exts), len(want), exts)
+	}
+	for i, w := range want {
+		e := exts[i]
+		if e.Offset != w.off || e.Phys-b.dataRegionStart != w.rel || e.Len != w.n ||
+			e.Flags&briefs.ExtentFlagUnwritten == 0 {
+			t.Fatalf("extent %d = %+v, want {off:%d rel:%d len:%d unwritten}", i, e, w.off, w.rel, w.n)
+		}
+	}
+	// Unwritten fragments read as zeros end to end.
+	got := readFile(t, b, ino, 0, int64(8*bs))
+	if !allZero(got) {
+		t.Fatalf("fragmented unwritten readback not zero")
+	}
+	// (No fsckClean here: the 4835 blocks this test reserved straight
+	// into the bitmap have no owning inode, which fsck rightly flags —
+	// the other fallocate tests own the fsck-clean invariant.)
+}

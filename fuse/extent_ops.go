@@ -135,9 +135,13 @@ func (b *BrieFS) fallocateOp(ino uint64, off, size uint64, mode uint32) error {
 
 // allocUnwrittenHole allocates unwritten extent(s) covering the hole blocks
 // [startBlk, endBlk), preferring one contiguous run (Allocator.AllocBlocks, one
-// bitmap pass) and falling back to per-block allocation when the bitmap is too
-// fragmented for a run — the kernel's briefs_zero_alloc_hole pattern
-// (file.c:2797), which replaced per-block hole allocation in 0fd1448.
+// bitmap pass) and falling back to run harvesting when the bitmap is too
+// fragmented for a single run — one extent per free-space fragment, never one
+// per block.  (The kernel's briefs_zero_alloc_hole, file.c:2840, falls back to
+// per-block extents; its 24-byte C arrays survive, but the same shape in Go is
+// a ~26M-entry append-doubled slice per whole-device fallocate that the GC
+// goal amplifies into a multi-GB transient — the generic/299 OOM.  Fragment
+// coverage is identical, so this is a memory-shape divergence only.)
 // Allocated data-relative blocks are accumulated into *allocated (the
 // caller's rollback list, run-encoded — addRun for the run path, tail-merged
 // addBlock for the fallback); on ENOSPC the partial allocations are left in
@@ -156,20 +160,29 @@ func (b *BrieFS) allocUnwrittenHole(startBlk, endBlk uint64, allocated *runAccum
 		}}, nil
 	}
 
-	// No contiguous run of seg fit: per-block fallback.
+	// No contiguous run of seg fit: harvest maximal runs until covered.
+	// A short harvest re-loops rather than failing — the pending-free
+	// reclaim that AllocRunsUpTo fires on an empty scan can also turn a
+	// partial harvest complete, and the per-block fallback this replaces
+	// got that retry on every block (each AllocBlock reclaims on its own
+	// miss).  ENOSPC only when a re-harvest yields nothing.
 	var exts []briefs.Extent
-	for blk := startBlk; blk < endBlk; blk++ {
-		rel := b.dataAlloc.AllocBlock()
-		if rel == 0 {
+	blk := startBlk
+	for blk < endBlk {
+		runs := b.dataAlloc.AllocRunsUpTo(endBlk - blk)
+		if len(runs) == 0 {
 			return nil, syscall.ENOSPC
 		}
-		allocated.addBlock(rel)
-		exts = append(exts, briefs.Extent{
-			Offset: blk,
-			Phys:   b.dataRegionStart + rel,
-			Len:    1,
-			Flags:  briefs.ExtentFlagUnwritten,
-		})
+		for _, run := range runs {
+			allocated.addRun(run.first, run.n)
+			exts = append(exts, briefs.Extent{
+				Offset: blk,
+				Phys:   b.dataRegionStart + run.first,
+				Len:    run.n,
+				Flags:  briefs.ExtentFlagUnwritten,
+			})
+			blk += run.n
+		}
 	}
 	return exts, nil
 }
