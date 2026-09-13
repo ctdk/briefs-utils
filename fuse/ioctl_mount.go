@@ -20,14 +20,9 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"fmt"
-	"os"
-	"strconv"
-	"strings"
 	"syscall"
 
 	"github.com/ctdk/briefs-utils/briefs"
-	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
 const (
@@ -36,10 +31,6 @@ const (
 
 	// struct fstrim_range (uapi/linux/fsmap.h): three __u64s.
 	sizeFsTrimRange = 24
-
-	// CAP_SYS_ADMIN, the capability the kernel requires for FITRIM and
-	// SETFSLABEL (file.c:258, :304).
-	capSysAdminBit = 21
 
 	// fallocate(2) modes for the FITRIM punch-hole analogue. The syscall
 	// package does not export the FALLOC_FL_* constants.
@@ -83,39 +74,6 @@ func (b *BrieFS) ioctlMount(ctx context.Context, cmd uint32, input, output []byt
 		return 0, errToErrno(b.fslabelSetOp(input)), true
 	}
 	return 0, syscall.ENOTTY, false
-}
-
-// callerCapSysAdmin reports whether the FUSE request's caller holds
-// CAP_SYS_ADMIN. The kernel checks capable(CAP_SYS_ADMIN) for FITRIM and
-// SETFSLABEL (file.c:258, :304); FUSE performs no capability check on the
-// daemon's behalf, so the bridge must. go-fuse supplies the caller's
-// uid/gid/pid (fuse.FromContext); the capability set is read from
-// /proc/<pid>/status CapEff. A caller whose status cannot be read (different
-// pid namespace, already exited) is denied.
-func callerCapSysAdmin(ctx context.Context) bool {
-	caller, ok := fuse.FromContext(ctx)
-	if !ok || caller == nil || caller.Pid == 0 {
-		return false
-	}
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", caller.Pid))
-	if err != nil {
-		return false
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if !strings.HasPrefix(line, "CapEff:") {
-			continue
-		}
-		fields := strings.Fields(line[len("CapEff:"):])
-		if len(fields) == 0 {
-			return false
-		}
-		caps, err := strconv.ParseUint(fields[0], 16, 64)
-		if err != nil {
-			return false
-		}
-		return caps&(1<<capSysAdminBit) != 0
-	}
-	return false
 }
 
 // --- FITRIM ---
