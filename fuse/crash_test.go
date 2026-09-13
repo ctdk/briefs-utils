@@ -27,7 +27,7 @@ func TestCrashRecovery(t *testing.T) {
 	b := openBridge(t, img)
 
 	// A short workload: create + write + xattr + chmod.
-	in, _ := b.createInDir(1, "c", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, _ := b.createInDir(1, "c", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	pat := makePattern(3, 4000)
 	writeFile(t, b, in.InodeNumber, pat, 0)
 	if err := b.setXattr(in.InodeNumber, "user.tag", []byte("v"), 0); err != nil {
@@ -91,7 +91,7 @@ func TestCrashFreshSlotWriteThroughIsolation(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	a, err := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false)
+	a, err := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create a: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestCrashFreshSlotWriteThroughIsolation(t *testing.T) {
 	// The fresh "b" slot reuses "a"'s slot, in the parent's inode-table
 	// block: the write-through must arm only the slot, not the parent's
 	// deferred state.
-	bIn, err := b.createInDir(1, "b", briefs.ModeFile|0o644, 1000, 1000, false)
+	bIn, err := b.createInDir(1, "b", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create b: %v", err)
 	}

@@ -26,7 +26,7 @@ func TestDeferredFreeReclaimOnENOSPC(t *testing.T) {
 	b := openBridge(t, img)
 
 	// Fill the data region: write 4K chunks until the allocator refuses.
-	a, err := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false)
+	a, err := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create a: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestDeferredFreeReclaimOnENOSPC(t *testing.T) {
 	// Delete-then-write: the allocation's first scan fails, the reclaim hook
 	// commits the journal (applying a's frees after the commit point), and
 	// the retry succeeds — no ENOSPC, no explicit sync anywhere.
-	bIn, err := b.createInDir(1, "b", briefs.ModeFile|0o644, 1000, 1000, false)
+	bIn, err := b.createInDir(1, "b", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create b: %v", err)
 	}

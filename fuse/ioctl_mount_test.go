@@ -99,8 +99,8 @@ func TestFstrim(t *testing.T) {
 
 	// Two one-block files; one survives, one is deleted so its block
 	// becomes a free run FSTRIM must punch.
-	inKeep, _ := b.createInDir(1, "keep", briefs.ModeFile|0o644, 1000, 1000, false)
-	inGone, _ := b.createInDir(1, "gone", briefs.ModeFile|0o644, 1000, 1000, false)
+	inKeep, _ := b.createInDir(1, "keep", briefs.ModeFile|0o644, 1000, 1000, false, 0)
+	inGone, _ := b.createInDir(1, "gone", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	pat := makePattern(7, int(bs))
 	writeFile(t, b, inKeep.InodeNumber, pat, 0)
 	writeFile(t, b, inGone.InodeNumber, pat, 0)

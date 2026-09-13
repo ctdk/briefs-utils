@@ -67,7 +67,7 @@ func TestFileWriteInline(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "inline", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "inline", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestFileWriteSpillBtree(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "big", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "big", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestFileWriteHoleAndAppend(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "holes", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "holes", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}

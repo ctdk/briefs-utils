@@ -213,7 +213,7 @@ func (b *BrieFS) dirIsEmpty(di *briefs.Inode) bool {
 // devices; symlinkTarget (non-empty only for symlinks) is stored inline (<=256B)
 // or in one data block plus a JRN_SYMLINK_DATA record. The caller must hold
 // b.mu (taken here) — it is a directory operation.
-func (b *BrieFS) createNamedInode(parentIno uint64, name string, mode, uid, gid uint32, excl bool, rdev uint64, symlinkTarget string) (*briefs.Inode, error) {
+func (b *BrieFS) createNamedInode(parentIno uint64, name string, mode, uid, gid uint32, excl bool, rdev uint64, symlinkTarget string, umask uint32) (*briefs.Inode, error) {
 	if b.readOnly {
 		return nil, syscall.EROFS
 	}
@@ -255,6 +255,17 @@ func (b *BrieFS) createNamedInode(parentIno uint64, name string, mode, uid, gid 
 	if !parent.IsDir() {
 		b.cacheAbort()
 		return nil, syscall.ENOTDIR
+	}
+
+	// SB_POSIXACL => fc->dont_mask (fs/fuse/inode.c:1763): the kernel sends
+	// create modes unmasked, so the daemon applies the caller's umask — or
+	// the parent's default ACL, when present, which replaces the umask
+	// entirely (posix_acl_create). Runs BEFORE the dir S_ISGID inherit so
+	// ACL-derived modes keep the bit. Symlinks skip it: the VFS fixes their
+	// mode at 0777 (S_IRWXUGO|S_IFLNK in inode_init_owner) — no umask, no
+	// default-ACL computation.
+	if symlinkTarget == "" {
+		mode = b.applyCreateMode(parent, mode, umask)
 	}
 
 	isDir := (mode & briefs.ModeTypeMask) == briefs.ModeDir
@@ -409,18 +420,21 @@ func (b *BrieFS) createNamedInode(parentIno uint64, name string, mode, uid, gid 
 }
 
 // createInDir is the file/directory create path (no rdev, no symlink target).
-func (b *BrieFS) createInDir(parentIno uint64, name string, mode, uid, gid uint32, excl bool) (*briefs.Inode, error) {
-	return b.createNamedInode(parentIno, name, mode, uid, gid, excl, 0, "")
+func (b *BrieFS) createInDir(parentIno uint64, name string, mode, uid, gid uint32, excl bool, umask uint32) (*briefs.Inode, error) {
+	return b.createNamedInode(parentIno, name, mode, uid, gid, excl, 0, "", umask)
 }
 
 // mknodInDir creates a special file (block/char device, fifo, socket).
-func (b *BrieFS) mknodInDir(parentIno uint64, name string, mode, uid, gid uint32, rdev uint64) (*briefs.Inode, error) {
-	return b.createNamedInode(parentIno, name, mode, uid, gid, false, rdev, "")
+func (b *BrieFS) mknodInDir(parentIno uint64, name string, mode, uid, gid uint32, rdev uint64, umask uint32) (*briefs.Inode, error) {
+	return b.createNamedInode(parentIno, name, mode, uid, gid, false, rdev, "", umask)
 }
 
-// symlinkInDir creates a symbolic link with the given target.
+// symlinkInDir creates a symbolic link with the given target. There is no
+// umask parameter: the kernel never masks symlink modes (the VFS fixes them
+// at 0777), and createNamedInode skips the umask/default-ACL computation for
+// symlinks.
 func (b *BrieFS) symlinkInDir(parentIno uint64, name string, target string, uid, gid uint32) (*briefs.Inode, error) {
-	return b.createNamedInode(parentIno, name, briefs.ModeSymlink|0o777, uid, gid, false, 0, target)
+	return b.createNamedInode(parentIno, name, briefs.ModeSymlink|0o777, uid, gid, false, 0, target, 0)
 }
 
 // mirroring briefs_unlink_common (dir.c:586).  isRmdir selects the rmdir path

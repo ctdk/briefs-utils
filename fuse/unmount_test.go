@@ -18,7 +18,7 @@ func TestUnmountCheckpoint(t *testing.T) {
 	b := openBridge(t, img)
 
 	// Create + write + fsync some state so the journal is non-trivially dirty.
-	in, err := b.createInDir(1, "u", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "u", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}

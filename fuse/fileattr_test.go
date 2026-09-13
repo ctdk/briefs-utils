@@ -16,7 +16,7 @@ func TestFileattrSetGet(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "f", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "f", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestFileattrSetGet(t *testing.T) {
 	if err := b.fileattrSet(ino, true, fsDirsyncFl, false, 0, 0, 0, 0); err != syscall.EINVAL {
 		t.Fatalf("DIRSYNC on file: want EINVAL, got %v", err)
 	}
-	dirIn, err := b.createInDir(1, "d", briefs.ModeDir|0o755, 1000, 1000, false)
+	dirIn, err := b.createInDir(1, "d", briefs.ModeDir|0o755, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestFileattrIoctl(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "io", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "io", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}

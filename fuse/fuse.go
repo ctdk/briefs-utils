@@ -731,7 +731,7 @@ func (n *brieFSNode) newChildNode(ctx context.Context, in *briefs.Inode) *fs.Ino
 // Create handles O_CREAT.  Mirrors briefs_create (dir.c:369).
 func (n *brieFSNode) Create(ctx context.Context, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	uid, gid := callerCreds(ctx)
-	child, err := n.bfs.createInDir(n.ino, name, briefs.ModeFile|mode, uid, gid, flags&syscall.O_EXCL != 0)
+	child, err := n.bfs.createInDir(n.ino, name, briefs.ModeFile|mode, uid, gid, flags&syscall.O_EXCL != 0, callerUmask(ctx))
 	if err != nil {
 		return nil, nil, 0, errToErrno(err)
 	}
@@ -742,7 +742,7 @@ func (n *brieFSNode) Create(ctx context.Context, name string, flags, mode uint32
 // Mkdir handles directory creation.  Mirrors briefs_mkdir (dir.c:414).
 func (n *brieFSNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	uid, gid := callerCreds(ctx)
-	child, err := n.bfs.createInDir(n.ino, name, briefs.ModeDir|mode, uid, gid, false)
+	child, err := n.bfs.createInDir(n.ino, name, briefs.ModeDir|mode, uid, gid, false, callerUmask(ctx))
 	if err != nil {
 		return nil, errToErrno(err)
 	}
@@ -894,7 +894,7 @@ func (n *brieFSNode) Symlink(ctx context.Context, target, name string, out *fuse
 // Mknod creates a special file. Mirrors briefs_mknod (file.c:2265).
 func (n *brieFSNode) Mknod(ctx context.Context, name string, mode, dev uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	uid, gid := callerCreds(ctx)
-	in, err := n.bfs.mknodInDir(n.ino, name, mode, uid, gid, uint64(dev))
+	in, err := n.bfs.mknodInDir(n.ino, name, mode, uid, gid, uint64(dev), callerUmask(ctx))
 	if err != nil {
 		return nil, errToErrno(err)
 	}

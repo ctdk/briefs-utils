@@ -27,11 +27,11 @@ func TestSyncMetaDrainKeepsSiblingSlots(t *testing.T) {
 
 	// Two files whose inode slots are siblings in one inode-table block —
 	// the generic/127 shape (two fsx files created consecutively).
-	a, err := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false)
+	a, err := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create a: %v", err)
 	}
-	c, err := b.createInDir(1, "c", briefs.ModeFile|0o644, 1000, 1000, false)
+	c, err := b.createInDir(1, "c", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create c: %v", err)
 	}

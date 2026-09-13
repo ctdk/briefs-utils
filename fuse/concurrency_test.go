@@ -24,7 +24,7 @@ func TestConcurrentFileWrites(t *testing.T) {
 	// inodes per 4K table block, these span 4 inode-table blocks.
 	inos := make([]uint64, n)
 	for i := 0; i < n; i++ {
-		in, err := b.createInDir(1, fmt.Sprintf("f%02d", i), briefs.ModeFile|0o644, 1000, 1000, false)
+		in, err := b.createInDir(1, fmt.Sprintf("f%02d", i), briefs.ModeFile|0o644, 1000, 1000, false, 0)
 		if err != nil {
 			t.Fatalf("create %d: %v", i, err)
 		}
@@ -66,7 +66,7 @@ func TestConcurrentDirOps(t *testing.T) {
 	b := openBridge(t, img)
 
 	// A scratch parent directory.
-	parent, err := b.createInDir(1, "parent", briefs.ModeDir|0o755, 1000, 1000, false)
+	parent, err := b.createInDir(1, "parent", briefs.ModeDir|0o755, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("mkdir parent: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestConcurrentDirOps(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			name := fmt.Sprintf("g%02d", i)
-			if _, err := b.createInDir(parentIno, name, briefs.ModeFile|0o644, 1000, 1000, false); err != nil {
+			if _, err := b.createInDir(parentIno, name, briefs.ModeFile|0o644, 1000, 1000, false, 0); err != nil {
 				t.Errorf("create %d: %v", i, err)
 				return
 			}
@@ -110,7 +110,7 @@ func TestConcurrentMixedFileAndDirOps(t *testing.T) {
 	const n = 16
 	inos := make([]uint64, n)
 	for i := 0; i < n; i++ {
-		in, err := b.createInDir(1, fmt.Sprintf("m%02d", i), briefs.ModeFile|0o644, 1000, 1000, false)
+		in, err := b.createInDir(1, fmt.Sprintf("m%02d", i), briefs.ModeFile|0o644, 1000, 1000, false, 0)
 		if err != nil {
 			t.Fatalf("create %d: %v", i, err)
 		}
@@ -136,7 +136,7 @@ func TestConcurrentMixedFileAndDirOps(t *testing.T) {
 				}
 			} else {
 				name := fmt.Sprintf("c%02d", i)
-				if _, err := b.createInDir(1, name, briefs.ModeFile|0o644, 1000, 1000, false); err != nil {
+				if _, err := b.createInDir(1, name, briefs.ModeFile|0o644, 1000, 1000, false, 0); err != nil {
 					t.Errorf("create %d: %v", i, err)
 					return
 				}

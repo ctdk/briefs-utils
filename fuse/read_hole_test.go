@@ -22,7 +22,7 @@ func TestReadHoleFullCount(t *testing.T) {
 	b := openBridge(t, img)
 
 	const rootIno = 1
-	in, err := b.createInDir(rootIno, "f", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(rootIno, "f", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}

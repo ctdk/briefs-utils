@@ -49,17 +49,17 @@ func TestReplay341RenameDirRecreateName(t *testing.T) {
 	b := openBridge(t, img)
 
 	// mkdir -p $SCRATCH_MNT/a/x
-	a, err := b.createInDir(1, "a", briefs.ModeDir|0o755, 1000, 1000, false)
+	a, err := b.createInDir(1, "a", briefs.ModeDir|0o755, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("mkdir a: %v", err)
 	}
-	x, err := b.createInDir(a.InodeNumber, "x", briefs.ModeDir|0o755, 1000, 1000, false)
+	x, err := b.createInDir(a.InodeNumber, "x", briefs.ModeDir|0o755, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("mkdir a/x: %v", err)
 	}
 	// pwrite 32K foo + 32K bar into a/x
 	for _, n := range []string{"foo", "bar"} {
-		f, err := b.createInDir(x.InodeNumber, n, briefs.ModeFile|0o644, 1000, 1000, false)
+		f, err := b.createInDir(x.InodeNumber, n, briefs.ModeFile|0o644, 1000, 1000, false, 0)
 		if err != nil {
 			t.Fatalf("create a/x/%s: %v", n, err)
 		}
@@ -75,7 +75,7 @@ func TestReplay341RenameDirRecreateName(t *testing.T) {
 	if err := b.renameInDir(a.InodeNumber, "x", a.InodeNumber, "y", 0); err != nil {
 		t.Fatalf("mv a/x a/y: %v", err)
 	}
-	if _, err := b.createInDir(a.InodeNumber, "x", briefs.ModeDir|0o755, 1000, 1000, false); err != nil {
+	if _, err := b.createInDir(a.InodeNumber, "x", briefs.ModeDir|0o755, 1000, 1000, false, 0); err != nil {
 		t.Fatalf("mkdir new a/x: %v", err)
 	}
 	// $XFS_IO_PROG -c "fsync" $SCRATCH_MNT/a/x  — a dir fsync reduces to the

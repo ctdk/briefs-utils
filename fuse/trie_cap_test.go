@@ -17,7 +17,7 @@ func TestTrieIteratorDeepNames(t *testing.T) {
 	img := mkfsImage(t, mkfs, 20000)
 	b := openBridge(t, img)
 
-	d, err := b.createInDir(1, "d", briefs.ModeDir|0o755, 0, 0, false)
+	d, err := b.createInDir(1, "d", briefs.ModeDir|0o755, 0, 0, false, 0)
 	if err != nil {
 		t.Fatalf("mkdir d: %v", err)
 	}
@@ -81,12 +81,12 @@ func TestTrieSiblingChainCap(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	d, err := b.createInDir(1, "d", briefs.ModeDir|0o755, 0, 0, false)
+	d, err := b.createInDir(1, "d", briefs.ModeDir|0o755, 0, 0, false, 0)
 	if err != nil {
 		t.Fatalf("mkdir d: %v", err)
 	}
 	for _, name := range []string{"aa", "ab", "ac"} {
-		if _, err := b.createInDir(d.InodeNumber, name, briefs.ModeFile|0o644, 0, 0, false); err != nil {
+		if _, err := b.createInDir(d.InodeNumber, name, briefs.ModeFile|0o644, 0, 0, false, 0); err != nil {
 			t.Fatalf("create %s: %v", name, err)
 		}
 	}

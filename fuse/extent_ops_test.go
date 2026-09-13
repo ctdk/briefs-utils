@@ -29,7 +29,7 @@ func TestFallocatePreallocate(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, _ := b.createInDir(1, "p", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, _ := b.createInDir(1, "p", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	ino := in.InodeNumber
 
 	// KEEP_SIZE preallocate [0, 8192): two unwritten blocks (merged into one
@@ -100,7 +100,7 @@ func TestFallocatePunchHole(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, _ := b.createInDir(1, "h", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, _ := b.createInDir(1, "h", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	ino := in.InodeNumber
 	bs := int64(b.blockSize)
 
@@ -144,7 +144,7 @@ func TestTruncate(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, _ := b.createInDir(1, "t", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, _ := b.createInDir(1, "t", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	ino := in.InodeNumber
 	bs := int64(b.blockSize)
 
@@ -197,7 +197,7 @@ func TestKillpriv(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, _ := b.createInDir(1, "k", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, _ := b.createInDir(1, "k", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	ino := in.InodeNumber
 
 	// chmod 4755 (setuid).
@@ -256,7 +256,7 @@ func TestRemovePrivsGating(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, _ := b.createInDir(1, "g", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, _ := b.createInDir(1, "g", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	ino := in.InodeNumber
 
 	// Caller contexts: unprivileged gid-1000 (in the file's group), and a
@@ -343,7 +343,7 @@ func TestRemovePrivsGating(t *testing.T) {
 
 	// A non-regular file (setgid directory) is a no-op.
 	injectCallerStatus(t, callerStatus{}, true)
-	dir, _ := b.createInDir(1, "d", briefs.ModeDir|0o2755, 1000, 1000, false)
+	dir, _ := b.createInDir(1, "d", briefs.ModeDir|0o2755, 1000, 1000, false, 0)
 	di, _ := b.inodes.ReadInode(dir.InodeNumber)
 	if di.Filemode&0o7777 != 0o2755 {
 		t.Fatalf("dir mode setup: want 2755, got %o", di.Filemode&0o7777)
@@ -366,7 +366,7 @@ func TestKillprivFallocate(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, _ := b.createInDir(1, "f", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, _ := b.createInDir(1, "f", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	ino := in.InodeNumber
 	chmod := func(m uint32) {
 		t.Helper()
@@ -422,7 +422,7 @@ func TestFallocateCollapseRange(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, _ := b.createInDir(1, "c", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, _ := b.createInDir(1, "c", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	ino := in.InodeNumber
 	bs := int64(b.blockSize)
 
@@ -465,7 +465,7 @@ func TestFallocateCollapseRange(t *testing.T) {
 		t.Errorf("collapse reaching EOF: want EINVAL, got %v", err)
 	}
 
-	inl, _ := b.createInDir(1, "ci", briefs.ModeFile|0o644, 1000, 1000, false)
+	inl, _ := b.createInDir(1, "ci", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	writeFile(t, b, inl.InodeNumber, makePattern(9, 100), 0)
 	// A block-aligned range on a <= 256-byte inline file always reaches
 	// EOF first, so the bounds EINVAL fires before the inline EOPNOTSUPP
@@ -486,7 +486,7 @@ func TestFallocateInsertRange(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, _ := b.createInDir(1, "i", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, _ := b.createInDir(1, "i", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	ino := in.InodeNumber
 	bs := int64(b.blockSize)
 
@@ -531,7 +531,7 @@ func TestFallocateInsertRange(t *testing.T) {
 		t.Errorf("insert at EOF: want EINVAL, got %v", err)
 	}
 
-	inl, _ := b.createInDir(1, "ii", briefs.ModeFile|0o644, 1000, 1000, false)
+	inl, _ := b.createInDir(1, "ii", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	writeFile(t, b, inl.InodeNumber, makePattern(9, 100), 0)
 	if err := b.fallocateOp(context.Background(), inl.InodeNumber, 0, uint64(bs), fallocInsertRange); err != syscall.EOPNOTSUPP {
 		t.Errorf("insert on inline file: want EOPNOTSUPP, got %v", err)
@@ -549,7 +549,7 @@ func TestFallocateZeroRange(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, _ := b.createInDir(1, "z", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, _ := b.createInDir(1, "z", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	ino := in.InodeNumber
 	bs := int64(b.blockSize)
 
@@ -606,7 +606,7 @@ func TestFallocateZeroRange(t *testing.T) {
 	}
 
 	// --- Hole in the middle is allocated as unwritten. ---
-	in2, _ := b.createInDir(1, "zh", briefs.ModeFile|0o644, 1000, 1000, false)
+	in2, _ := b.createInDir(1, "zh", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	ino2 := in2.InodeNumber
 	writeFile(t, b, ino2, p0, 0)    // block 0
 	writeFile(t, b, ino2, p2, 2*bs) // block 2 (block 1 stays a hole)
@@ -622,7 +622,7 @@ func TestFallocateZeroRange(t *testing.T) {
 	}
 
 	// --- !KEEP_SIZE extends the file; the old-EOF tail is zeroed. ---
-	in3, _ := b.createInDir(1, "zx", briefs.ModeFile|0o644, 1000, 1000, false)
+	in3, _ := b.createInDir(1, "zx", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	ino3 := in3.InodeNumber
 	writeFile(t, b, ino3, pat, 0) // 300 bytes, mid-block EOF
 	if err := b.fallocateOp(context.Background(), ino3, 400, 2*uint64(bs), fallocZeroRange); err != nil {
@@ -638,7 +638,7 @@ func TestFallocateZeroRange(t *testing.T) {
 	}
 
 	// --- Inline-data branch: zero within the region, optionally grow. ---
-	inl, _ := b.createInDir(1, "zi", briefs.ModeFile|0o644, 1000, 1000, false)
+	inl, _ := b.createInDir(1, "zi", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	writeFile(t, b, inl.InodeNumber, pat, 0)
 	if err := b.fallocateOp(context.Background(), inl.InodeNumber, 100, 100, fallocZeroRange); err != nil {
 		t.Fatalf("inline zero range: %v", err)
@@ -682,7 +682,7 @@ func TestFallocateFragmentedHole(t *testing.T) {
 	// The file is created first (its dir trie page takes a low data block),
 	// then everything except data-relative runs [100,103), [200,202),
 	// [300,303) is reserved: 8 free blocks, no contiguous run longer than 3.
-	in, _ := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, _ := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	ino := in.InodeNumber
 	free := map[uint64]bool{}
 	for blk := uint64(100); blk < 103; blk++ {

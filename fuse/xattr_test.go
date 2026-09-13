@@ -18,7 +18,7 @@ func TestXattrSetGetListRemove(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "x", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "x", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestXattrLargeValue(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "big", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "big", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestXattrRebuildPreservesOthers(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "r", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "r", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestXattrSystemNamespace(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	in, _ := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, _ := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	ino := in.InodeNumber
 
 	// A canonical-format access ACL (version 2 header + entries); the

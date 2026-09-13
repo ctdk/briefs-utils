@@ -76,7 +76,7 @@ func TestExtentRebuildAppendReusesPrefixLeaves(t *testing.T) {
 	img := mkfsImage(t, mkfs, 20000)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestExtentRebuildMiddleShiftReusesNothing(t *testing.T) {
 	img := mkfsImage(t, mkfs, 20000)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestExtentRebuildMergeDoesNotCorruptCachedChunks(t *testing.T) {
 	img := mkfsImage(t, mkfs, 20000)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestExtentTreeCacheInvalidatedByPunch(t *testing.T) {
 	img := mkfsImage(t, mkfs, 20000)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -280,7 +280,7 @@ func TestExtentRebuildCrashReplayReusedBlocks(t *testing.T) {
 	img := mkfsImage(t, mkfs, 20000)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}

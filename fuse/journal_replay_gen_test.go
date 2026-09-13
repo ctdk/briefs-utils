@@ -179,7 +179,7 @@ func TestCrashSlotReuseReplay(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	a, err := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false)
+	a, err := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create a: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestCrashSlotReuseReplay(t *testing.T) {
 		t.Fatalf("unlink a: %v", err)
 	}
 
-	bIn, err := b.createInDir(1, "b", briefs.ModeFile|0o644, 1000, 1000, false)
+	bIn, err := b.createInDir(1, "b", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create b: %v", err)
 	}

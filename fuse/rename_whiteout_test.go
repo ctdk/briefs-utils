@@ -19,10 +19,10 @@ func TestRenameWhiteoutChardev(t *testing.T) {
 	b := openBridge(t, img)
 
 	const rootIno = 1
-	if _, err := b.createInDir(rootIno, "foo", briefs.ModeFile|0o644, 1000, 1000, false); err != nil {
+	if _, err := b.createInDir(rootIno, "foo", briefs.ModeFile|0o644, 1000, 1000, false, 0); err != nil {
 		t.Fatalf("create foo: %v", err)
 	}
-	if _, err := b.createInDir(rootIno, "bar", briefs.ModeFile|0o644, 1000, 1000, false); err != nil {
+	if _, err := b.createInDir(rootIno, "bar", briefs.ModeFile|0o644, 1000, 1000, false, 0); err != nil {
 		t.Fatalf("create bar: %v", err)
 	}
 

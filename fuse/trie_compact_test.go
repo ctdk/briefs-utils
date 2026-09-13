@@ -163,7 +163,7 @@ func TestTrieNameHeapChurnNoSpuriousENOSPC(t *testing.T) {
 			}
 			exists[name] = false
 		} else {
-			_, err := b.createInDir(rootIno, name, briefs.ModeFile|0o644, 1000, 1000, false)
+			_, err := b.createInDir(rootIno, name, briefs.ModeFile|0o644, 1000, 1000, false, 0)
 			if err == syscall.ENOSPC {
 				t.Fatalf("iter %d create %q: spurious ENOSPC (name-heap dead space not compacted)", i, name)
 			}

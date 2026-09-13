@@ -117,7 +117,7 @@ func TestReplayTriePoolSeedingFullFs(t *testing.T) {
 	// checkpoint — the replay window starts from this on-disk trie.
 	for i := 0; i < 15; i++ {
 		if _, err := b.createInDir(1, fmt.Sprintf("a%02d", i),
-			briefs.ModeFile|0o644, 1000, 1000, false); err != nil {
+			briefs.ModeFile|0o644, 1000, 1000, false, 0); err != nil {
 			t.Fatalf("phase A create %d: %v", i, err)
 		}
 	}
@@ -136,13 +136,13 @@ func TestReplayTriePoolSeedingFullFs(t *testing.T) {
 	// Phase B (the window): fill the data region completely, then two more
 	// creates whose names fit on the checkpointed partial page — they
 	// succeed live precisely because the partial-page pool knows that page.
-	fin, err := b.createInDir(1, "bigfill", briefs.ModeFile|0o644, 1000, 1000, false)
+	fin, err := b.createInDir(1, "bigfill", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create bigfill: %v", err)
 	}
 	fillDataRegion(t, b, fin.InodeNumber)
 	for _, name := range []string{"blast", "blown"} {
-		if _, err := b.createInDir(1, name, briefs.ModeFile|0o644, 1000, 1000, false); err != nil {
+		if _, err := b.createInDir(1, name, briefs.ModeFile|0o644, 1000, 1000, false, 0); err != nil {
 			t.Fatalf("create %s on full fs (live reused a partial page): %v", name, err)
 		}
 	}
@@ -232,7 +232,7 @@ func fillTriePages(t *testing.T, b *BrieFS) {
 		}
 		if free > 62 {
 			if _, err := b.createInDir(1, fmt.Sprintf("%c%s%02d", longTags[i], strings.Repeat("q", 218), i),
-				briefs.ModeFile|0o644, 1000, 1000, false); err != nil {
+				briefs.ModeFile|0o644, 1000, 1000, false, 0); err != nil {
 				t.Fatalf("trie-fill long create: %v", err)
 			}
 			continue
@@ -247,7 +247,7 @@ func fillTriePages(t *testing.T, b *BrieFS) {
 				return
 			}
 			if _, err := b.createInDir(1, string(c),
-				briefs.ModeFile|0o644, 1000, 1000, false); err != nil {
+				briefs.ModeFile|0o644, 1000, 1000, false, 0); err != nil {
 				t.Fatalf("trie-fill create %q: %v", string(c), err)
 			}
 		}
@@ -272,7 +272,7 @@ func TestReplayTrieBlockPoolFullFs(t *testing.T) {
 
 	// Phase A: fill the trie, then a fill file, then the data region — every
 	// trie page ends full, and the checkpoint makes that state durable.
-	fin, err := b.createInDir(1, "bigfill", briefs.ModeFile|0o644, 1000, 1000, false)
+	fin, err := b.createInDir(1, "bigfill", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create bigfill: %v", err)
 	}
@@ -320,11 +320,11 @@ func TestReplayTrieBlockPoolFullFs(t *testing.T) {
 		names = append(names, fmt.Sprintf("%c%s%03d", 'A'+i, strings.Repeat("z", 220), i))
 	}
 	for _, name := range names {
-		if _, err := b.createInDir(1, name, briefs.ModeFile|0o644, 1000, 1000, false); err != nil {
+		if _, err := b.createInDir(1, name, briefs.ModeFile|0o644, 1000, 1000, false, 0); err != nil {
 			t.Fatalf("long-name create %q: %v", name, err)
 		}
 	}
-	rfin, err := b.createInDir(1, "refill", briefs.ModeFile|0o644, 1000, 1000, false)
+	rfin, err := b.createInDir(1, "refill", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create refill: %v", err)
 	}

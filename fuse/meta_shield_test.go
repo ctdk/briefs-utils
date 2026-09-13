@@ -110,12 +110,12 @@ func TestMetaShieldConversionOnFullFs(t *testing.T) {
 	img := mkfsImage(t, mkfs, 500)
 	b := openBridge(t, img)
 
-	pre, err := b.createInDir(1, "pre", briefs.ModeFile|0o644, 1000, 1000, false)
+	pre, err := b.createInDir(1, "pre", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create pre: %v", err)
 	}
 	preIno := pre.InodeNumber
-	scratch, err := b.createInDir(1, "scratch", briefs.ModeFile|0o644, 1000, 1000, false)
+	scratch, err := b.createInDir(1, "scratch", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create scratch: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestMetaShieldConversionOnFullFs(t *testing.T) {
 
 	// Fill the fs with written data on a third file until ENOSPC. Data
 	// allocations stop exactly at free_count == shield.
-	fill, err := b.createInDir(1, "fill", briefs.ModeFile|0o644, 1000, 1000, false)
+	fill, err := b.createInDir(1, "fill", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create fill: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestMetaShieldPunchRelease(t *testing.T) {
 	img := mkfsImage(t, mkfs, 500)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "p", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "p", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestMetaShieldDropOnUnlink(t *testing.T) {
 	img := mkfsImage(t, mkfs, 500)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "d", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "d", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}

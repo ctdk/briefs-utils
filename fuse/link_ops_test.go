@@ -15,7 +15,7 @@ func TestHardlink(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	a, err := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false)
+	a, err := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create a: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestMknod(t *testing.T) {
 		{"sock", modeSock | 0o666, 0},
 	}
 	for _, c := range cases {
-		in, err := b.mknodInDir(1, c.name, c.mode, 1000, 1000, c.rdev)
+		in, err := b.mknodInDir(1, c.name, c.mode, 1000, 1000, c.rdev, 0)
 		if err != nil {
 			t.Fatalf("mknod %q: %v", c.name, err)
 		}
@@ -155,7 +155,7 @@ func TestRename(t *testing.T) {
 	b := openBridge(t, img)
 
 	// Files in root.
-	a, _ := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false)
+	a, _ := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	b.writeFileData(context.Background(), a.InodeNumber, makePattern(1, 100), 0)
 	// Same-dir rename a -> a2.
 	if err := b.renameInDir(1, "a", 1, "a2", 0); err != nil {
@@ -169,7 +169,7 @@ func TestRename(t *testing.T) {
 	}
 
 	// A second dir + cross-dir rename a2 -> sub/a2 (file move).
-	sub, _ := b.createInDir(1, "sub", briefs.ModeDir|0o755, 1000, 1000, false)
+	sub, _ := b.createInDir(1, "sub", briefs.ModeDir|0o755, 1000, 1000, false, 0)
 	if err := b.renameInDir(1, "a2", sub.InodeNumber, "a2", 0); err != nil {
 		t.Fatalf("rename a2 -> sub/a2: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestRename(t *testing.T) {
 	// Cross-dir DIRECTORY move updates parent_inode + parent nlinks. Create a
 	// dir "d" in root, move it into sub, check d.parent_inode == sub and the
 	// parent nlink adjustments.
-	d, _ := b.createInDir(1, "d", briefs.ModeDir|0o755, 1000, 1000, false)
+	d, _ := b.createInDir(1, "d", briefs.ModeDir|0o755, 1000, 1000, false, 0)
 	rootBefore, _ := b.inodes.ReadInode(1)
 	subBefore, _ := b.inodes.ReadInode(sub.InodeNumber)
 	if err := b.renameInDir(1, "d", sub.InodeNumber, "d", 0); err != nil {
@@ -207,10 +207,10 @@ func TestRename(t *testing.T) {
 	}
 
 	// Rename over an existing target replaces it (and frees the old target).
-	tgt, _ := b.createInDir(1, "tgt", briefs.ModeFile|0o644, 1000, 1000, false)
+	tgt, _ := b.createInDir(1, "tgt", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	b.writeFileData(context.Background(), tgt.InodeNumber, makePattern(2, 200), 0)
 	tgtIno := tgt.InodeNumber
-	src, _ := b.createInDir(1, "src", briefs.ModeFile|0o644, 1000, 1000, false)
+	src, _ := b.createInDir(1, "src", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err := b.renameInDir(1, "src", 1, "tgt", 0); err != nil {
 		t.Fatalf("rename src -> tgt (replace): %v", err)
 	}
@@ -224,19 +224,19 @@ func TestRename(t *testing.T) {
 	}
 
 	// Rename over a non-empty directory target -> ENOTEMPTY.
-	ne, _ := b.createInDir(1, "ne", briefs.ModeDir|0o755, 1000, 1000, false)
-	if _, err := b.createInDir(ne.InodeNumber, "kid", briefs.ModeFile|0o644, 1000, 1000, false); err != nil {
+	ne, _ := b.createInDir(1, "ne", briefs.ModeDir|0o755, 1000, 1000, false, 0)
+	if _, err := b.createInDir(ne.InodeNumber, "kid", briefs.ModeFile|0o644, 1000, 1000, false, 0); err != nil {
 		t.Fatalf("create ne/kid: %v", err)
 	}
-	if _, err := b.createInDir(1, "src2", briefs.ModeFile|0o644, 1000, 1000, false); err != nil {
+	if _, err := b.createInDir(1, "src2", briefs.ModeFile|0o644, 1000, 1000, false, 0); err != nil {
 		t.Fatalf("create src2: %v", err)
 	}
 	if err := b.renameInDir(1, "src2", 1, "ne", 0); err != syscall.ENOTEMPTY {
 		t.Fatalf("rename over non-empty dir: want ENOTEMPTY, got %v", err)
 	}
 	// Renaming over an EMPTY directory replaces it (rmdir-style).
-	empty, _ := b.createInDir(1, "empty", briefs.ModeDir|0o755, 1000, 1000, false)
-	src3, _ := b.createInDir(1, "src3", briefs.ModeFile|0o644, 1000, 1000, false)
+	empty, _ := b.createInDir(1, "empty", briefs.ModeDir|0o755, 1000, 1000, false, 0)
+	src3, _ := b.createInDir(1, "src3", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err := b.renameInDir(1, "src3", 1, "empty", 0); err != nil {
 		t.Fatalf("rename over empty dir: %v", err)
 	}
@@ -257,8 +257,8 @@ func TestRenameExchange(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	x, _ := b.createInDir(1, "x", briefs.ModeFile|0o644, 1000, 1000, false)
-	y, _ := b.createInDir(1, "y", briefs.ModeFile|0o644, 1000, 1000, false)
+	x, _ := b.createInDir(1, "x", briefs.ModeFile|0o644, 1000, 1000, false, 0)
+	y, _ := b.createInDir(1, "y", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 
 	if err := b.renameInDir(1, "x", 1, "y", renameExchange); err != nil {
 		t.Fatalf("exchange: %v", err)
@@ -271,8 +271,8 @@ func TestRenameExchange(t *testing.T) {
 	}
 
 	// Cross-dir exchange.
-	sub, _ := b.createInDir(1, "sub", briefs.ModeDir|0o755, 1000, 1000, false)
-	z, _ := b.createInDir(sub.InodeNumber, "z", briefs.ModeFile|0o644, 1000, 1000, false)
+	sub, _ := b.createInDir(1, "sub", briefs.ModeDir|0o755, 1000, 1000, false, 0)
+	z, _ := b.createInDir(sub.InodeNumber, "z", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err := b.renameInDir(1, "x", sub.InodeNumber, "z", renameExchange); err != nil {
 		t.Fatalf("cross-dir exchange: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestRenameWhiteout(t *testing.T) {
 	img := mkfsImage(t, mkfs, 5000)
 	b := openBridge(t, img)
 
-	src, _ := b.createInDir(1, "src", briefs.ModeFile|0o644, 1000, 1000, false)
+	src, _ := b.createInDir(1, "src", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	srcIno := src.InodeNumber
 
 	if err := b.renameInDir(1, "src", 1, "dst", renameWhiteout); err != nil {

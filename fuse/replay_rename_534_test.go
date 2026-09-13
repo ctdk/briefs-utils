@@ -37,7 +37,7 @@ func TestReplayRenameOldNameStaysGone534(t *testing.T) {
 	b := openBridge(t, img)
 
 	// $XFS_IO_PROG -f -c "pwrite -S 0xab 0 8000" -c "fsync" -c "truncate 3000"
-	foo, err := b.createInDir(1, "foo", briefs.ModeFile|0o644, 1000, 1000, false)
+	foo, err := b.createInDir(1, "foo", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create foo: %v", err)
 	}

@@ -107,7 +107,7 @@ func TestExtentJournalRunEncodedAndReplay(t *testing.T) {
 	size := fallocBlocks * uint64(b.blockSize)
 	freeBefore := b.dataAlloc.FreeCount()
 
-	f, err := b.createInDir(1, "big", briefs.ModeFile|0o644, 1000, 1000, false)
+	f, err := b.createInDir(1, "big", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create big: %v", err)
 	}

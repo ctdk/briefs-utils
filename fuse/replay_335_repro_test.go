@@ -25,19 +25,19 @@ func TestReplay335FullWindowReplay(t *testing.T) {
 	b := openBridge(t, img)
 
 	// mkdir -p $SCRATCH_MNT/a/b; mkdir $SCRATCH_MNT/c; touch $SCRATCH_MNT/a/b/foo
-	a, err := b.createInDir(1, "a", briefs.ModeDir|0o755, 1000, 1000, false)
+	a, err := b.createInDir(1, "a", briefs.ModeDir|0o755, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("mkdir a: %v", err)
 	}
-	ab, err := b.createInDir(a.InodeNumber, "b", briefs.ModeDir|0o755, 1000, 1000, false)
+	ab, err := b.createInDir(a.InodeNumber, "b", briefs.ModeDir|0o755, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("mkdir a/b: %v", err)
 	}
-	c, err := b.createInDir(1, "c", briefs.ModeDir|0o755, 1000, 1000, false)
+	c, err := b.createInDir(1, "c", briefs.ModeDir|0o755, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("mkdir c: %v", err)
 	}
-	if _, err := b.createInDir(ab.InodeNumber, "foo", briefs.ModeFile|0o644, 1000, 1000, false); err != nil {
+	if _, err := b.createInDir(ab.InodeNumber, "foo", briefs.ModeFile|0o644, 1000, 1000, false, 0); err != nil {
 		t.Fatalf("touch a/b/foo: %v", err)
 	}
 
@@ -50,7 +50,7 @@ func TestReplay335FullWindowReplay(t *testing.T) {
 	}
 
 	// touch $SCRATCH_MNT/a/bar; $XFS_IO_PROG -c "fsync" $SCRATCH_MNT/a
-	if _, err := b.createInDir(a.InodeNumber, "bar", briefs.ModeFile|0o644, 1000, 1000, false); err != nil {
+	if _, err := b.createInDir(a.InodeNumber, "bar", briefs.ModeFile|0o644, 1000, 1000, false, 0); err != nil {
 		t.Fatalf("touch a/bar: %v", err)
 	}
 	fsyncLike(t, b)

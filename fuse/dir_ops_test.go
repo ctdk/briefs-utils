@@ -44,7 +44,7 @@ func TestDirCreateMkdirUnlinkRmdir(t *testing.T) {
 	files := []string{"alpha", "beta", "gamma", "delta"}
 	inoByName := map[string]uint64{}
 	for _, name := range files {
-		child, err := b.createInDir(rootIno, name, briefs.ModeFile|0o644, 1000, 1000, false)
+		child, err := b.createInDir(rootIno, name, briefs.ModeFile|0o644, 1000, 1000, false, 0)
 		if err != nil {
 			t.Fatalf("createInDir %q: %v", name, err)
 		}
@@ -82,7 +82,7 @@ func TestDirCreateMkdirUnlinkRmdir(t *testing.T) {
 	dirs := []string{"sub1", "sub2"}
 	inoByDir := map[string]uint64{}
 	for _, name := range dirs {
-		child, err := b.createInDir(rootIno, name, briefs.ModeDir|0o755, 1000, 1000, false)
+		child, err := b.createInDir(rootIno, name, briefs.ModeDir|0o755, 1000, 1000, false, 0)
 		if err != nil {
 			t.Fatalf("mkdir %q: %v", name, err)
 		}
@@ -109,7 +109,7 @@ func TestDirCreateMkdirUnlinkRmdir(t *testing.T) {
 
 	// --- create a file inside a subdir (nested trie) ---
 	sub1 := inoByDir["sub1"]
-	nested, err := b.createInDir(sub1, "inside", briefs.ModeFile|0o600, 1000, 1000, false)
+	nested, err := b.createInDir(sub1, "inside", briefs.ModeFile|0o600, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("createInDir nested: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestDirCreateMkdirUnlinkRmdir(t *testing.T) {
 	}
 
 	// --- duplicate create fails with EEXIST and does not corrupt ---
-	if _, err := b.createInDir(rootIno, "alpha", briefs.ModeFile|0o644, 1000, 1000, true); err != syscall.EEXIST {
+	if _, err := b.createInDir(rootIno, "alpha", briefs.ModeFile|0o644, 1000, 1000, true, 0); err != syscall.EEXIST {
 		t.Fatalf("duplicate create: want EEXIST, got %v", err)
 	}
 	if got := dirEntryCount(t, b, rootIno); got != len(files)+len(dirs) {
@@ -183,7 +183,7 @@ func TestDirCreateMkdirUnlinkRmdir(t *testing.T) {
 
 	// The freed inode numbers should be reusable (bitmap recycled).
 	freeBefore := b.inodeAlloc.FreeCount()
-	reused, err := b.createInDir(rootIno, "reused", briefs.ModeFile|0o644, 1000, 1000, false)
+	reused, err := b.createInDir(rootIno, "reused", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("createInDir reused: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestSetgidDirInheritGid(t *testing.T) {
 	const rootIno = 1
 
 	// A setgid parent owned by gid 777; the caller's gid is 888.
-	sg, err := b.createInDir(rootIno, "sgdir", briefs.ModeDir|modeSetGID|0o755, 1000, 777, false)
+	sg, err := b.createInDir(rootIno, "sgdir", briefs.ModeDir|modeSetGID|0o755, 1000, 777, false, 0)
 	if err != nil {
 		t.Fatalf("createInDir sgdir: %v", err)
 	}
@@ -233,13 +233,13 @@ func TestSetgidDirInheritGid(t *testing.T) {
 	}
 
 	// Every child type takes the parent's gid (inode_init_owner).
-	f, err := b.createInDir(sg.InodeNumber, "file", briefs.ModeFile|0o644, 1000, 888, false)
+	f, err := b.createInDir(sg.InodeNumber, "file", briefs.ModeFile|0o644, 1000, 888, false, 0)
 	if err != nil {
 		t.Fatalf("createInDir file: %v", err)
 	}
 	checkGid("file", f, 777)
 
-	d, err := b.createInDir(sg.InodeNumber, "sub", briefs.ModeDir|0o755, 1000, 888, false)
+	d, err := b.createInDir(sg.InodeNumber, "sub", briefs.ModeDir|0o755, 1000, 888, false, 0)
 	if err != nil {
 		t.Fatalf("createInDir sub: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestSetgidDirInheritGid(t *testing.T) {
 		t.Fatalf("sub under setgid parent lost S_ISGID: mode %o", d.Filemode)
 	}
 
-	n, err := b.mknodInDir(sg.InodeNumber, "fifo", modeFifo|0o644, 1000, 888, 0)
+	n, err := b.mknodInDir(sg.InodeNumber, "fifo", modeFifo|0o644, 1000, 888, 0, 0)
 	if err != nil {
 		t.Fatalf("mknodInDir fifo: %v", err)
 	}
@@ -261,11 +261,11 @@ func TestSetgidDirInheritGid(t *testing.T) {
 	checkGid("symlink", l, 777)
 
 	// A plain parent: children keep the caller's gid.
-	p, err := b.createInDir(rootIno, "plain", briefs.ModeDir|0o755, 1000, 888, false)
+	p, err := b.createInDir(rootIno, "plain", briefs.ModeDir|0o755, 1000, 888, false, 0)
 	if err != nil {
 		t.Fatalf("createInDir plain: %v", err)
 	}
-	f2, err := b.createInDir(p.InodeNumber, "file", briefs.ModeFile|0o644, 1000, 888, false)
+	f2, err := b.createInDir(p.InodeNumber, "file", briefs.ModeFile|0o644, 1000, 888, false, 0)
 	if err != nil {
 		t.Fatalf("createInDir file2: %v", err)
 	}

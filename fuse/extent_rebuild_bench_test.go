@@ -29,7 +29,7 @@ func TestFragmentedWritePerf(t *testing.T) {
 	img := mkfsImage(t, mkfs, 60000)
 	b := openBridge(t, img)
 
-	in, err := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false)
+	in, err := b.createInDir(1, "frag", briefs.ModeFile|0o644, 1000, 1000, false, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
