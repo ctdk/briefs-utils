@@ -166,6 +166,70 @@ func accessAclMode(entries []posixAclEntry) uint32 {
 	return mode
 }
 
+// chmodAcl rewrites an access ACL's entries to match a new mode — a port
+// of __posix_acl_chmod_masq (fs/posix_acl.c:516): USER_OBJ and OTHER take
+// the mode's owner/other perm bits, the group class (MASK when present,
+// else GROUP_OBJ) the group bits; named entries are untouched. Returns
+// false for the kernel's -EIO shape (no group-class entry).
+func chmodAcl(entries []posixAclEntry, mode uint32) bool {
+	groupIdx, maskIdx := -1, -1
+	for i := range entries {
+		switch entries[i].tag {
+		case aclTagUserObj:
+			entries[i].perm = uint16((mode & sIRWXU) >> 6)
+		case aclTagGroupObj:
+			groupIdx = i
+		case aclTagMask:
+			maskIdx = i
+		case aclTagOther:
+			entries[i].perm = uint16(mode & sIRWXO)
+		}
+	}
+	gi := maskIdx
+	if gi < 0 {
+		gi = groupIdx
+	}
+	if gi < 0 {
+		return false
+	}
+	entries[gi].perm = uint16((mode & sIRWXG) >> 3)
+	return true
+}
+
+// syncAccessAclToMode rewrites @in's stored system.posix_acl_access to
+// match @in's (already updated) Filemode — what native filesystems do from
+// their ->setattr via posix_acl_chmod (e.g. ext4/inode.c:6156,
+// xfs/xfs_iops.c:888). fuse_setattr never runs it: fs/fuse/dir.c:2365
+// comments that the daemon "may have updated acl xattrs in the filesystem",
+// so the bridge must, or a chmod leaves the stored ACL stale and a
+// subsequent setfacl whose change already matches the stale ACL issues no
+// setxattr — leaving the mode stuck (generic/375). The masq'd blob rides
+// setXattrLocked's commit, which persists @in, so the ACL and the new mode
+// publish together; an absent, undecodable, or unmasq-able ACL is left
+// alone (the mode alone is then authoritative, as for an ACL-less inode).
+func (b *BrieFS) syncAccessAclToMode(in *briefs.Inode) error {
+	kvs, _, err := b.loadXattrEntries(in)
+	if err != nil {
+		return err
+	}
+	blob, ok := getXattrFromKvs(kvs, aclAccessName)
+	if !ok {
+		return nil
+	}
+	acl, aok := decodePosixAcl(blob)
+	if !aok {
+		return nil
+	}
+	if !chmodAcl(acl, in.Filemode&0o777) {
+		return nil
+	}
+	newBlob := encodePosixAcl(acl)
+	if string(newBlob) == string(blob) {
+		return nil
+	}
+	return b.setXattrLocked(in, aclAccessName, newBlob, 0)
+}
+
 // encodePosixAcl serializes entries into the on-wire blob format (tests).
 func encodePosixAcl(entries []posixAclEntry) []byte {
 	buf := make([]byte, 4+posixAclEntrySz*len(entries))

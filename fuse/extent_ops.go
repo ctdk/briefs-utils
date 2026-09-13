@@ -935,6 +935,15 @@ func (b *BrieFS) setattrOp(ctx context.Context, ino uint64, in *fuseSetAttrIn) e
 	if in.valid&fattrMode != 0 {
 		di.Filemode = (di.Filemode &^ 0o7777) | (in.mode & 0o7777)
 		changed = true
+		// Keep a stored access ACL in sync with the new mode
+		// (posix_acl_chmod, which fuse_setattr defers to the daemon —
+		// see syncAccessAclToMode). Runs with the mode already set on
+		// di so the masq'd ACL and the new mode ride one commit.
+		if di.XattrOffset != 0 {
+			if err := b.syncAccessAclToMode(di); err != nil {
+				return err
+			}
+		}
 	}
 	if in.valid&fattrUID != 0 {
 		di.Uid = in.uid

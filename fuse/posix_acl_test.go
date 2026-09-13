@@ -421,3 +421,135 @@ func TestSetAccessAclUpdatesMode(t *testing.T) {
 		t.Fatalf("default ACL mode: want 0755 unchanged, got %o", in.Filemode&0o7777)
 	}
 }
+
+// TestChmodUpdatesAccessAcl covers the chmod-masq (generic/375): the stored
+// access ACL must track the mode after a chmod — posix_acl_chmod, which
+// native filesystems run from their ->setattr and fuse_setattr defers to
+// the daemon — or a later setfacl whose change already matches the stale
+// ACL issues no setxattr and the mode never follows the ACL.
+func TestChmodUpdatesAccessAcl(t *testing.T) {
+	// chmodAcl unit shapes: group class from MASK when present (GROUP_OBJ
+	// and named entries untouched), else from GROUP_OBJ; the kernel's
+	// -EIO shape has no group class.
+	acl := []posixAclEntry{
+		{tag: aclTagUserObj, perm: 0o6},
+		{tag: aclTagUser, perm: 0o7, id: 101},
+		{tag: aclTagGroupObj, perm: 0o4},
+		{tag: aclTagMask, perm: 0o7},
+		{tag: aclTagOther, perm: 0o4},
+	}
+	if !chmodAcl(acl, 0o755) {
+		t.Fatalf("chmodAcl failed for masked shape")
+	}
+	want := []posixAclEntry{
+		{tag: aclTagUserObj, perm: 0o7},
+		{tag: aclTagUser, perm: 0o7, id: 101},
+		{tag: aclTagGroupObj, perm: 0o4},
+		{tag: aclTagMask, perm: 0o5},
+		{tag: aclTagOther, perm: 0o5},
+	}
+	for i := range want {
+		if acl[i] != want[i] {
+			t.Fatalf("entry %d: want %+v, got %+v", i, want[i], acl[i])
+		}
+	}
+	noMask := []posixAclEntry{
+		{tag: aclTagUserObj, perm: 0o6},
+		{tag: aclTagGroupObj, perm: 0o7},
+		{tag: aclTagOther, perm: 0o4},
+	}
+	if !chmodAcl(noMask, 0o755) {
+		t.Fatalf("chmodAcl failed for group-obj shape")
+	}
+	if noMask[1].perm != 0o5 || noMask[0].perm != 0o7 || noMask[2].perm != 0o5 {
+		t.Fatalf("group-obj shape: got %+v", noMask)
+	}
+	if chmodAcl([]posixAclEntry{
+		{tag: aclTagUserObj, perm: 0o7},
+		{tag: aclTagOther, perm: 0o5},
+	}, 0o755) {
+		t.Fatalf("no group class: chmodAcl unexpectedly succeeded")
+	}
+
+	mkfs := buildMkfs(t)
+	img := mkfsImage(t, mkfs, 5000)
+	b := openBridge(t, img)
+
+	const rootIno = 1
+
+	// The generic/375 file sequence. Store an access ACL (setfacl), then
+	// chmod 2755: the stored ACL must masq to u::rwx,g::r-x,o::r-x — with
+	// the mode already set on the inode, both publish in one commit.
+	f, err := b.createInDir(rootIno, "f", briefs.ModeFile|0o644, 1000, 100, false, 0)
+	if err != nil {
+		t.Fatalf("createInDir f: %v", err)
+	}
+	injectCallerStatus(t, callerStatus{}, true)
+	ctx := callerCtx(100, 100, 4321)
+	if err := b.setXattrOp(ctx, f.InodeNumber, aclAccessName, encodePosixAcl(aclTrivial), 0); err != nil {
+		t.Fatalf("setfacl initial: %v", err)
+	}
+	if err := b.setattrOp(context.Background(), f.InodeNumber,
+		setattrReq(fattrMode, withMode(0o2755))); err != nil {
+		t.Fatalf("chmod 2755: %v", err)
+	}
+	got, err := b.getXattr(f.InodeNumber, aclAccessName)
+	if err != nil {
+		t.Fatalf("getXattr after chmod: %v", err)
+	}
+	entries, ok := decodePosixAcl(got)
+	if !ok || len(entries) != 3 {
+		t.Fatalf("post-chmod ACL decode: ok %v, %d entries", ok, len(entries))
+	}
+	want = []posixAclEntry{
+		{tag: aclTagUserObj, perm: 0o7},
+		{tag: aclTagGroupObj, perm: 0o5},
+		{tag: aclTagOther, perm: 0o5},
+	}
+	for i := range want {
+		if entries[i] != want[i] {
+			t.Fatalf("post-chmod entry %d: want %+v, got %+v", i, want[i], entries[i])
+		}
+	}
+
+	// Then the out-of-group setfacl (its change now differs from the
+	// masq'd ACL, so it issues a setxattr): mode follows the ACL and the
+	// S_ISGID is cleared.
+	ctx = callerCtx(100, 101, 4322)
+	if err := b.setXattrOp(ctx, f.InodeNumber, aclAccessName,
+		encodePosixAcl([]posixAclEntry{
+			{tag: aclTagUserObj, perm: 0o7, id: 0xffffffff},
+			{tag: aclTagGroupObj, perm: 0o7, id: 0xffffffff},
+			{tag: aclTagOther, perm: 0o7, id: 0xffffffff},
+		}), 0); err != nil {
+		t.Fatalf("setfacl clear: %v", err)
+	}
+	in, err := b.inodes.ReadInode(f.InodeNumber)
+	if err != nil {
+		t.Fatalf("ReadInode f: %v", err)
+	}
+	if in.Filemode&0o7777 != 0o777 {
+		t.Fatalf("post-setfacl mode: want 0777, got %o", in.Filemode&0o7777)
+	}
+
+	// A further chmod re-masqs the stored ACL to the new mode too; an
+	// ACL-less inode's chmod path is unaffected (the XattrOffset guard).
+	if err := b.setattrOp(context.Background(), f.InodeNumber,
+		setattrReq(fattrMode, withMode(0o755))); err != nil {
+		t.Fatalf("chmod matching: %v", err)
+	}
+	in, err = b.inodes.ReadInode(f.InodeNumber)
+	if err != nil {
+		t.Fatalf("ReadInode f2: %v", err)
+	}
+	if in.Filemode&0o7777 != 0o755 {
+		t.Fatalf("matching chmod mode: want 0755, got %o", in.Filemode&0o7777)
+	}
+	got, err = b.getXattr(f.InodeNumber, aclAccessName)
+	if err != nil {
+		t.Fatalf("getXattr after matching chmod: %v", err)
+	}
+	if entries, ok := decodePosixAcl(got); !ok || entries[1].perm != 0o5 || entries[2].perm != 0o5 {
+		t.Fatalf("matching chmod ACL: got % x", got)
+	}
+}
