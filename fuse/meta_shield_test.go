@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"syscall"
 	"testing"
 
@@ -127,7 +128,7 @@ func TestMetaShieldConversionOnFullFs(t *testing.T) {
 	blk4096 := make([]byte, 4096)
 	const nUnwritten = 9
 	for i := 0; i < nUnwritten; i++ {
-		if err := b.fallocateOp(preIno, uint64(i)*2*4096, 4096, fallocKeepSize); err != nil {
+		if err := b.fallocateOp(context.Background(), preIno, uint64(i)*2*4096, 4096, fallocKeepSize); err != nil {
 			t.Fatalf("fallocate #%d: %v", i, err)
 		}
 		writeFile(t, b, scratch.InodeNumber, blk4096, int64(i)*4096)
@@ -152,7 +153,7 @@ func TestMetaShieldConversionOnFullFs(t *testing.T) {
 	}
 	fillIno := fill.InodeNumber
 	for off := int64(0); ; off += 4096 {
-		if _, err := b.writeFileData(fillIno, blk4096, off); err != nil {
+		if _, err := b.writeFileData(context.Background(), fillIno, blk4096, off); err != nil {
 			if err != syscall.ENOSPC {
 				t.Fatalf("fill write at %d: %v (want ENOSPC)", off, err)
 			}
@@ -200,7 +201,7 @@ func TestMetaShieldPunchRelease(t *testing.T) {
 	ino := in.InodeNumber
 
 	// Three unwritten blocks -> shield = metaReserveSize(3).
-	if err := b.fallocateOp(ino, 0, 3*4096, 0); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, 0, 3*4096, 0); err != nil {
 		t.Fatalf("fallocate: %v", err)
 	}
 	shield := b.dataAlloc.Shield()
@@ -213,7 +214,7 @@ func TestMetaShieldPunchRelease(t *testing.T) {
 
 	// Punch the middle block: unwritten count drops to 2, the shield to
 	// metaReserveSize(2), and the punched block returns to the data pool.
-	if err := b.fallocateOp(ino, 4096, 4096, fallocPunchHole|fallocKeepSize); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, 4096, 4096, fallocPunchHole|fallocKeepSize); err != nil {
 		t.Fatalf("punch: %v", err)
 	}
 	shield = b.dataAlloc.Shield()
@@ -237,7 +238,7 @@ func TestMetaShieldDropOnUnlink(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	ino := in.InodeNumber
-	if err := b.fallocateOp(ino, 0, 2*4096, 0); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, 0, 2*4096, 0); err != nil {
 		t.Fatalf("fallocate: %v", err)
 	}
 	if got := b.dataAlloc.Shield(); got != metaReserveSize(2) {

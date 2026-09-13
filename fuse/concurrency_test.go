@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -39,7 +40,7 @@ func TestConcurrentFileWrites(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			pat := makePattern(i+100, 2*int(b.blockSize))
-			if _, err := b.writeFileData(inos[i], pat, 0); err != nil {
+			if _, err := b.writeFileData(context.Background(), inos[i], pat, 0); err != nil {
 				t.Errorf("writeFileData %d: %v", i, err)
 				return
 			}
@@ -126,7 +127,7 @@ func TestConcurrentMixedFileAndDirOps(t *testing.T) {
 			defer wg.Done()
 			if i%2 == 0 {
 				pat := makePattern(i+200, int(b.blockSize))
-				if _, err := b.writeFileData(inos[i], pat, 0); err != nil {
+				if _, err := b.writeFileData(context.Background(), inos[i], pat, 0); err != nil {
 					t.Errorf("write %d: %v", i, err)
 					return
 				}

@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"syscall"
 	"testing"
 
@@ -34,7 +35,7 @@ func TestFallocatePreallocate(t *testing.T) {
 	// KEEP_SIZE preallocate [0, 8192): two unwritten blocks (merged into one
 	// extent of len 2), size unchanged (0).
 	freeBeforePre := b.dataAlloc.FreeCount()
-	if err := b.fallocateOp(ino, 0, 8192, fallocKeepSize); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, 0, 8192, fallocKeepSize); err != nil {
 		t.Fatalf("fallocate keep-size: %v", err)
 	}
 	di, _ := b.inodes.ReadInode(ino)
@@ -73,7 +74,7 @@ func TestFallocatePreallocate(t *testing.T) {
 
 	// Re-preallocating the same range is a no-op (blocks already mapped).
 	freeBefore := b.dataAlloc.FreeCount()
-	if err := b.fallocateOp(ino, 0, 8192, fallocKeepSize); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, 0, 8192, fallocKeepSize); err != nil {
 		t.Fatalf("re-fallocate: %v", err)
 	}
 	if got := b.dataAlloc.FreeCount(); got != freeBefore {
@@ -81,7 +82,7 @@ func TestFallocatePreallocate(t *testing.T) {
 	}
 
 	// Plain preallocate past EOF grows the size.
-	if err := b.fallocateOp(ino, 8192, 4096, 0); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, 8192, 4096, 0); err != nil {
 		t.Fatalf("plain fallocate: %v", err)
 	}
 	di, _ = b.inodes.ReadInode(ino)
@@ -112,7 +113,7 @@ func TestFallocatePunchHole(t *testing.T) {
 	writeFile(t, b, ino, p2, 2*bs)
 
 	// Punch a hole in block 1.
-	if err := b.fallocateOp(ino, uint64(bs), uint64(bs), fallocPunchHole|fallocKeepSize); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, uint64(bs), uint64(bs), fallocPunchHole|fallocKeepSize); err != nil {
 		t.Fatalf("punch hole: %v", err)
 	}
 	if got := readFile(t, b, ino, bs, bs); !allZero(got) {
@@ -152,7 +153,7 @@ func TestTruncate(t *testing.T) {
 	freeBefore := b.dataAlloc.FreeCount()
 
 	// Truncate down to 1000 (frees blocks 1+; zeroes the tail of block 0).
-	if err := b.truncateInode(ino, 1000); err != nil {
+	if err := b.truncateInode(context.Background(), ino, 1000); err != nil {
 		t.Fatalf("truncate down: %v", err)
 	}
 	di, _ := b.inodes.ReadInode(ino)
@@ -172,7 +173,7 @@ func TestTruncate(t *testing.T) {
 	}
 
 	// Truncate up to 2*bs; the gap reads zeros.
-	if err := b.truncateInode(ino, uint64(2*bs)); err != nil {
+	if err := b.truncateInode(context.Background(), ino, uint64(2*bs)); err != nil {
 		t.Fatalf("truncate up: %v", err)
 	}
 	di, _ = b.inodes.ReadInode(ino)
@@ -200,7 +201,7 @@ func TestKillpriv(t *testing.T) {
 	ino := in.InodeNumber
 
 	// chmod 4755 (setuid).
-	if err := b.setattrOp(ino, setattrReq(fattrMode, withMode(briefs.ModeFile|0o4755))); err != nil {
+	if err := b.setattrOp(context.Background(), ino, setattrReq(fattrMode, withMode(briefs.ModeFile|0o4755))); err != nil {
 		t.Fatalf("chmod setuid: %v", err)
 	}
 	di, _ := b.inodes.ReadInode(ino)
@@ -215,10 +216,10 @@ func TestKillpriv(t *testing.T) {
 	}
 
 	// chmod setuid again, then chown -> strips setuid.
-	if err := b.setattrOp(ino, setattrReq(fattrMode, withMode(briefs.ModeFile|0o4755))); err != nil {
+	if err := b.setattrOp(context.Background(), ino, setattrReq(fattrMode, withMode(briefs.ModeFile|0o4755))); err != nil {
 		t.Fatalf("chmod setuid 2: %v", err)
 	}
-	if err := b.setattrOp(ino, setattrReq(fattrUID, withUID(2000))); err != nil {
+	if err := b.setattrOp(context.Background(), ino, setattrReq(fattrUID, withUID(2000))); err != nil {
 		t.Fatalf("chown: %v", err)
 	}
 	di, _ = b.inodes.ReadInode(ino)
@@ -239,6 +240,164 @@ func TestKillpriv(t *testing.T) {
 	writeFile(t, b, ino, makePattern(2, 50), 0)
 	if _, err := b.getXattr(ino, "security.capability"); err != syscall.ENODATA {
 		t.Fatalf("security.capability not cleared on write: err %v", err)
+	}
+
+	fsckClean(t, b, img)
+}
+
+// TestRemovePrivsGating checks removePrivs against the kernel's
+// setattr_should_drop_suidgid rules (fs/attr.c): nothing for a CAP_FSETID
+// caller or a non-regular file; suid always for an unprivileged caller; sgid
+// only when the file is group-executable or the caller is outside the file's
+// group; security.capability cleared even for the privileged caller
+// (generic/093's root append, 683's root cases, 355's sgid golden lines).
+func TestRemovePrivsGating(t *testing.T) {
+	mkfs := buildMkfs(t)
+	img := mkfsImage(t, mkfs, 5000)
+	b := openBridge(t, img)
+
+	in, _ := b.createInDir(1, "g", briefs.ModeFile|0o644, 1000, 1000, false)
+	ino := in.InodeNumber
+
+	// Caller contexts: unprivileged gid-1000 (in the file's group), and a
+	// CAP_FSETID holder. The injected /proc status applies to whichever
+	// caller each write carries.
+	unprivGroup := callerCtx(1000, 1000, 1234)
+	unprivOther := callerCtx(1000, 2000, 1234)
+	capFsetid := callerCtx(0, 0, 1234)
+
+	chmod := func(m uint32) {
+		t.Helper()
+		if err := b.setattrOp(context.Background(), ino,
+			setattrReq(fattrMode, withMode(briefs.ModeFile|m))); err != nil {
+			t.Fatalf("chmod %o: %v", m, err)
+		}
+	}
+	mode := func() uint32 {
+		t.Helper()
+		di, _ := b.inodes.ReadInode(ino)
+		return di.Filemode & 0o7777
+	}
+	write := func(ctx context.Context) {
+		t.Helper()
+		if _, err := b.writeFileData(ctx, ino, makePattern(1, 50), 0); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	// 4755, unprivileged in-group write -> 755 (suid stripped).
+	injectCallerStatus(t, callerStatus{}, true)
+	chmod(0o4755)
+	write(unprivGroup)
+	if got := mode(); got != 0o755 {
+		t.Fatalf("4755 unpriv write: want 755, got %o", got)
+	}
+
+	// 2644 (sgid, no group-exec), unprivileged in-group write -> sgid kept
+	// (setattr_should_drop_sgid: S_IXGRP clear and caller in group).
+	chmod(0o2644)
+	write(unprivGroup)
+	if got := mode(); got != 0o2644 {
+		t.Fatalf("2644 in-group write: want 2644, got %o", got)
+	}
+
+	// 2644, unprivileged out-of-group write -> sgid stripped.
+	chmod(0o2644)
+	write(unprivOther)
+	if got := mode(); got != 0o644 {
+		t.Fatalf("2644 out-of-group write: want 644, got %o", got)
+	}
+
+	// 2755 (sgid + group-exec), in-group -> stripped anyway (S_IXGRP).
+	chmod(0o2755)
+	write(unprivGroup)
+	if got := mode(); got != 0o755 {
+		t.Fatalf("2755 in-group write: want 755, got %o", got)
+	}
+
+	// 6755, CAP_FSETID write -> both bits preserved (root case).
+	injectCallerStatus(t, callerStatus{capEff: 1 << capFSetIDBit}, true)
+	chmod(0o6755)
+	write(capFsetid)
+	if got := mode(); got != 0o6755 {
+		t.Fatalf("6755 CAP_FSETID write: want 6755, got %o", got)
+	}
+
+	// security.capability is cleared even for the CAP_FSETID caller
+	// (generic/093: a root append still drops file capabilities), and other
+	// xattrs are untouched.
+	if err := b.setXattr(ino, "security.capability", makePattern(9, 20), 0); err != nil {
+		t.Fatalf("set security.capability: %v", err)
+	}
+	if err := b.setXattr(ino, "trusted.other", makePattern(8, 20), 0); err != nil {
+		t.Fatalf("set trusted.other: %v", err)
+	}
+	chmod(0o6755)
+	write(capFsetid)
+	if _, err := b.getXattr(ino, "security.capability"); err != syscall.ENODATA {
+		t.Fatalf("security.capability not cleared for CAP_FSETID write: err %v", err)
+	}
+	if _, err := b.getXattr(ino, "trusted.other"); err != nil {
+		t.Fatalf("trusted.other disturbed by killpriv: err %v", err)
+	}
+
+	// A non-regular file (setgid directory) is a no-op.
+	injectCallerStatus(t, callerStatus{}, true)
+	dir, _ := b.createInDir(1, "d", briefs.ModeDir|0o2755, 1000, 1000, false)
+	di, _ := b.inodes.ReadInode(dir.InodeNumber)
+	if di.Filemode&0o7777 != 0o2755 {
+		t.Fatalf("dir mode setup: want 2755, got %o", di.Filemode&0o7777)
+	}
+	if err := b.removePrivs(unprivGroup, di); err != nil {
+		t.Fatalf("removePrivs on dir: %v", err)
+	}
+	di, _ = b.inodes.ReadInode(dir.InodeNumber)
+	if di.Filemode&0o7777 != 0o2755 {
+		t.Fatalf("removePrivs stripped a non-regular file: got %o", di.Filemode&0o7777)
+	}
+
+	fsckClean(t, b, img)
+}
+
+// TestKillprivFallocate checks the fallocate killpriv site (generic/683):
+// an unprivileged fallocate strips suid; a CAP_FSETID fallocate preserves it.
+func TestKillprivFallocate(t *testing.T) {
+	mkfs := buildMkfs(t)
+	img := mkfsImage(t, mkfs, 5000)
+	b := openBridge(t, img)
+
+	in, _ := b.createInDir(1, "f", briefs.ModeFile|0o644, 1000, 1000, false)
+	ino := in.InodeNumber
+	chmod := func(m uint32) {
+		t.Helper()
+		if err := b.setattrOp(context.Background(), ino,
+			setattrReq(fattrMode, withMode(briefs.ModeFile|m))); err != nil {
+			t.Fatalf("chmod %o: %v", m, err)
+		}
+	}
+
+	// Unprivileged fallocate strips suid (683's qa_user case). The kernel
+	// strips nothing on the FUSE fallocate path without killpriv_v2, so the
+	// daemon-side strip is the only one.
+	injectCallerStatus(t, callerStatus{}, true)
+	chmod(0o4755)
+	if err := b.fallocateOp(callerCtx(1000, 1000, 1234), ino, 0, 8192, 0); err != nil {
+		t.Fatalf("fallocate: %v", err)
+	}
+	di, _ := b.inodes.ReadInode(ino)
+	if di.Filemode&0o4000 != 0 {
+		t.Fatalf("setuid not stripped on unpriv fallocate: mode %o", di.Filemode)
+	}
+
+	// CAP_FSETID fallocate preserves it (683's root case).
+	injectCallerStatus(t, callerStatus{capEff: 1 << capFSetIDBit}, true)
+	chmod(0o4755)
+	if err := b.fallocateOp(callerCtx(0, 0, 1234), ino, 8192, 8192, 0); err != nil {
+		t.Fatalf("fallocate 2: %v", err)
+	}
+	di, _ = b.inodes.ReadInode(ino)
+	if di.Filemode&0o4000 == 0 {
+		t.Fatalf("setuid stripped on CAP_FSETID fallocate: mode %o", di.Filemode)
 	}
 
 	fsckClean(t, b, img)
@@ -275,7 +434,7 @@ func TestFallocateCollapseRange(t *testing.T) {
 	}
 
 	freeBefore := b.dataAlloc.FreeCount()
-	if err := b.fallocateOp(ino, uint64(bs), uint64(bs), fallocCollapseRange); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, uint64(bs), uint64(bs), fallocCollapseRange); err != nil {
 		t.Fatalf("collapse range: %v", err)
 	}
 
@@ -299,10 +458,10 @@ func TestFallocateCollapseRange(t *testing.T) {
 	}
 
 	// Guards: unaligned offset, range reaching EOF, inline data.
-	if err := b.fallocateOp(ino, 100, uint64(bs), fallocCollapseRange); err != syscall.EINVAL {
+	if err := b.fallocateOp(context.Background(), ino, 100, uint64(bs), fallocCollapseRange); err != syscall.EINVAL {
 		t.Errorf("unaligned collapse: want EINVAL, got %v", err)
 	}
-	if err := b.fallocateOp(ino, 2*uint64(bs), uint64(bs), fallocCollapseRange); err != syscall.EINVAL {
+	if err := b.fallocateOp(context.Background(), ino, 2*uint64(bs), uint64(bs), fallocCollapseRange); err != syscall.EINVAL {
 		t.Errorf("collapse reaching EOF: want EINVAL, got %v", err)
 	}
 
@@ -311,7 +470,7 @@ func TestFallocateCollapseRange(t *testing.T) {
 	// A block-aligned range on a <= 256-byte inline file always reaches
 	// EOF first, so the bounds EINVAL fires before the inline EOPNOTSUPP
 	// (the kernel's check order, file.c:3258-3273).
-	if err := b.fallocateOp(inl.InodeNumber, 0, uint64(bs), fallocCollapseRange); err != syscall.EINVAL {
+	if err := b.fallocateOp(context.Background(), inl.InodeNumber, 0, uint64(bs), fallocCollapseRange); err != syscall.EINVAL {
 		t.Errorf("collapse on inline file: want EINVAL (bounds first), got %v", err)
 	}
 
@@ -337,7 +496,7 @@ func TestFallocateInsertRange(t *testing.T) {
 	writeFile(t, b, ino, p1, bs)
 
 	freeBefore := b.dataAlloc.FreeCount()
-	if err := b.fallocateOp(ino, uint64(bs), uint64(bs), fallocInsertRange); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, uint64(bs), uint64(bs), fallocInsertRange); err != nil {
 		t.Fatalf("insert range: %v", err)
 	}
 
@@ -365,16 +524,16 @@ func TestFallocateInsertRange(t *testing.T) {
 	}
 
 	// Guards: unaligned, offset at/past EOF, inline data.
-	if err := b.fallocateOp(ino, 100, uint64(bs), fallocInsertRange); err != syscall.EINVAL {
+	if err := b.fallocateOp(context.Background(), ino, 100, uint64(bs), fallocInsertRange); err != syscall.EINVAL {
 		t.Errorf("unaligned insert: want EINVAL, got %v", err)
 	}
-	if err := b.fallocateOp(ino, 3*uint64(bs), uint64(bs), fallocInsertRange); err != syscall.EINVAL {
+	if err := b.fallocateOp(context.Background(), ino, 3*uint64(bs), uint64(bs), fallocInsertRange); err != syscall.EINVAL {
 		t.Errorf("insert at EOF: want EINVAL, got %v", err)
 	}
 
 	inl, _ := b.createInDir(1, "ii", briefs.ModeFile|0o644, 1000, 1000, false)
 	writeFile(t, b, inl.InodeNumber, makePattern(9, 100), 0)
-	if err := b.fallocateOp(inl.InodeNumber, 0, uint64(bs), fallocInsertRange); err != syscall.EOPNOTSUPP {
+	if err := b.fallocateOp(context.Background(), inl.InodeNumber, 0, uint64(bs), fallocInsertRange); err != syscall.EOPNOTSUPP {
 		t.Errorf("insert on inline file: want EOPNOTSUPP, got %v", err)
 	}
 
@@ -397,7 +556,7 @@ func TestFallocateZeroRange(t *testing.T) {
 	// --- Partial-block zero keeps the block as data (case 17). ---
 	pat := makePattern(1, 300)
 	writeFile(t, b, ino, pat, 0)
-	if err := b.fallocateOp(ino, 100, 100, fallocZeroRange); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, 100, 100, fallocZeroRange); err != nil {
 		t.Fatalf("partial zero range: %v", err)
 	}
 	got := readFile(t, b, ino, 0, 300)
@@ -422,7 +581,7 @@ func TestFallocateZeroRange(t *testing.T) {
 	physBefore := exts[0].Phys
 	freeBefore := b.dataAlloc.FreeCount()
 
-	if err := b.fallocateOp(ino, 0, 2*uint64(bs), fallocZeroRange); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, 0, 2*uint64(bs), fallocZeroRange); err != nil {
 		t.Fatalf("aligned zero range: %v", err)
 	}
 	if got := readFile(t, b, ino, 0, 2*bs); !allZero(got) {
@@ -452,7 +611,7 @@ func TestFallocateZeroRange(t *testing.T) {
 	writeFile(t, b, ino2, p0, 0)    // block 0
 	writeFile(t, b, ino2, p2, 2*bs) // block 2 (block 1 stays a hole)
 	freeBefore = b.dataAlloc.FreeCount()
-	if err := b.fallocateOp(ino2, uint64(bs), uint64(bs), fallocZeroRange); err != nil {
+	if err := b.fallocateOp(context.Background(), ino2, uint64(bs), uint64(bs), fallocZeroRange); err != nil {
 		t.Fatalf("zero range over a hole: %v", err)
 	}
 	if got := b.dataAlloc.FreeCount(); got != freeBefore-1 {
@@ -466,7 +625,7 @@ func TestFallocateZeroRange(t *testing.T) {
 	in3, _ := b.createInDir(1, "zx", briefs.ModeFile|0o644, 1000, 1000, false)
 	ino3 := in3.InodeNumber
 	writeFile(t, b, ino3, pat, 0) // 300 bytes, mid-block EOF
-	if err := b.fallocateOp(ino3, 400, 2*uint64(bs), fallocZeroRange); err != nil {
+	if err := b.fallocateOp(context.Background(), ino3, 400, 2*uint64(bs), fallocZeroRange); err != nil {
 		t.Fatalf("extending zero range: %v", err)
 	}
 	di, _ = b.inodes.ReadInode(ino3)
@@ -481,14 +640,14 @@ func TestFallocateZeroRange(t *testing.T) {
 	// --- Inline-data branch: zero within the region, optionally grow. ---
 	inl, _ := b.createInDir(1, "zi", briefs.ModeFile|0o644, 1000, 1000, false)
 	writeFile(t, b, inl.InodeNumber, pat, 0)
-	if err := b.fallocateOp(inl.InodeNumber, 100, 100, fallocZeroRange); err != nil {
+	if err := b.fallocateOp(context.Background(), inl.InodeNumber, 100, 100, fallocZeroRange); err != nil {
 		t.Fatalf("inline zero range: %v", err)
 	}
 	got = readFile(t, b, inl.InodeNumber, 0, 300)
 	if !bytesEqual(got[:100], pat[:100]) || !allZero(got[100:200]) || !bytesEqual(got[200:], pat[200:]) {
 		t.Fatalf("inline partial zero mismatch")
 	}
-	if err := b.fallocateOp(inl.InodeNumber, 300, 200, fallocZeroRange); err != nil {
+	if err := b.fallocateOp(context.Background(), inl.InodeNumber, 300, 200, fallocZeroRange); err != nil {
 		t.Fatalf("inline extending zero: %v", err)
 	}
 	// end (500) exceeds the inline region, so this promotes to extent-backed
@@ -546,7 +705,7 @@ func TestFallocateFragmentedHole(t *testing.T) {
 
 	// 16 blocks wanted, 8 free: ENOSPC with the partial harvest rolled
 	// back (the free count must come home unchanged).
-	if err := b.fallocateOp(ino, 0, 16*bs, 0); err != syscall.ENOSPC {
+	if err := b.fallocateOp(context.Background(), ino, 0, 16*bs, 0); err != syscall.ENOSPC {
 		t.Fatalf("oversized fragmented fallocate: err = %v, want ENOSPC", err)
 	}
 	if got := b.dataAlloc.FreeCount(); got != 8 {
@@ -555,7 +714,7 @@ func TestFallocateFragmentedHole(t *testing.T) {
 
 	// 8 blocks across three fragments: three unwritten extents, in offset
 	// order, covering exactly the three free runs.
-	if err := b.fallocateOp(ino, 0, 8*bs, 0); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, 0, 8*bs, 0); err != nil {
 		t.Fatalf("fragmented fallocate: %v", err)
 	}
 	di, _ := b.inodes.ReadInode(ino)

@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"sync"
 	"testing"
 
@@ -51,7 +52,7 @@ func TestSyncMetaDrainKeepsSiblingSlots(t *testing.T) {
 
 	// Truncate a WITHOUT syncing: the deferred map now holds a whole-block
 	// copy with a truncated to 50 that the device page cache does not have.
-	if err := b.setattrOp(a.InodeNumber, setattrReq(fattrSize, withSize(50))); err != nil {
+	if err := b.setattrOp(context.Background(), a.InodeNumber, setattrReq(fattrSize, withSize(50))); err != nil {
 		t.Fatalf("truncate a: %v", err)
 	}
 

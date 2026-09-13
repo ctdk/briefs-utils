@@ -12,6 +12,7 @@
 package fuse
 
 import (
+	"context"
 	"syscall"
 
 	"github.com/ctdk/briefs-utils/briefs"
@@ -26,10 +27,13 @@ const (
 	fallocInsertRange   uint32 = 0x20
 )
 
-// S_ISUID / S_ISGID (mode bits stripped by killpriv).
+// S_ISUID / S_ISGID (mode bits stripped by killpriv) and S_IXGRP (the
+// sgid-strip condition: setattr_should_drop_sgid clears S_ISGID only when
+// the file is group-executable or the caller is outside the file's group).
 const (
 	s_ISUID uint32 = 0o4000
 	s_ISGID uint32 = 0o2000
+	s_IXGRP uint32 = 0o0010
 )
 
 // fattr* bits mirror fuse.FATTR_* (the VFS setattr valid mask).
@@ -67,7 +71,7 @@ type fuseSetAttrIn struct {
 // converts its block-aligned middle to unwritten; COLLAPSE_RANGE removes the
 // range and shifts the tail down; INSERT_RANGE opens a hole and shifts the
 // tail up.
-func (b *BrieFS) fallocateOp(ino uint64, off, size uint64, mode uint32) error {
+func (b *BrieFS) fallocateOp(ctx context.Context, ino uint64, off, size uint64, mode uint32) error {
 	if b.readOnly {
 		return syscall.EROFS
 	}
@@ -100,7 +104,11 @@ func (b *BrieFS) fallocateOp(ino uint64, off, size uint64, mode uint32) error {
 		return syscall.EPERM
 	}
 	// killpriv: strip suid/sgid + clear security.capability (generic/683/688).
-	if err := b.removePrivs(in); err != nil {
+	// The load-bearing daemon-side site: without FUSE_HANDLE_KILLPRIV_V2
+	// (go-fuse v2.10.1 negotiates neither killpriv variant) the kernel
+	// strips nothing on the fallocate path (dir.c:2225-2236 gates
+	// FATTR_KILL_SUIDGID on handle_killpriv_v2), so the bridge must.
+	if err := b.removePrivs(ctx, in); err != nil {
 		return err
 	}
 
@@ -859,7 +867,7 @@ func (b *BrieFS) zeroRangeInline(in *briefs.Inode, off, end uint64, mode uint32)
 }
 
 // truncateInode is the public truncate entry: lock + read + truncateLocked.
-func (b *BrieFS) truncateInode(ino uint64, newSize uint64) error {
+func (b *BrieFS) truncateInode(ctx context.Context, ino uint64, newSize uint64) error {
 	if b.readOnly {
 		return syscall.EROFS
 	}
@@ -870,7 +878,7 @@ func (b *BrieFS) truncateInode(ino uint64, newSize uint64) error {
 	if err != nil {
 		return err
 	}
-	return b.truncateLocked(in, newSize)
+	return b.truncateLocked(ctx, in, newSize)
 }
 
 // zeroEofTailBlock zeroes [size, block_end) of the block containing @size, if
@@ -897,7 +905,7 @@ func (b *BrieFS) zeroEofTailBlock(exts []briefs.Extent, size uint64) error {
 // mirroring briefs_setattr (file.c:836). go-fuse passes the requested fields via
 // SetAttrIn.Valid (FATTR_* bits). Truncate delegates to truncateInode's path;
 // metadata changes journal a fresh JRN_INODE_FULL.
-func (b *BrieFS) setattrOp(ino uint64, in *fuseSetAttrIn) error {
+func (b *BrieFS) setattrOp(ctx context.Context, ino uint64, in *fuseSetAttrIn) error {
 	if b.readOnly {
 		return syscall.EROFS
 	}
@@ -912,7 +920,7 @@ func (b *BrieFS) setattrOp(ino uint64, in *fuseSetAttrIn) error {
 
 	// Size change first (it handles its own killpriv + commit).
 	if in.valid&fattrSize != 0 {
-		if err := b.truncateLocked(di, in.size); err != nil {
+		if err := b.truncateLocked(ctx, di, in.size); err != nil {
 			return err
 		}
 		// Re-read after truncate (truncateLocked mutated + persisted di).
@@ -965,7 +973,7 @@ func (b *BrieFS) setattrOp(ino uint64, in *fuseSetAttrIn) error {
 	// commits its removal. Do NOT re-read di here -- that would discard the
 	// in-memory mode strip.
 	if (in.valid&fattrUID != 0 || in.valid&fattrGID != 0) && di.Filemode&(s_ISUID|s_ISGID) != 0 {
-		if err := b.removePrivs(di); err != nil {
+		if err := b.removePrivs(ctx, di); err != nil {
 			return err
 		}
 		changed = true
@@ -993,7 +1001,7 @@ func (b *BrieFS) setattrOp(ino uint64, in *fuseSetAttrIn) error {
 
 // truncateLocked is the size-change path assuming the inode-block lock is held
 // (shared with truncateInode, which also locks). Mirrors briefs_setattr truncate.
-func (b *BrieFS) truncateLocked(in *briefs.Inode, newSize uint64) error {
+func (b *BrieFS) truncateLocked(ctx context.Context, in *briefs.Inode, newSize uint64) error {
 	// s_maxbytes: truncate past MAX_LFS_FILESIZE fails with EFBIG (kernel
 	// parity: inode_newsize_ok against sb->s_maxbytes = MAX_LFS_FILESIZE,
 	// super.c:495).
@@ -1009,7 +1017,7 @@ func (b *BrieFS) truncateLocked(in *briefs.Inode, newSize uint64) error {
 	if newSize == in.FileSize {
 		return nil
 	}
-	if err := b.removePrivs(in); err != nil {
+	if err := b.removePrivs(ctx, in); err != nil {
 		return err
 	}
 	bs := b.blockSize
@@ -1146,13 +1154,35 @@ func (b *BrieFS) truncateLocked(in *briefs.Inode, newSize uint64) error {
 }
 
 // removePrivs strips suid/sgid and clears security.capability (killpriv),
-// mirroring file_remove_privs (file.c). The suid/sgid bits are cleared on the
+// mirroring file_remove_privs (file.c) with setattr_should_drop_suidgid's
+// gating (fs/attr.c:64-78): a no-op on non-regular files, and nothing at
+// all when the caller holds CAP_FSETID — so a privileged caller preserves
+// the setid bits (generic/683's root cases, 193's root chown) while an
+// unprivileged one loses S_ISUID, plus S_ISGID when the file is
+// group-executable or the caller is outside the file's group
+// (setattr_should_drop_sgid's rule). The security.capability xattr, by
+// contrast, is cleared regardless of the caller's capabilities: it rides
+// the kernel's ATTR_KILL_PRIV path (dentry_needs_remove_privs adds it
+// independent of the CAP_FSETID gate), so a root append still drops file
+// capabilities (generic/093). The suid/sgid bits are cleared on the
 // in-memory inode (persisted by the caller's JRN_INODE_FULL); the
-// security.capability xattr, if present, is removed via a committed xattr op.
-// The caller must hold the inode-block lock.
-func (b *BrieFS) removePrivs(in *briefs.Inode) error {
-	if in.Filemode&(s_ISUID|s_ISGID) != 0 {
-		in.Filemode &^= s_ISUID | s_ISGID
+// security.capability xattr, if present, is removed via a committed xattr
+// op. The caller must hold the inode-block lock.
+func (b *BrieFS) removePrivs(ctx context.Context, in *briefs.Inode) error {
+	// file_remove_privs_flags: no-op unless S_ISREG.
+	if in.Filemode&briefs.ModeTypeMask != briefs.ModeFile {
+		return nil
+	}
+	if !callerHasCap(ctx, capFSetIDBit) {
+		var clear uint32
+		if in.Filemode&s_ISUID != 0 {
+			clear = s_ISUID
+		}
+		if in.Filemode&s_ISGID != 0 &&
+			(in.Filemode&s_IXGRP != 0 || !callerInGroup(ctx, in.Gid)) {
+			clear |= s_ISGID
+		}
+		in.Filemode &^= clear
 	}
 	// Clear security.capability if present (ENODATA => none).
 	if in.XattrOffset != 0 {

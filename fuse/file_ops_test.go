@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"os/exec"
 	"testing"
 
@@ -19,7 +20,7 @@ func makePattern(seed, n int) []byte {
 // writeFile is a test helper that writes data to ino at off and fatals on error.
 func writeFile(t *testing.T, b *BrieFS, ino uint64, data []byte, off int64) {
 	t.Helper()
-	if _, err := b.writeFileData(ino, data, off); err != nil {
+	if _, err := b.writeFileData(context.Background(), ino, data, off); err != nil {
 		t.Fatalf("writeFileData ino %d off %d len %d: %v", ino, off, len(data), err)
 	}
 }

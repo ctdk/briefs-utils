@@ -11,6 +11,7 @@ package fuse
 // are freed.
 
 import (
+	"context"
 	"testing"
 
 	"github.com/ctdk/briefs-utils/briefs"
@@ -41,7 +42,7 @@ func TestPunchMultiBlockBoundary(t *testing.T) {
 
 	off := int64(bs) + 100
 	size := int64(2*bs) + 100 // ends 200 bytes into block 3
-	if err := b.fallocateOp(ino, uint64(off), uint64(size), fallocPunchHole|fallocKeepSize); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, uint64(off), uint64(size), fallocPunchHole|fallocKeepSize); err != nil {
 		t.Fatalf("punch: %v", err)
 	}
 
@@ -101,7 +102,7 @@ func TestPunchSingleBlockBoundary(t *testing.T) {
 
 	off := bs + 100
 	size := 100 // [bs+100, bs+200): entirely inside block 1
-	if err := b.fallocateOp(ino, uint64(off), uint64(size), fallocPunchHole|fallocKeepSize); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, uint64(off), uint64(size), fallocPunchHole|fallocKeepSize); err != nil {
 		t.Fatalf("punch: %v", err)
 	}
 
@@ -138,7 +139,7 @@ func TestPunchInline(t *testing.T) {
 		t.Fatalf("expected inline data, flags=0x%x", di.Flags)
 	}
 
-	if err := b.fallocateOp(ino, 10, 20, fallocPunchHole|fallocKeepSize); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, 10, 20, fallocPunchHole|fallocKeepSize); err != nil {
 		t.Fatalf("punch inline: %v", err)
 	}
 
@@ -177,7 +178,7 @@ func TestPunchAlignedAndHoleRange(t *testing.T) {
 	writeFile(t, b, ino, data, 0)
 
 	// Block-aligned punch of block 1: whole block freed, neighbours intact.
-	if err := b.fallocateOp(ino, uint64(bs), uint64(bs), fallocPunchHole|fallocKeepSize); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, uint64(bs), uint64(bs), fallocPunchHole|fallocKeepSize); err != nil {
 		t.Fatalf("aligned punch: %v", err)
 	}
 	got := readFile(t, b, ino, 0, 3*bs)
@@ -194,7 +195,7 @@ func TestPunchAlignedAndHoleRange(t *testing.T) {
 	}
 
 	// Punch the (now) hole again: no-op, no error.
-	if err := b.fallocateOp(ino, uint64(bs), uint64(bs), fallocPunchHole|fallocKeepSize); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, uint64(bs), uint64(bs), fallocPunchHole|fallocKeepSize); err != nil {
 		t.Fatalf("punch over hole: %v", err)
 	}
 	got = readFile(t, b, ino, 0, 3*bs)

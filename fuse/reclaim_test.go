@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"os/exec"
 	"syscall"
 	"testing"
@@ -32,7 +33,7 @@ func TestDeferredFreeReclaimOnENOSPC(t *testing.T) {
 	chunk := makePattern(1, 4096)
 	filled := 0
 	for i := 0; i < 20000; i++ {
-		if _, err := b.writeFileData(a.InodeNumber, chunk, int64(i)*4096); err != nil {
+		if _, err := b.writeFileData(context.Background(), a.InodeNumber, chunk, int64(i)*4096); err != nil {
 			if err != syscall.ENOSPC {
 				t.Fatalf("fill write %d: %v", i, err)
 			}
@@ -49,7 +50,7 @@ func TestDeferredFreeReclaimOnENOSPC(t *testing.T) {
 
 	// Truncate to zero WITHOUT any sync: every data block's free goes to
 	// pendingFrees, invisible to the bitmap until its records commit.
-	if err := b.setattrOp(a.InodeNumber, setattrReq(fattrSize, withSize(0))); err != nil {
+	if err := b.setattrOp(context.Background(), a.InodeNumber, setattrReq(fattrSize, withSize(0))); err != nil {
 		t.Fatalf("truncate a: %v", err)
 	}
 	pending := b.pendingFreeCount()

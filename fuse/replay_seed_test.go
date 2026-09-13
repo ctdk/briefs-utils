@@ -29,6 +29,7 @@ package fuse
 //     re-derivation page-init ENOSPCs on the zero-free region.
 
 import (
+	"context"
 	"fmt"
 	"math/bits"
 	"strings"
@@ -48,7 +49,7 @@ func fillDataRegion(t *testing.T, b *BrieFS, ino uint64) {
 	chunk := makePattern(1, 512*1024)
 	filled := 0
 	for i := 0; i < 2000; i++ {
-		if _, err := b.writeFileData(ino, chunk, int64(i)*int64(len(chunk))); err != nil {
+		if _, err := b.writeFileData(context.Background(), ino, chunk, int64(i)*int64(len(chunk))); err != nil {
 			if err != syscall.ENOSPC {
 				t.Fatalf("fill write %d: %v", i, err)
 			}
@@ -68,7 +69,7 @@ func fillDataRegion(t *testing.T, b *BrieFS, ino uint64) {
 		if free*4096 > 512*1024 {
 			t.Fatalf("tail fill left %d blocks free — more than one chunk", free)
 		}
-		if _, err := b.writeFileData(ino, makePattern(2, int(free)*4096),
+		if _, err := b.writeFileData(context.Background(), ino, makePattern(2, int(free)*4096),
 			int64(filled)*int64(len(chunk))); err != nil {
 			t.Fatalf("tail fill write (%d blocks): %v", free, err)
 		}
@@ -284,7 +285,7 @@ func TestReplayTrieBlockPoolFullFs(t *testing.T) {
 	// Free the data region again, retiring the truncate's records with a
 	// second checkpoint: the window must not contain extent-frees, whose
 	// pass-2 application would hand the unpooled re-derivation free blocks.
-	if err := b.truncateInode(fin.InodeNumber, 0); err != nil {
+	if err := b.truncateInode(context.Background(), fin.InodeNumber, 0); err != nil {
 		t.Fatalf("truncate bigfill: %v", err)
 	}
 	if err := b.journal.Checkpoint(); err != nil {

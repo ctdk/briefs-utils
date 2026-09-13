@@ -12,6 +12,7 @@ package fuse
 // the kernel module).
 
 import (
+	"context"
 	"syscall"
 	"testing"
 
@@ -32,7 +33,7 @@ func TestMaxFileSizeEFBIG(t *testing.T) {
 	ino := in.InodeNumber
 
 	// A write spilling past MAX_LFS_FILESIZE: off fits, off+len does not.
-	if _, err := b.writeFileData(ino, makePattern(1, 16), maxFileSize-8); err != syscall.EFBIG {
+	if _, err := b.writeFileData(context.Background(), ino, makePattern(1, 16), maxFileSize-8); err != syscall.EFBIG {
 		t.Fatalf("write spilling past s_maxbytes: got %v, want EFBIG", err)
 	}
 	// The rejected write must not have touched the file.
@@ -40,7 +41,7 @@ func TestMaxFileSizeEFBIG(t *testing.T) {
 		t.Fatalf("FileSize after rejected write: got %d, want 0", di.FileSize)
 	}
 	// Truncate past s_maxbytes fails the same way (inode_newsize_ok parity).
-	if err := b.truncateInode(ino, uint64(maxFileSize)+1); err != syscall.EFBIG {
+	if err := b.truncateInode(context.Background(), ino, uint64(maxFileSize)+1); err != syscall.EFBIG {
 		t.Fatalf("truncate past s_maxbytes: got %v, want EFBIG", err)
 	}
 

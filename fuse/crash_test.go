@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"os/exec"
 	"testing"
 
@@ -32,7 +33,7 @@ func TestCrashRecovery(t *testing.T) {
 	if err := b.setXattr(in.InodeNumber, "user.tag", []byte("v"), 0); err != nil {
 		t.Fatalf("setxattr: %v", err)
 	}
-	if err := b.setattrOp(in.InodeNumber, setattrReq(fattrMode, withMode(briefs.ModeFile|0o640))); err != nil {
+	if err := b.setattrOp(context.Background(), in.InodeNumber, setattrReq(fattrMode, withMode(briefs.ModeFile|0o640))); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
 

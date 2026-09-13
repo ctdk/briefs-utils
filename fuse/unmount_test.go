@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"os/exec"
 	"testing"
 
@@ -23,7 +24,7 @@ func TestUnmountCheckpoint(t *testing.T) {
 	}
 	pat := makePattern(7, 5000)
 	writeFile(t, b, in.InodeNumber, pat, 0)
-	if err := b.setattrOp(in.InodeNumber, setattrReq(fattrMode, withMode(briefs.ModeFile|0o600))); err != nil {
+	if err := b.setattrOp(context.Background(), in.InodeNumber, setattrReq(fattrMode, withMode(briefs.ModeFile|0o600))); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
 

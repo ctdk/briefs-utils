@@ -16,6 +16,7 @@ package fuse
 // state, where every drained add EEXISTs and del ENOENTs as a no-op.
 
 import (
+	"context"
 	"sort"
 	"testing"
 
@@ -63,7 +64,7 @@ func TestReplay341RenameDirRecreateName(t *testing.T) {
 			t.Fatalf("create a/x/%s: %v", n, err)
 		}
 		data := make([]byte, 32*1024)
-		if _, err := b.writeFileData(f.InodeNumber, data, 0); err != nil {
+		if _, err := b.writeFileData(context.Background(), f.InodeNumber, data, 0); err != nil {
 			t.Fatalf("pwrite a/x/%s: %v", n, err)
 		}
 	}

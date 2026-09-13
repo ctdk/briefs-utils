@@ -52,6 +52,7 @@
 package fuse
 
 import (
+	"context"
 	"os"
 	"slices"
 	"sort"
@@ -213,7 +214,7 @@ func collectInodeExtents(file *os.File, in *briefs.Inode, blockSize uint64) ([]b
 // inodeBlockLock) plus data/btree blocks exclusive to the inode, so writes to
 // files in different inode blocks run concurrently with each other and with
 // dir ops. The caller (go-fuse Write handler) need not lock.
-func (b *BrieFS) writeFileData(ino uint64, data []byte, off int64) (int, error) {
+func (b *BrieFS) writeFileData(ctx context.Context, ino uint64, data []byte, off int64) (int, error) {
 	if len(data) == 0 {
 		return 0, nil
 	}
@@ -242,8 +243,9 @@ func (b *BrieFS) writeFileData(ino uint64, data []byte, off int64) (int, error) 
 	}
 	// killpriv: a write to a setid file strips suid/sgid and clears
 	// security.capability (generic/093). Mirrors briefs_write_iter's
-	// file_remove_privs.
-	if err := b.removePrivs(in); err != nil {
+	// file_remove_privs; gated on the caller's CAP_FSETID like the kernel's
+	// setattr_should_drop_suidgid (a root write preserves the bits).
+	if err := b.removePrivs(ctx, in); err != nil {
 		return 0, err
 	}
 	oldSize := int64(in.FileSize)

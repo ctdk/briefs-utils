@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"encoding/binary"
 	"syscall"
 	"testing"
@@ -22,7 +23,7 @@ func TestFileattrSetGet(t *testing.T) {
 	ino := in.InodeNumber
 
 	// Seed some data so the file is non-empty.
-	if _, err := b.writeFileData(ino, makePattern(1, 100), 0); err != nil {
+	if _, err := b.writeFileData(context.Background(), ino, makePattern(1, 100), 0); err != nil {
 		t.Fatalf("seed write: %v", err)
 	}
 
@@ -48,7 +49,7 @@ func TestFileattrSetGet(t *testing.T) {
 	}
 
 	// A write to an immutable file must fail with EPERM.
-	if _, err := b.writeFileData(ino, makePattern(2, 50), 0); err != syscall.EPERM {
+	if _, err := b.writeFileData(context.Background(), ino, makePattern(2, 50), 0); err != syscall.EPERM {
 		t.Fatalf("write to immutable: want EPERM, got %v", err)
 	}
 
@@ -56,7 +57,7 @@ func TestFileattrSetGet(t *testing.T) {
 	if err := b.fileattrSet(ino, true, 0, false, 0, 0, 0, 0); err != nil {
 		t.Fatalf("fileattrSet -i: %v", err)
 	}
-	if _, err := b.writeFileData(ino, makePattern(3, 50), 0); err != nil {
+	if _, err := b.writeFileData(context.Background(), ino, makePattern(3, 50), 0); err != nil {
 		t.Fatalf("write after -i: %v", err)
 	}
 
@@ -66,12 +67,12 @@ func TestFileattrSetGet(t *testing.T) {
 	}
 	// A write past EOF (non-append) must fail with EPERM.
 	di, _ := b.inodes.ReadInode(ino)
-	if _, err := b.writeFileData(ino, makePattern(4, 50), int64(di.FileSize)+100); err != syscall.EPERM {
+	if _, err := b.writeFileData(context.Background(), ino, makePattern(4, 50), int64(di.FileSize)+100); err != syscall.EPERM {
 		t.Fatalf("append-only non-EOF write: want EPERM, got %v", err)
 	}
 	// A write at EOF must succeed.
 	size := int64(di.FileSize)
-	if _, err := b.writeFileData(ino, makePattern(5, 50), size); err != nil {
+	if _, err := b.writeFileData(context.Background(), ino, makePattern(5, 50), size); err != nil {
 		t.Fatalf("append-only EOF write: %v", err)
 	}
 	// Clear append.

@@ -16,6 +16,7 @@ package fuse
 //     publish at the sync's commit point.
 
 import (
+	"context"
 	"os/exec"
 	"testing"
 
@@ -245,7 +246,7 @@ func TestExtentTreeCacheInvalidatedByPunch(t *testing.T) {
 	// Punch a hole over fragments [10, 290): those extents drop out via
 	// the full rebuild (extent_ops), invalidating the cache entry.
 	bs := int64(b.blockSize)
-	if err := b.fallocateOp(ino, uint64(10*bs), uint64(280*bs), fallocPunchHole|fallocKeepSize); err != nil {
+	if err := b.fallocateOp(context.Background(), ino, uint64(10*bs), uint64(280*bs), fallocPunchHole|fallocKeepSize); err != nil {
 		t.Fatalf("punch: %v", err)
 	}
 

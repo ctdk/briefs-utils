@@ -10,6 +10,7 @@ package fuse
 // (the readFileData/promoteInlineData daemon panics, generic/551, 2026-09-11).
 
 import (
+	"context"
 	"testing"
 
 	"github.com/ctdk/briefs-utils/briefs"
@@ -18,7 +19,7 @@ import (
 // truncateTo is a helper that truncates ino and fatals on error.
 func truncateTo(t *testing.T, b *BrieFS, ino uint64, newSize uint64) {
 	t.Helper()
-	if err := b.truncateInode(ino, newSize); err != nil {
+	if err := b.truncateInode(context.Background(), ino, newSize); err != nil {
 		t.Fatalf("truncateInode ino %d to %d: %v", ino, newSize, err)
 	}
 }

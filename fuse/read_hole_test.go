@@ -10,6 +10,7 @@ package fuse
 
 import (
 	"bytes"
+	"context"
 	"testing"
 
 	"github.com/ctdk/briefs-utils/briefs"
@@ -31,13 +32,13 @@ func TestReadHoleFullCount(t *testing.T) {
 	bs := int64(b.blockSize)
 	blk0 := bytes.Repeat([]byte{0xA5}, int(bs))
 	blk2 := bytes.Repeat([]byte{0x5A}, int(bs))
-	if _, err := b.writeFileData(ino, blk0, 0); err != nil {
+	if _, err := b.writeFileData(context.Background(), ino, blk0, 0); err != nil {
 		t.Fatalf("write blk0: %v", err)
 	}
-	if err := b.truncateInode(ino, uint64(3*bs)); err != nil {
+	if err := b.truncateInode(context.Background(), ino, uint64(3*bs)); err != nil {
 		t.Fatalf("truncate up: %v", err)
 	}
-	if _, err := b.writeFileData(ino, blk2, 2*bs); err != nil {
+	if _, err := b.writeFileData(context.Background(), ino, blk2, 2*bs); err != nil {
 		t.Fatalf("write blk2: %v", err)
 	}
 
@@ -75,7 +76,7 @@ func TestReadHoleFullCount(t *testing.T) {
 
 	// Read past the last extent within EOF (tail hole after truncate-up):
 	// full count of zeros too.
-	if err := b.truncateInode(ino, uint64(4*bs)); err != nil {
+	if err := b.truncateInode(context.Background(), ino, uint64(4*bs)); err != nil {
 		t.Fatalf("truncate up to 4 blocks: %v", err)
 	}
 	tail := make([]byte, bs)

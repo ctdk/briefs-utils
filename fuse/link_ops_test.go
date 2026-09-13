@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"syscall"
 	"testing"
 
@@ -19,7 +20,7 @@ func TestHardlink(t *testing.T) {
 		t.Fatalf("create a: %v", err)
 	}
 	data := makePattern(1, 300)
-	if _, err := b.writeFileData(a.InodeNumber, data, 0); err != nil {
+	if _, err := b.writeFileData(context.Background(), a.InodeNumber, data, 0); err != nil {
 		t.Fatalf("write a: %v", err)
 	}
 
@@ -155,7 +156,7 @@ func TestRename(t *testing.T) {
 
 	// Files in root.
 	a, _ := b.createInDir(1, "a", briefs.ModeFile|0o644, 1000, 1000, false)
-	b.writeFileData(a.InodeNumber, makePattern(1, 100), 0)
+	b.writeFileData(context.Background(), a.InodeNumber, makePattern(1, 100), 0)
 	// Same-dir rename a -> a2.
 	if err := b.renameInDir(1, "a", 1, "a2", 0); err != nil {
 		t.Fatalf("rename a->a2: %v", err)
@@ -207,7 +208,7 @@ func TestRename(t *testing.T) {
 
 	// Rename over an existing target replaces it (and frees the old target).
 	tgt, _ := b.createInDir(1, "tgt", briefs.ModeFile|0o644, 1000, 1000, false)
-	b.writeFileData(tgt.InodeNumber, makePattern(2, 200), 0)
+	b.writeFileData(context.Background(), tgt.InodeNumber, makePattern(2, 200), 0)
 	tgtIno := tgt.InodeNumber
 	src, _ := b.createInDir(1, "src", briefs.ModeFile|0o644, 1000, 1000, false)
 	if err := b.renameInDir(1, "src", 1, "tgt", 0); err != nil {

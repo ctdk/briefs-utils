@@ -766,7 +766,7 @@ func (n *brieFSNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 // Locking is per inode-table block (inodeBlockLocks), not the global dir lock,
 // so writes to files in different inode blocks run concurrently.
 func (n *brieFSNode) Write(ctx context.Context, f fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
-	nwritten, err := n.bfs.writeFileData(n.ino, data, off)
+	nwritten, err := n.bfs.writeFileData(ctx, n.ino, data, off)
 	if err != nil {
 		return 0, errToErrno(err)
 	}
@@ -958,7 +958,7 @@ func (n *brieFSNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetA
 		mtimensec: in.Mtimensec,
 		ctimensec: in.Ctimensec,
 	}
-	if err := n.bfs.setattrOp(n.ino, &req); err != nil {
+	if err := n.bfs.setattrOp(ctx, n.ino, &req); err != nil {
 		return errToErrno(err)
 	}
 	di, err := n.bfs.inodes.ReadInode(n.ino)
@@ -975,5 +975,5 @@ func (n *brieFSNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetA
 // all five modes: preallocate (unwritten extents), PUNCH_HOLE, ZERO_RANGE,
 // COLLAPSE_RANGE, and INSERT_RANGE.
 func (n *brieFSNode) Allocate(ctx context.Context, f fs.FileHandle, off, size uint64, mode uint32) syscall.Errno {
-	return errToErrno(n.bfs.fallocateOp(n.ino, off, size, mode))
+	return errToErrno(n.bfs.fallocateOp(ctx, n.ino, off, size, mode))
 }

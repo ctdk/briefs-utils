@@ -10,6 +10,7 @@ package fuse
 // the unmount checkpoint (dm-flakey drops those writes) and replays.
 
 import (
+	"context"
 	"testing"
 
 	"github.com/ctdk/briefs-utils/briefs"
@@ -44,12 +45,12 @@ func TestReplayRenameOldNameStaysGone534(t *testing.T) {
 	for i := range data {
 		data[i] = 0xab
 	}
-	if _, err := b.writeFileData(foo.InodeNumber, data, 0); err != nil {
+	if _, err := b.writeFileData(context.Background(), foo.InodeNumber, data, 0); err != nil {
 		t.Fatalf("pwrite foo: %v", err)
 	}
 	fsyncLike(t, b)
 	// ftruncate -> Setattr(FATTR_SIZE)
-	if err := b.setattrOp(foo.InodeNumber, &fuseSetAttrIn{valid: fattrSize, size: 3000}); err != nil {
+	if err := b.setattrOp(context.Background(), foo.InodeNumber, &fuseSetAttrIn{valid: fattrSize, size: 3000}); err != nil {
 		t.Fatalf("truncate foo: %v", err)
 	}
 

@@ -18,6 +18,7 @@ package fuse
 // reserve/free the same allocator bits the live path did.
 
 import (
+	"context"
 	"testing"
 
 	"github.com/ctdk/briefs-utils/briefs"
@@ -110,7 +111,7 @@ func TestExtentJournalRunEncodedAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create big: %v", err)
 	}
-	if err := b.fallocateOp(f.InodeNumber, 0, size, 0); err != nil {
+	if err := b.fallocateOp(context.Background(), f.InodeNumber, 0, size, 0); err != nil {
 		t.Fatalf("falloc %d blocks: %v", fallocBlocks, err)
 	}
 	freeAfterFalloc := b.dataAlloc.FreeCount()
@@ -156,7 +157,7 @@ func TestExtentJournalRunEncodedAndReplay(t *testing.T) {
 
 	// Free side: truncate to 0 journals run-encoded EXTENT_FREE records,
 	// and replaying them frees the same bits the live path freed.
-	if err := b2.truncateInode(f.InodeNumber, 0); err != nil {
+	if err := b2.truncateInode(context.Background(), f.InodeNumber, 0); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	if err := b2.journal.Sync(false); err != nil {
