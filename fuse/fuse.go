@@ -318,6 +318,20 @@ func Mount(imagePath string, opts MountOptions) error {
 			// user_allow_other in /etc/fuse.conf is needed; a non-root
 			// manual mount would now require it.
 			AllowOther: true,
+			// Negotiate FUSE_DONT_MASK. Without it the kernel applies
+			// the caller's umask to create modes itself (fuse_create /
+			// fuse_mknod / fuse_mkdir, fs/fuse/dir.c:843, :1070, :1117)
+			// BEFORE the request, so a default-ACL parent's modes are
+			// pre-masked (0777 arrives as 0755) and the daemon's ACL
+			// masq intersects the wrong mode. Advertising the flag sets
+			// fc->dont_mask from this init reply (fs/fuse/inode.c:1312)
+			// -- SB_POSIXACL alone does not (that check at
+			// inode.c:1763 runs before the flag is set there) -- making
+			// the daemon the sole mode computer: applyCreateMode applies
+			// the caller's umask, or, under a system.posix_acl_default
+			// parent, the ACL's masq with the umask ignored
+			// (posix_acl_create).
+			ExtraCapabilities: fuse.CAP_DONT_MASK,
 		},
 		// Report modes exactly as stored.  Without this, go-fuse patches
 		// any zero-permission mode in Getattr/Lookup replies to 0644 (+0111

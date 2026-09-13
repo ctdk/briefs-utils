@@ -1,13 +1,13 @@
 // Package fuse: POSIX ACL xattr decoding and create-mode computation.
 //
-// Because the mount reports POSIX ACL support, the kernel sets fc->dont_mask
-// (fs/fuse/inode.c:1763) and sends create requests with the caller's mode
-// unmasked. The daemon must apply the umask itself — or, when the parent
-// directory carries a system.posix_acl_default xattr, compute the mode from
-// the ACL instead and ignore the umask, mirroring the VFS posix_acl_create
-// path. This file ports the on-wire xattr format
-// (posix_acl_from_xattr, fs/posix_acl.c) and the mode computation
-// (posix_acl_create_masq, fs/posix_acl.c:459).
+// Because the mount negotiates FUSE_DONT_MASK (fuse.go), the kernel sets
+// fc->dont_mask from the init reply (fs/fuse/inode.c:1312) and sends create
+// requests with the caller's mode unmasked. The daemon must apply the umask
+// itself — or, when the parent directory carries a system.posix_acl_default
+// xattr, compute the mode from the ACL instead and ignore the umask,
+// mirroring the VFS posix_acl_create path. This file ports the on-wire
+// xattr format (posix_acl_from_xattr, fs/posix_acl.c) and the mode
+// computation (posix_acl_create_masq, fs/posix_acl.c:459).
 
 package fuse
 

@@ -257,8 +257,8 @@ func (b *BrieFS) createNamedInode(parentIno uint64, name string, mode, uid, gid 
 		return nil, syscall.ENOTDIR
 	}
 
-	// SB_POSIXACL => fc->dont_mask (fs/fuse/inode.c:1763): the kernel sends
-	// create modes unmasked, so the daemon applies the caller's umask — or
+	// The mount negotiates FUSE_DONT_MASK (fuse.go), so the kernel sends
+	// create modes unmasked and the daemon applies the caller's umask — or
 	// the parent's default ACL, when present, which replaces the umask
 	// entirely (posix_acl_create). Runs BEFORE the dir S_ISGID inherit so
 	// ACL-derived modes keep the bit. Symlinks skip it: the VFS fixes their

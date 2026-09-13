@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"testing"
 
 	"github.com/ctdk/briefs-utils/briefs"
@@ -231,5 +232,52 @@ func TestCreateDefaultACLMode(t *testing.T) {
 	}
 	if f2.Filemode&0o777 != 0o644 {
 		t.Fatalf("file2 mode: want 0644, got %o", f2.Filemode&0o777)
+	}
+}
+
+// live444Blob is the exact system.posix_acl_default blob the live VM's
+// setfacl -d -m u:101:rwx wrote (od dump) in the generic/444 failure: a full
+// named-user grant, group r-x, permissive mask, other r-x.
+var live444Blob = []byte{
+	0x02, 0, 0, 0,
+	0x01, 0, 0x07, 0, 0xff, 0xff, 0xff, 0xff,
+	0x02, 0, 0x07, 0, 0x65, 0, 0, 0,
+	0x04, 0, 0x05, 0, 0xff, 0xff, 0xff, 0xff,
+	0x10, 0, 0x07, 0, 0xff, 0xff, 0xff, 0xff,
+	0x20, 0, 0x05, 0, 0xff, 0xff, 0xff, 0xff,
+}
+
+// TestCreateMode444LiveSequence replays the exact generic/444 sequence:
+// mkdir, setfacl a default ACL, chown 100:100 + chmod 2755, then a 0777
+// mkdir under umask 022 — which must land on 02775: the ACL masq (umask
+// ignored) gives 0775 and the setgid parent adds S_ISGID and its gid.
+func TestCreateMode444LiveSequence(t *testing.T) {
+	mkfs := buildMkfs(t)
+	img := mkfsImage(t, mkfs, 5000)
+	b := openBridge(t, img)
+
+	const rootIno = 1
+	parent, err := b.createInDir(rootIno, "testdir.444", briefs.ModeDir|0o755, 0, 0, false, 0o022)
+	if err != nil {
+		t.Fatalf("mkdir testdir: %v", err)
+	}
+	if err := b.setXattr(parent.InodeNumber, "system.posix_acl_default", live444Blob, 0); err != nil {
+		t.Fatalf("setfacl default ACL: %v", err)
+	}
+	req := setattrReq(fattrUID|fattrGID|fattrMode,
+		withUID(100), withGID(100), withMode(briefs.ModeDir|0o2755))
+	if err := b.setattrOp(context.Background(), parent.InodeNumber, req); err != nil {
+		t.Fatalf("chown+chmod: %v", err)
+	}
+
+	sub, err := b.createInDir(parent.InodeNumber, "testsub1", briefs.ModeDir|0o777, 100, 100, false, 0o022)
+	if err != nil {
+		t.Fatalf("mkdir testsub1: %v", err)
+	}
+	if sub.Filemode != briefs.ModeDir|0o2775 {
+		t.Fatalf("testsub1 mode: want 02775, got %o", sub.Filemode)
+	}
+	if sub.Gid != 100 {
+		t.Fatalf("testsub1 gid: want 100, got %d", sub.Gid)
 	}
 }
