@@ -332,6 +332,16 @@ func Mount(imagePath string, opts MountOptions) error {
 			// parent, the ACL's masq with the umask ignored
 			// (posix_acl_create).
 			ExtraCapabilities: fuse.CAP_DONT_MASK,
+			// fusermount3 mounts FUSE filesystems
+			// nosuid,nodev,noexec by default, while the kernel
+			// `mount -t briefs` mount allows suid,dev,exec.  Mirror
+			// the kernel mount: generic/633's vfstest exec's a
+			// chowned 5000:5000 suid copy of itself from the mount
+			// and expects euid 5000 (impossible under nosuid, and
+			// the exec itself needs exec), and device-node tests
+			// open nodes from the mount.  The daemon runs as root,
+			// which fusermount3 permits to lift the restrictions.
+			Options: []string{"suid", "dev", "exec"},
 		},
 		// Report modes exactly as stored.  Without this, go-fuse patches
 		// any zero-permission mode in Getattr/Lookup replies to 0644 (+0111
