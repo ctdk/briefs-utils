@@ -208,3 +208,66 @@ func TestDirCreateMkdirUnlinkRmdir(t *testing.T) {
 		t.Fatalf("fsck not clean after dir ops:\n%s", out)
 	}
 }
+
+func TestSetgidDirInheritGid(t *testing.T) {
+	mkfs := buildMkfs(t)
+	img := mkfsImage(t, mkfs, 5000)
+	b := openBridge(t, img)
+
+	const rootIno = 1
+
+	// A setgid parent owned by gid 777; the caller's gid is 888.
+	sg, err := b.createInDir(rootIno, "sgdir", briefs.ModeDir|modeSetGID|0o755, 1000, 777, false)
+	if err != nil {
+		t.Fatalf("createInDir sgdir: %v", err)
+	}
+	if sg.Filemode&modeSetGID == 0 {
+		t.Fatalf("sgdir lost S_ISGID: mode %o", sg.Filemode)
+	}
+
+	checkGid := func(label string, child *briefs.Inode, want uint32) {
+		t.Helper()
+		if child.Gid != want {
+			t.Fatalf("%s gid: want %d, got %d", label, want, child.Gid)
+		}
+	}
+
+	// Every child type takes the parent's gid (inode_init_owner).
+	f, err := b.createInDir(sg.InodeNumber, "file", briefs.ModeFile|0o644, 1000, 888, false)
+	if err != nil {
+		t.Fatalf("createInDir file: %v", err)
+	}
+	checkGid("file", f, 777)
+
+	d, err := b.createInDir(sg.InodeNumber, "sub", briefs.ModeDir|0o755, 1000, 888, false)
+	if err != nil {
+		t.Fatalf("createInDir sub: %v", err)
+	}
+	checkGid("dir", d, 777)
+	if d.Filemode&modeSetGID == 0 {
+		t.Fatalf("sub under setgid parent lost S_ISGID: mode %o", d.Filemode)
+	}
+
+	n, err := b.mknodInDir(sg.InodeNumber, "fifo", modeFifo|0o644, 1000, 888, 0)
+	if err != nil {
+		t.Fatalf("mknodInDir fifo: %v", err)
+	}
+	checkGid("fifo", n, 777)
+
+	l, err := b.symlinkInDir(sg.InodeNumber, "link", "file", 1000, 888)
+	if err != nil {
+		t.Fatalf("symlinkInDir link: %v", err)
+	}
+	checkGid("symlink", l, 777)
+
+	// A plain parent: children keep the caller's gid.
+	p, err := b.createInDir(rootIno, "plain", briefs.ModeDir|0o755, 1000, 888, false)
+	if err != nil {
+		t.Fatalf("createInDir plain: %v", err)
+	}
+	f2, err := b.createInDir(p.InodeNumber, "file", briefs.ModeFile|0o644, 1000, 888, false)
+	if err != nil {
+		t.Fatalf("createInDir file2: %v", err)
+	}
+	checkGid("file under non-setgid parent", f2, 888)
+}

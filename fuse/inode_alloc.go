@@ -4,9 +4,10 @@
 // briefs_free_inode_num (inode.c:1108): allocate an inode number from the
 // inode-allocator bitmap, journal the allocation, initialize and persist the
 // on-disk inode; on free, zero the on-disk slot, journal the free, then return
-// the number to the bitmap.  The caller (a FUSE handler) is responsible for
-// setgid inheritance and uid/gid derivation from the FUSE caller's
-// credentials, matching the kernel's inode_init_owner().
+// the number to the bitmap.  The caller (a FUSE handler, i.e.
+// createNamedInode) is responsible for setgid inheritance and uid/gid
+// derivation from the FUSE caller's credentials, matching the kernel's
+// inode_init_owner() — which FUSE never runs kernel-side.
 
 package fuse
 

@@ -263,6 +263,13 @@ func (b *BrieFS) createNamedInode(parentIno uint64, name string, mode, uid, gid 
 	if isDir && (parent.Filemode&modeSetGID) != 0 {
 		mode |= modeSetGID
 	}
+	// ...and under a setgid parent every child type — file, dir, special
+	// file, symlink — takes the parent's gid, not the caller's
+	// (inode_init_owner, fs/inode.c:2304-2310). FUSE never runs it kernel-side,
+	// so the bridge must.
+	if parent.Filemode&modeSetGID != 0 {
+		gid = parent.Gid
+	}
 
 	// AllocInode journals JRN_INODE_ALLOC and builds the inode in memory; it does
 	// NOT persist (the caller writes the inode under the child's block lock).
