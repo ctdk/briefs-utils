@@ -281,3 +281,143 @@ func TestCreateMode444LiveSequence(t *testing.T) {
 		t.Fatalf("testsub1 gid: want 100, got %d", sub.Gid)
 	}
 }
+
+// aclAcl75 is a u::rwx,u:101:rwx,g::rwx,m::r-x,o::r-x access ACL: the MASK
+// (not GROUP_OBJ) fixes the group class.
+var aclMasked = []posixAclEntry{
+	{tag: aclTagUserObj, perm: 0o7},
+	{tag: aclTagUser, perm: 0o7, id: 101},
+	{tag: aclTagGroupObj, perm: 0o7},
+	{tag: aclTagMask, perm: 0o5},
+	{tag: aclTagOther, perm: 0o5},
+}
+
+// aclTrivial is the equiv-mode setfacl of `chmod 640`: u::rw-,g::r--,o::---.
+var aclTrivial = []posixAclEntry{
+	{tag: aclTagUserObj, perm: 0o6},
+	{tag: aclTagGroupObj, perm: 0o4},
+	{tag: aclTagOther, perm: 0o0},
+}
+
+// TestSetAccessAclUpdatesMode covers the setxattr ACL contract
+// (generic/375): storing system.posix_acl_access rewrites the mode from the
+// ACL — the kernel delegates this to the daemon (fs/fuse/acl.c) — clearing
+// S_ISGID unless the caller is in the file's group or capable
+// (in_group_or_capable, what the kernel signals to setxattr-ext daemons via
+// FUSE_SETXATTR_ACL_KILL_SGID).
+func TestSetAccessAclUpdatesMode(t *testing.T) {
+	mkfs := buildMkfs(t)
+	img := mkfsImage(t, mkfs, 5000)
+	b := openBridge(t, img)
+
+	const rootIno = 1
+
+	// accessAclMode: the class entries decide; a MASK overwrites the
+	// GROUP_OBJ's group bits; named entries contribute nothing.
+	if m := accessAclMode(acl444); m != 0o775 {
+		t.Fatalf("444 ACL mode: want 0775, got %o", m)
+	}
+	if m := accessAclMode(aclMasked); m != 0o755 {
+		t.Fatalf("masked ACL mode: want 0755, got %o", m)
+	}
+	if m := accessAclMode(aclTrivial); m != 0o640 {
+		t.Fatalf("trivial ACL mode: want 0640, got %o", m)
+	}
+
+	// A caller-less context (no FUSE caller: unreachable live) is the
+	// unprivileged worst case: not in the file's group, no capabilities.
+	// A 2640 file taking the trivial ACL lands on 0640 — sgid cleared.
+	f, err := b.createInDir(rootIno, "f1", briefs.ModeFile|0o2640, 1000, 100, false, 0)
+	if err != nil {
+		t.Fatalf("createInDir f1: %v", err)
+	}
+	blob := encodePosixAcl(aclTrivial)
+	if err := b.setXattrOp(context.Background(), f.InodeNumber, aclAccessName, blob, 0); err != nil {
+		t.Fatalf("setxattrOp access ACL: %v", err)
+	}
+	in, err := b.inodes.ReadInode(f.InodeNumber)
+	if err != nil {
+		t.Fatalf("ReadInode f1: %v", err)
+	}
+	if in.Filemode&0o7777 != 0o640 {
+		t.Fatalf("unpriv ACL mode: want 0640, got %o", in.Filemode&0o7777)
+	}
+	// The blob itself is stored verbatim.
+	got, err := b.getXattr(f.InodeNumber, aclAccessName)
+	if err != nil || string(got) != string(blob) {
+		t.Fatalf("access ACL blob: want % x, got % x (err %v)", blob, got, err)
+	}
+
+	// In the file's group (egid 100): the S_ISGID survives.
+	f2, err := b.createInDir(rootIno, "f2", briefs.ModeFile|0o2640, 1000, 100, false, 0)
+	if err != nil {
+		t.Fatalf("createInDir f2: %v", err)
+	}
+	injectCallerStatus(t, callerStatus{}, true)
+	ctx := callerCtx(100, 100, 4321)
+	if err := b.setXattrOp(ctx, f2.InodeNumber, aclAccessName, blob, 0); err != nil {
+		t.Fatalf("setxattrOp in-group: %v", err)
+	}
+	in, err = b.inodes.ReadInode(f2.InodeNumber)
+	if err != nil {
+		t.Fatalf("ReadInode f2: %v", err)
+	}
+	if in.Filemode&0o7777 != 0o2640 {
+		t.Fatalf("in-group ACL mode: want 02640, got %o", in.Filemode&0o7777)
+	}
+
+	// Out of the group but holding CAP_FOWNER: the S_ISGID survives too.
+	f3, err := b.createInDir(rootIno, "f3", briefs.ModeFile|0o2640, 1000, 100, false, 0)
+	if err != nil {
+		t.Fatalf("createInDir f3: %v", err)
+	}
+	injectCallerStatus(t, callerStatus{capEff: 1 << capFOwnerBit}, true)
+	ctx = callerCtx(1000, 1000, 4322)
+	if err := b.setXattrOp(ctx, f3.InodeNumber, aclAccessName, blob, 0); err != nil {
+		t.Fatalf("setxattrOp capable: %v", err)
+	}
+	in, err = b.inodes.ReadInode(f3.InodeNumber)
+	if err != nil {
+		t.Fatalf("ReadInode f3: %v", err)
+	}
+	if in.Filemode&0o7777 != 0o2640 {
+		t.Fatalf("capable ACL mode: want 02640, got %o", in.Filemode&0o7777)
+	}
+
+	// An undecodable blob is stored verbatim with no mode change.
+	f4, err := b.createInDir(rootIno, "f4", briefs.ModeFile|0o640, 1000, 100, false, 0)
+	if err != nil {
+		t.Fatalf("createInDir f4: %v", err)
+	}
+	junk := []byte{0x09, 0x09, 0x09, 0x09}
+	if err := b.setXattrOp(context.Background(), f4.InodeNumber, aclAccessName, junk, 0); err != nil {
+		t.Fatalf("setxattrOp junk: %v", err)
+	}
+	got, err = b.getXattr(f4.InodeNumber, aclAccessName)
+	if err != nil || string(got) != string(junk) {
+		t.Fatalf("junk ACL blob: want % x, got % x (err %v)", junk, got, err)
+	}
+	in, err = b.inodes.ReadInode(f4.InodeNumber)
+	if err != nil {
+		t.Fatalf("ReadInode f4: %v", err)
+	}
+	if in.Filemode&0o7777 != 0o640 {
+		t.Fatalf("junk ACL mode: want 0640 unchanged, got %o", in.Filemode&0o7777)
+	}
+
+	// The default ACL never rewrites a mode (it only shapes creates).
+	d, err := b.createInDir(rootIno, "d", briefs.ModeDir|0o755, 1000, 100, false, 0)
+	if err != nil {
+		t.Fatalf("createInDir d: %v", err)
+	}
+	if err := b.setXattrOp(context.Background(), d.InodeNumber, aclDefaultName, encodePosixAcl(acl444), 0); err != nil {
+		t.Fatalf("setxattrOp default ACL: %v", err)
+	}
+	in, err = b.inodes.ReadInode(d.InodeNumber)
+	if err != nil {
+		t.Fatalf("ReadInode d: %v", err)
+	}
+	if in.Filemode&0o7777 != 0o755 {
+		t.Fatalf("default ACL mode: want 0755 unchanged, got %o", in.Filemode&0o7777)
+	}
+}

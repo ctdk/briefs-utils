@@ -32,6 +32,7 @@ import (
 
 const (
 	// Capability bits checked by the bridge (include/uapi/linux/capability.h).
+	capFOwnerBit   = 3  // CAP_FOWNER: in_group_or_capable's capable side
 	capFSetIDBit   = 7  // CAP_FSETID: setattr_should_drop_suidgid gate
 	capSysAdminBit = 21 // CAP_SYS_ADMIN: FITRIM, SETFSLABEL (file.c:258, :304)
 )

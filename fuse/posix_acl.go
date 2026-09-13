@@ -41,8 +41,13 @@ const (
 	sIRWXUGO        = sIRWXU | sIRWXG | sIRWXO
 )
 
-// aclDefaultName is the parent-directory xattr a default ACL is stored in.
-const aclDefaultName = "system.posix_acl_default"
+// aclDefaultName is the parent-directory xattr a default ACL is stored in;
+// aclAccessName is the per-file access ACL, whose mode implications the
+// kernel does not compute for FUSE (see setXattrOp).
+const (
+	aclDefaultName = "system.posix_acl_default"
+	aclAccessName  = "system.posix_acl_access"
+)
 
 // posixAclEntry is one decoded ACL entry (perm is the low 3 bits; id names
 // the user/group for the USER and GROUP tags, 0 otherwise).
@@ -136,6 +141,29 @@ func createModeFromACL(entries []posixAclEntry, mode uint32) (uint32, bool) {
 	entries[gi].perm &= uint16((m >> 3) | ^sIRWXO)
 	m &= (uint32(entries[gi].perm) << 3) | ^sIRWXG
 	return (mode &^ sIRWXUGO) | m, true
+}
+
+// accessAclMode builds the permission bits an access ACL implies — the
+// mode half of posix_acl_equiv_mode (fs/posix_acl.c:312): owner from
+// USER_OBJ, group from GROUP_OBJ, overwritten by MASK when present, other
+// from OTHER; named USER/GROUP entries contribute no bits. Only each
+// entry's low 3 perm bits count (the kernel masks e_perm & S_IRWXO).
+func accessAclMode(entries []posixAclEntry) uint32 {
+	var mode uint32
+	for _, e := range entries {
+		perm := uint32(e.perm & 0o7)
+		switch e.tag {
+		case aclTagUserObj:
+			mode |= perm << 6
+		case aclTagGroupObj:
+			mode |= perm << 3
+		case aclTagOther:
+			mode |= perm
+		case aclTagMask:
+			mode = (mode &^ sIRWXG) | (perm << 3)
+		}
+	}
+	return mode
 }
 
 // encodePosixAcl serializes entries into the on-wire blob format (tests).

@@ -832,9 +832,10 @@ func (n *brieFSNode) Getxattr(ctx context.Context, name string, dest []byte) (ui
 }
 
 // Setxattr sets/replaces an xattr (value != nil) or removes it (value == nil).
-// Mirrors briefs_xattr_set (xattr.c:925).
+// Mirrors briefs_xattr_set (xattr.c:925); setXattrOp adds the POSIX-ACL mode
+// contract for system.posix_acl_access.
 func (n *brieFSNode) Setxattr(ctx context.Context, name string, data []byte, flags uint32) syscall.Errno {
-	return errToErrno(n.bfs.setXattr(n.ino, name, data, flags))
+	return errToErrno(n.bfs.setXattrOp(ctx, n.ino, name, data, flags))
 }
 
 // Listxattr lists all xattr names (NUL-separated). With a zero-length dest it

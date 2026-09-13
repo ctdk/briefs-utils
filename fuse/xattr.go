@@ -39,6 +39,7 @@
 package fuse
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"syscall"
@@ -144,6 +145,53 @@ func (b *BrieFS) setXattr(ino uint64, name string, value []byte, flags uint32) e
 	in, err := b.inodes.ReadInode(ino)
 	if err != nil {
 		return err
+	}
+	return b.setXattrLocked(in, name, value, flags)
+}
+
+// setXattrOp is the handler-level setxattr: plain storage via setXattr, plus
+// the POSIX-ACL contract. Storing system.posix_acl_access rewrites the file
+// mode from the ACL — fs/fuse/acl.c (fuse_set_acl) delegates this to the
+// daemon ("Fuse userspace is responsible for updating access permissions in
+// the inode"), while native filesystems do it in posix_acl_update_mode
+// (fs/posix_acl.c:712). The S_ISGID bit is cleared when the caller is not in
+// the file's group and not capable (in_group_or_capable): the kernel signals
+// the same condition to setxattr-ext daemons via FUSE_SETXATTR_ACL_KILL_SGID
+// in the setxattr_flags field, but go-fuse 2.10.1 does not negotiate
+// FUSE_SETXATTR_EXT, so the kernel sends only the compat header and the
+// bridge must compute the condition from the caller status. An undecodable
+// blob is stored verbatim with no mode change: the kernel validates ACL
+// xattrs (posix_acl_valid) before they reach FUSE, so this is unreachable
+// through the mount.
+func (b *BrieFS) setXattrOp(ctx context.Context, ino uint64, name string, value []byte, flags uint32) error {
+	if name != aclAccessName || value == nil {
+		return b.setXattr(ino, name, value, flags)
+	}
+	acl, ok := decodePosixAcl(value)
+	if !ok {
+		return b.setXattr(ino, name, value, flags)
+	}
+	if len(value) > xattrMaxValueLen {
+		return syscall.E2BIG
+	}
+	if b.readOnly {
+		return syscall.EROFS
+	}
+	lock := b.inodeBlockLock(ino)
+	lock.Lock()
+	defer lock.Unlock()
+
+	in, err := b.inodes.ReadInode(ino)
+	if err != nil {
+		return err
+	}
+	// Mutate the mode before the store: setXattrLocked commits the inode
+	// with the xattr op, so both changes ride one journaled commit (the
+	// same trick removePrivs uses for killpriv). Setid and type bits pass
+	// through untouched.
+	in.Filemode = (in.Filemode &^ sIRWXUGO) | accessAclMode(acl)
+	if !callerInGroup(ctx, in.Gid) && !callerHasCap(ctx, capFOwnerBit) {
+		in.Filemode &^= s_ISGID
 	}
 	return b.setXattrLocked(in, name, value, flags)
 }
