@@ -307,6 +307,17 @@ func Mount(imagePath string, opts MountOptions) error {
 			// (briefs-xattr/acl parity), so kernel-created and
 			// fuse-created ACLs interoperate.
 			EnableAcl: true,
+			// Let other users' processes past fuse_permissible_uidgid
+			// (fs/fuse/dir.c fuse_allow_current_process): without
+			// allow_other, every permission-checked op from any process
+			// whose uid/euid/suid/gid/egid/sgid don't all equal the
+			// daemon's mount ids gets EACCES regardless of file mode, so
+			// the fsgqa/qa_user/runas children every xfstests permission
+			// test spawns die before exercising any semantics.  The daemon
+			// mounts as root (mount.fuse.briefs systemd-run path), so no
+			// user_allow_other in /etc/fuse.conf is needed; a non-root
+			// manual mount would now require it.
+			AllowOther: true,
 		},
 		// Report modes exactly as stored.  Without this, go-fuse patches
 		// any zero-permission mode in Getattr/Lookup replies to 0644 (+0111
