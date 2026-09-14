@@ -20,7 +20,7 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int, opts *repairOpt
 	}
 
 	// 1. Set up data allocator.
-	dataRegionStart := fs.sb.TrieNodePoolStart + fs.sb.TrieNodePoolSize
+	dataRegionStart := fs.dataRegionStart()
 	if dataRegionStart > fs.sb.TotalBlocks {
 		return fmt.Errorf("data region start %d exceeds total blocks %d", dataRegionStart, fs.sb.TotalBlocks)
 	}
@@ -239,7 +239,7 @@ func loadAllocatorFromDisk(file *os.File, poolBlock, blockSize uint64) (*briefs.
 // already minimally packed is left untouched (the fast path) so a healthy
 // image is not rewritten for nothing.
 func compactFileExtents(fs *fsckState, plan *repairPlan, blockSize uint64) error {
-	dataRegionStart := fs.sb.TrieNodePoolStart + fs.sb.TrieNodePoolSize
+	dataRegionStart := fs.dataRegionStart()
 	for ino, in := range fs.inodes {
 		if in == nil || in.Flags&briefs.InodeFlagIndexed == 0 {
 			continue

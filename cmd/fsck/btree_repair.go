@@ -213,13 +213,7 @@ func rebuildOneBtree(fs *fsckState, plan *repairPlan, ino uint64, in *briefs.Ino
 // Used by both the Phase 4 rebuild (repair of failed trees) and Phase 6
 // compaction (optimization of healthy ones).
 func rebuildBtreeFromExtents(fs *fsckState, plan *repairPlan, ino uint64, clone *briefs.Inode, extents []briefs.Extent, oldNodeBlocks []uint64, blockSize, dataRegionStart uint64) (nodeCount int, rootBlock uint64, err error) {
-	allocBlock := func() (uint64, error) {
-		rel, err := plan.dataAlloc.AllocateBlock()
-		if err != nil {
-			return 0, err
-		}
-		return rel + dataRegionStart, nil
-	}
+	allocBlock := allocDataBlock(plan, dataRegionStart)
 	leafBlocks, leafFirstOffsets, leafBufs, err := briefs.BuildBtreeLeaves(extents, blockSize, allocBlock)
 	if err != nil {
 		freeNodeBlocks(plan, leafBlocks, dataRegionStart) // free the partial allocation

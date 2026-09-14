@@ -176,6 +176,40 @@ func verifyAllDirTries(fs *fsckState, blockSize uint64, dirs []dirInfo) []trieEn
 	return allEntries
 }
 
+// fsckTrieNote builds the WalkTrie Note hook shared by the collection walks:
+// read/page/slot problems abort the walk wrapped with context, and a
+// sibling-read problem is always tolerated (the chain gathered so far is
+// kept).  A cycle note aborts the entry collector — it must not loop
+// forever on a corrupt trie — but is tolerated by the block collector
+// (already visited: skip); a sibling-cap note is the reverse, since the
+// block collector must see every page it is going to free.
+func fsckTrieNote(abortOnCycle, abortOnSiblingCap bool) func(ref uint64, kind briefs.TrieWalkNote, nerr error) error {
+	return func(ref uint64, kind briefs.TrieWalkNote, nerr error) error {
+		switch kind {
+		case briefs.TrieNoteRead:
+			return fmt.Errorf("read page %d: %w", briefs.TrieRefBlock(ref), nerr)
+		case briefs.TrieNotePage:
+			return fmt.Errorf("page %d: %w", briefs.TrieRefBlock(ref), nerr)
+		case briefs.TrieNoteSlot:
+			return nerr
+		case briefs.TrieNoteCycle:
+			if abortOnCycle {
+				return fmt.Errorf("cycle detected at ref %d", ref)
+			}
+			return nil // already visited: skip
+		case briefs.TrieNoteSiblingCap:
+			if abortOnSiblingCap {
+				return fmt.Errorf("sibling chain from ref %d exceeds %d nodes (corrupt/cyclic trie)",
+					ref, briefs.TrieSiblingMax)
+			}
+			return nil // keep the chain gathered so far
+		case briefs.TrieNoteSiblingRead:
+			return nil // keep the chain gathered so far
+		}
+		return nil
+	}
+}
+
 // collectDirectoryEntries walks a directory trie and returns all live
 // entries.  Unlike verifyDirectoryTrie, it does not emit fsck errors; it
 // returns an error only on structural problems that prevent collection.
@@ -185,23 +219,7 @@ func collectDirectoryEntries(fs *fsckState, parentIno uint64, rootRef uint64, bl
 	}
 	var entries []trieEntry
 	err := briefs.WalkTrie(trieReadAt(fs, blockSize), rootRef, briefs.TrieVisitor{
-		Note: func(ref uint64, kind briefs.TrieWalkNote, nerr error) error {
-			switch kind {
-			case briefs.TrieNoteRead:
-				return fmt.Errorf("read page %d: %w", briefs.TrieRefBlock(ref), nerr)
-			case briefs.TrieNotePage:
-				return fmt.Errorf("page %d: %w", briefs.TrieRefBlock(ref), nerr)
-			case briefs.TrieNoteSlot:
-				return nerr
-			case briefs.TrieNoteCycle:
-				return fmt.Errorf("cycle detected at ref %d", ref)
-			case briefs.TrieNoteSiblingCap, briefs.TrieNoteSiblingRead:
-				// Keep the chain gathered so far and continue: the caller
-				// gets every entry that is still reachable.
-				return nil
-			}
-			return nil
-		},
+		Note: fsckTrieNote(true, false),
 		VisitLeaf: func(ref uint64, buf []byte, node *briefs.TrieSlot) error {
 			if node.Flags&uint16(briefs.NodeFlagDeleted) != 0 {
 				return nil
@@ -233,24 +251,7 @@ func collectDirectoryTrieBlocks(fs *fsckState, rootRef uint64, blockSize uint64)
 		return blocks, nil
 	}
 	err := briefs.WalkTrie(trieReadAt(fs, blockSize), rootRef, briefs.TrieVisitor{
-		Note: func(ref uint64, kind briefs.TrieWalkNote, nerr error) error {
-			switch kind {
-			case briefs.TrieNoteRead:
-				return fmt.Errorf("read page %d: %w", briefs.TrieRefBlock(ref), nerr)
-			case briefs.TrieNotePage:
-				return fmt.Errorf("page %d: %w", briefs.TrieRefBlock(ref), nerr)
-			case briefs.TrieNoteSlot:
-				return nerr
-			case briefs.TrieNoteCycle:
-				return nil // already visited: skip
-			case briefs.TrieNoteSiblingCap:
-				return fmt.Errorf("sibling chain from ref %d exceeds %d nodes (corrupt/cyclic trie)",
-					ref, briefs.TrieSiblingMax)
-			case briefs.TrieNoteSiblingRead:
-				return nil // keep the chain gathered so far
-			}
-			return nil
-		},
+		Note: fsckTrieNote(false, true),
 		VisitNode: func(ref uint64, emitted bool, buf []byte, page *briefs.TriePage, node *briefs.TrieSlot) error {
 			blocks[briefs.TrieRefBlock(ref)] = true
 			return nil

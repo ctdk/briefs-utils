@@ -17,7 +17,7 @@ import (
 // the data region). The absolute block number of the first data block is
 // TrieNodePoolStart + TrieNodePoolSize.
 func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
-	dataRegionStart := fs.sb.TrieNodePoolStart + fs.sb.TrieNodePoolSize
+	dataRegionStart := fs.dataRegionStart()
 
 	l2, dataBlockCount, err := readAllocatorL2(fs.file, fs.sb.TrieNodePoolStart, blockSize)
 	if err != nil {
@@ -269,17 +269,8 @@ func verifyExtentOverlaps(fs *fsckState) {
 	var allExtents []extentRef
 
 	addExtent := func(ino uint64, ext briefs.Extent) {
-		// A hole has no physical backing (Phys == 0). Unwritten extents are
-		// fully allocated and must be counted.
-		if ext.Phys == 0 {
-			return
-		}
-		if ext.Flags&^uint32(briefs.ExtentFlagUnwritten) != 0 {
-			fs.warnf("ino %d: extent with unknown flags 0x%08X (phys=%d, len=%d)",
-				ino, ext.Flags, ext.Phys, ext.Len)
-		}
-		if ext.Len > 0 && ext.Phys > 0 {
-			allExtents = append(allExtents, extentRef{ino: ino, phys: ext.Phys, len: ext.Len})
+		if phys, length, ok := checkExtent(fs, ino, ext); ok {
+			allExtents = append(allExtents, extentRef{ino: ino, phys: phys, len: length})
 		}
 	}
 

@@ -28,15 +28,6 @@ func verifyAllocatorPool(file *os.File, poolBlock, blockSize uint64, label strin
 	return nil
 }
 
-// readAllocatorHeader reads the allocator pool header and returns all fields.
-func readAllocatorHeader(file *os.File, poolBlock, blockSize uint64) (l0w, l1w, l2w, blockCount, freeCount uint64, err error) {
-	hdr, err := briefs.ReadAllocatorHeader(file, poolBlock, blockSize)
-	if err != nil {
-		return 0, 0, 0, 0, 0, err
-	}
-	return hdr.L0Words, hdr.L1Words, hdr.L2Words, hdr.BlockCount, hdr.FreeCount, nil
-}
-
 // verifyAllocatorBitmap reads and validates the full 3-level allocator bitmap.
 // It checks:
 //   - L0 bits correctly summarize L1 (a set L0 bit means at least one L1 word under it is non-zero)
@@ -170,26 +161,23 @@ func readAllocatorL2(file *os.File, poolBlock, blockSize uint64) (l2 []uint64, b
 // the allocator headers and the actual inode/found counts.
 func verifySuperblockFreeCounts(fs *fsckState, totalInodesFound int) {
 	// Read data allocator free count
-	_, _, _, _, dataFree, err := readAllocatorHeader(fs.file, fs.sb.TrieNodePoolStart, fs.sb.BlockSize)
-	if err == nil {
-		if dataFree != fs.sb.FreeDataBlks {
+	if hdr, err := briefs.ReadAllocatorHeader(fs.file, fs.sb.TrieNodePoolStart, fs.sb.BlockSize); err == nil {
+		if hdr.FreeCount != fs.sb.FreeDataBlks {
 			fs.errorf("superblock free data blocks mismatch: superblock says %d, allocator says %d",
-				fs.sb.FreeDataBlks, dataFree)
+				fs.sb.FreeDataBlks, hdr.FreeCount)
 		}
 	}
 
-	// Read inode allocator free count
-	_, _, _, _, inodeFree, err := readAllocatorHeader(fs.file, fs.sb.InodeBMOffset, fs.sb.BlockSize)
-	if err == nil {
-		if inodeFree != fs.sb.FreeInodes {
-			fs.errorf("superblock free inodes mismatch: superblock says %d, allocator says %d",
-				fs.sb.FreeInodes, inodeFree)
-		}
-	}
-
-	// Cross-check: total inodes = (blockCount - inodeFree), should be totalInodesFound
+	// Read the inode allocator header once: its free count cross-checks the
+	// superblock, and its block count drives the in-use tally below.
 	if inoHdr, err := briefs.ReadAllocatorHeader(fs.file, fs.sb.InodeBMOffset, fs.sb.BlockSize); err == nil {
-		expectedInodes := int(inoHdr.BlockCount - inodeFree)
+		if inoHdr.FreeCount != fs.sb.FreeInodes {
+			fs.errorf("superblock free inodes mismatch: superblock says %d, allocator says %d",
+				fs.sb.FreeInodes, inoHdr.FreeCount)
+		}
+		// Cross-check: total inodes = (blockCount - freeCount), should be
+		// totalInodesFound
+		expectedInodes := int(inoHdr.BlockCount - inoHdr.FreeCount)
 		if expectedInodes != totalInodesFound {
 			fs.errorf("inode count mismatch: bitmap says %d in-use, inode table scan found %d",
 				expectedInodes, totalInodesFound)

@@ -36,14 +36,8 @@ type compactTriePage struct {
 // packing nodes and names tightly into fresh pages and freeing any old pages that
 // are no longer needed. This covers step 4 of the fsck repair roadmap.
 func compactDirectoryTries(fs *fsckState, plan *repairPlan, blockSize uint64) error {
-	dataRegionStart := fs.sb.TrieNodePoolStart + fs.sb.TrieNodePoolSize
-	allocBlock := func() (uint64, error) {
-		rel, err := plan.dataAlloc.AllocateBlock()
-		if err != nil {
-			return 0, err
-		}
-		return rel + dataRegionStart, nil
-	}
+	dataRegionStart := fs.dataRegionStart()
+	allocBlock := allocDataBlock(plan, dataRegionStart)
 
 	for _, d := range fs.dirs {
 		entries, err := collectDirectoryEntries(fs, d.ino, d.trieRoot, blockSize)

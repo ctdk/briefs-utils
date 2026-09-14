@@ -59,6 +59,26 @@ type repairOptions struct {
 	RepairLinks        bool // recompute inode nlink values (phase 5)
 }
 
+// dataRegionStart is the absolute block number of the first data block
+// (the trie node pool ends there). The data allocator tracks data-relative
+// block numbers from this point.
+func (fs *fsckState) dataRegionStart() uint64 {
+	return fs.sb.TrieNodePoolStart + fs.sb.TrieNodePoolSize
+}
+
+// allocDataBlock returns a fresh-block allocator over the repair plan's
+// data allocator: each call returns one data-relative allocation shifted
+// to its absolute block number.
+func allocDataBlock(plan *repairPlan, dataRegionStart uint64) func() (uint64, error) {
+	return func() (uint64, error) {
+		rel, err := plan.dataAlloc.AllocateBlock()
+		if err != nil {
+			return 0, err
+		}
+		return rel + dataRegionStart, nil
+	}
+}
+
 func (fs *fsckState) errorf(format string, args ...interface{}) {
 	fs.errors++
 	fmt.Fprintf(os.Stderr, "  ERROR: "+format+"\n", args...)

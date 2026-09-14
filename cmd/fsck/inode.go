@@ -257,6 +257,24 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 	return
 }
 
+// checkExtent validates one extent for the fsck passes: a hole has no
+// physical backing (Phys == 0) and is skipped; unwritten extents are fully
+// backed and must be counted; unknown flags are reported. The extent's
+// physical range is returned when it has one.
+func checkExtent(fs *fsckState, ino uint64, ext briefs.Extent) (phys, length uint64, ok bool) {
+	if ext.Phys == 0 {
+		return 0, 0, false
+	}
+	if ext.Flags&^uint32(briefs.ExtentFlagUnwritten) != 0 {
+		fs.warnf("ino %d: extent with unknown flags 0x%08X (phys=%d, len=%d)",
+			ino, ext.Flags, ext.Phys, ext.Len)
+	}
+	if ext.Len > 0 && ext.Phys > 0 {
+		return ext.Phys, ext.Len, true
+	}
+	return 0, 0, false
+}
+
 // collectInodeExtents collects all blocks referenced by an inode's extents
 // (and, for tree-backed inodes, the B-tree node blocks themselves) into
 // fs.usedBlocks for cross-referencing against the allocator bitmap.
@@ -266,18 +284,10 @@ func collectInodeExtents(fs *fsckState, ino uint64, in *briefs.Inode, blockSize 
 		return
 	}
 
-	// Record the blocks from a single extent. A hole has no physical backing
-	// (Phys == 0); unwritten extents are fully backed and must be counted.
+	// Record the blocks from a single extent.
 	addExtentBlocks := func(ext briefs.Extent) error {
-		if ext.Phys == 0 {
-			return nil
-		}
-		if ext.Flags&^uint32(briefs.ExtentFlagUnwritten) != 0 {
-			fs.warnf("ino %d: extent with unknown flags 0x%08X (phys=%d, len=%d)",
-				ino, ext.Flags, ext.Phys, ext.Len)
-		}
-		if ext.Len > 0 && ext.Phys > 0 {
-			fs.usedBlocks.markRange(ext.Phys, ext.Len)
+		if phys, length, ok := checkExtent(fs, ino, ext); ok {
+			fs.usedBlocks.markRange(phys, length)
 		}
 		return nil
 	}
