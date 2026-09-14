@@ -520,6 +520,33 @@ func (a *Allocator) FreeBlock(relBlock uint64) {
 	}
 }
 
+// FreeRun frees the data-relative blocks [first, first+n) in one mutex
+// acquisition and one pass over the touched L2 words. Equivalent to n
+// FreeBlock calls (out-of-range and already-free blocks change nothing),
+// minus the per-block mutex round and L1/L0 summary walk — the large
+// truncate/delete paths feed it run-encoded ranges. The whole word span's
+// L2 blocks are marked dirty, which can include one already-free edge word
+// per span; Sync rewrites those unchanged, a cheap price for skipping the
+// per-block bookkeeping.
+func (a *Allocator) FreeRun(first, n uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.l0 == nil || n == 0 || first >= a.blockCount {
+		return
+	}
+	if n > a.blockCount-first {
+		n = a.blockCount - first // keep the dirty word span inside the bitmap
+	}
+	if briefs.AllocMarkFreeRun(a.l0, a.l1, a.l2, &a.freeCount, a.blockCount, first, n) > 0 {
+		a.dirty = true
+		wEnd := (first + n - 1) / 64
+		for w := first / 64; w <= wEnd; w++ {
+			a.markL2Word(w)
+		}
+	}
+}
+
 // ReserveBlock marks a specific block as allocated (used during journal replay).
 func (a *Allocator) ReserveBlock(relBlock uint64) {
 	a.mu.Lock()
@@ -598,12 +625,10 @@ func (a *Allocator) Allocated(rel uint64) bool {
 }
 
 // FreeBlocksRange frees [phys, phys+length) absolute data blocks, converting
-// each to data-relative. Used by journal replay's JRN_EXTENT_FREE / trie-free
-// handlers. Mirrors the kernel's briefs_free_blocks_range().
+// the range to data-relative. Used by journal replay's JRN_EXTENT_FREE /
+// trie-free handlers. Mirrors the kernel's briefs_free_blocks_range()
 func (a *Allocator) FreeBlocksRange(dataRegionStart, phys, length uint64) {
-	for i := uint64(0); i < length; i++ {
-		a.FreeBlock(phys + i - dataRegionStart)
-	}
+	a.FreeRun(phys-dataRegionStart, length)
 }
 
 // TotalBlocks returns the total number of blocks tracked by this allocator.

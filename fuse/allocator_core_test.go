@@ -79,3 +79,67 @@ func TestAllocatorCoreMatchesBuilder(t *testing.T) {
 		t.Fatal("out-of-range block reported allocated by Allocator")
 	}
 }
+
+// TestAllocMarkFreeRunMatchesPerBlock drives random ranges through
+// AllocMarkFreeRun and through the equivalent per-block AllocMarkFree
+// sequence on identical copies of a seeded bitmap, asserting the levels,
+// free counts, and returned newly-freed tallies stay identical at every
+// step. Ranges deliberately overlap, re-free, run past blockCount, start
+// out of range, and use zero lengths — the edge shapes the run form must
+// fold to the same no-ops the per-block form produces.
+func TestAllocMarkFreeRunMatchesPerBlock(t *testing.T) {
+	const blockCount = uint64(5000)
+	rng := rand.New(rand.NewSource(7))
+
+	// A partially-allocated seed bitmap, mirrored into run/per-block views.
+	seed := briefs.NewAllocBuilder(blockCount)
+	for i := 0; i < 1000; i++ {
+		seed.MarkAllocated(rng.Uint64() % blockCount)
+	}
+	clone := func() (l0, l1, l2 []uint64, free uint64) {
+		return append([]uint64(nil), seed.L0...),
+			append([]uint64(nil), seed.L1...),
+			append([]uint64(nil), seed.L2...),
+			seed.FreeCount
+	}
+
+	for op := 0; op < 20000; op++ {
+		// Runs up to ~3 words, plus occasional monsters past blockCount.
+		first := rng.Uint64() % (blockCount + 100)
+		n := rng.Uint64() % 200
+		if rng.Intn(50) == 0 {
+			n = blockCount // clamp path
+		}
+		if rng.Intn(20) == 0 {
+			n = 0
+		}
+
+		runL0, runL1, runL2, runFree := clone()
+		perL0, perL1, perL2, perFree := clone()
+
+		freedRun := briefs.AllocMarkFreeRun(runL0, runL1, runL2, &runFree, blockCount, first, n)
+
+		freedPer := uint64(0)
+		for i := uint64(0); i < n; i++ {
+			if briefs.AllocMarkFree(perL0, perL1, perL2, &perFree, blockCount, first+i) {
+				freedPer++
+			}
+		}
+
+		if freedRun != freedPer {
+			t.Fatalf("op %d (first=%d n=%d): newly-freed tally run=%d per-block=%d",
+				op, first, n, freedRun, freedPer)
+		}
+		if runFree != perFree {
+			t.Fatalf("op %d (first=%d n=%d): free_count drift run=%d per-block=%d",
+				op, first, n, runFree, perFree)
+		}
+		if !reflect.DeepEqual(runL0, perL0) || !reflect.DeepEqual(runL1, perL1) ||
+			!reflect.DeepEqual(runL2, perL2) {
+			t.Fatalf("op %d (first=%d n=%d): bitmap drift", op, first, n)
+		}
+
+		// The mirrored seed must follow the run result for the next op.
+		seed.L0, seed.L1, seed.L2, seed.FreeCount = runL0, runL1, runL2, runFree
+	}
+}

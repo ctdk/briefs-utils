@@ -11,7 +11,10 @@
 // FreeBlock/Sync, and mutex/dirty handling stay on their respective types.
 package briefs
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"math/bits"
+)
 
 // AllocMarkAllocated clears the L2 bit for relBlock, decrementing *freeCount,
 // and propagates a now-empty word up through the L1 and L0 summaries. It is
@@ -79,6 +82,57 @@ func AllocMarkFree(l0, l1, l2 []uint64, freeCount *uint64, blockCount, relBlock 
 		}
 	}
 	return true
+}
+
+// AllocMarkFreeRun sets the L2 bits for the data-relative blocks
+// [first, first+n) in one pass over the touched L2 words, incrementing
+// *freeCount by the number newly freed and propagating empty→non-empty
+// words up through the L1 and L0 summaries once per word. It is the
+// run-shaped equivalent of AllocMarkFree behind fuse.Allocator.FreeRun,
+// which would otherwise pay the L1/L0 walk once per block. The portion of
+// the range outside [0,blockCount) is skipped, matching AllocMarkFree's
+// no-op; already-free blocks change nothing. It returns the number of
+// blocks newly freed, so the caller can set its dirty flag exactly when
+// AllocMarkFree would have.
+func AllocMarkFreeRun(l0, l1, l2 []uint64, freeCount *uint64, blockCount, first, n uint64) uint64 {
+	if n == 0 || first >= blockCount {
+		return 0
+	}
+	if n > blockCount-first {
+		n = blockCount - first
+	}
+	wStart := first / 64
+	wEnd := (first + n - 1) / 64
+	freed := uint64(0)
+	for w := wStart; w <= wEnd; w++ {
+		mask := ^uint64(0)
+		if w == wStart {
+			mask &^= (1 << (first % 64)) - 1
+		}
+		if w == wEnd {
+			// 1<<(hi+1) with hi == 63 shifts out to 0, so the -1 wraps to
+			// all ones — the whole-tail case needs no special form.
+			hi := (first + n - 1) % 64
+			mask &= (1 << (hi + 1)) - 1
+		}
+		added := mask &^ l2[w]
+		if added == 0 {
+			continue
+		}
+		if l2[w] == 0 {
+			// Word goes empty → non-empty: its L1 bit was clear; if the L1
+			// word was empty too, so was the L0 bit.
+			w1, b1 := w/64, w%64
+			if l1[w1] == 0 {
+				l0[w1/64] |= 1 << (w1 % 64)
+			}
+			l1[w1] |= 1 << b1
+		}
+		l2[w] |= mask
+		freed += uint64(bits.OnesCount64(added))
+		*freeCount += uint64(bits.OnesCount64(added))
+	}
+	return freed
 }
 
 // PackAllocWords packs 64-bit allocator words into little-endian blocks of

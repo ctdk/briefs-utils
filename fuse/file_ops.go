@@ -930,9 +930,7 @@ func (b *BrieFS) journalExtentFree(ino, phys, length uint64) error {
 // the allocator. Used on phase-1 errors, before any journal record is written.
 func (b *BrieFS) rollbackAlloc(allocated runAccum) {
 	allocated.forEach(func(first, n uint64) error {
-		for i := uint64(0); i < n; i++ {
-			b.dataAlloc.FreeBlock(first + i)
-		}
+		b.dataAlloc.FreeRun(first, n)
 		return nil
 	})
 }

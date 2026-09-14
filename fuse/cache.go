@@ -289,9 +289,7 @@ func (b *BrieFS) SyncMeta() error {
 	if len(b.dirtyBlocks) == 0 {
 		b.dirtyMu.Unlock()
 		for _, run := range frees.runs {
-			for i := uint64(0); i < run.n; i++ {
-				b.dataAlloc.FreeBlock(run.first + i)
-			}
+			b.dataAlloc.FreeRun(run.first, run.n)
 		}
 		return nil
 	}
@@ -327,9 +325,7 @@ func (b *BrieFS) SyncMeta() error {
 		}
 	}
 	for _, run := range frees.runs {
-		for i := uint64(0); i < run.n; i++ {
-			b.dataAlloc.FreeBlock(run.first + i)
-		}
+		b.dataAlloc.FreeRun(run.first, run.n)
 	}
 	b.dirtyMu.Lock()
 	for blk, buf := range snap {
