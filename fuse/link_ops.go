@@ -41,7 +41,7 @@ const symlinkMaxLen = 2550
 // Mirrors briefs_link (dir.c:432): reject dir targets (EPERM), add the entry,
 // bump the target's nlink + ctime, advance the parent mtime/ctime. Locking:
 // global dir lock + the parent and target inode-block shards.
-func (b *BrieFS) linkInDir(parentIno uint64, name string, targetIno uint64) (*briefs.Inode, error) {
+func (b *BrieFS) linkInDir(parentIno uint64, name string, targetIno uint64) (_ *briefs.Inode, err error) {
 	if b.readOnly {
 		return nil, syscall.EROFS
 	}
@@ -67,28 +67,24 @@ func (b *BrieFS) linkInDir(parentIno uint64, name string, targetIno uint64) (*br
 		return nil, syscall.EPERM
 	}
 
-	b.cacheBegin()
 	unlock := b.lockInodeShards([]uint64{parentIno, targetIno})
 	defer unlock()
+	defer b.cacheEpilogue(&err)()
 
 	parent, err := b.readInodeCached(parentIno)
 	if err != nil {
-		b.cacheAbort()
 		return nil, err
 	}
 	target, err := b.readInodeCached(targetIno)
 	if err != nil {
-		b.cacheAbort()
 		return nil, err
 	}
 
 	ftype := uint8(target.Filemode >> 12)
 	if err := b.addDirEntry(parent, targetIno, name, ftype); err != nil {
-		b.cacheAbort()
 		return nil, err
 	}
 	if err := b.journalDirUpdate(parentIno, targetIno, name, 0, ftype); err != nil {
-		b.cacheAbort()
 		return nil, err
 	}
 
@@ -96,21 +92,15 @@ func (b *BrieFS) linkInDir(parentIno uint64, name string, targetIno uint64) (*br
 	target.Nlinks++
 	stampCtime(target)
 	if err := b.writeInodeCached(target); err != nil {
-		b.cacheAbort()
 		return nil, err
 	}
 	if err := b.journalInodeFull(target); err != nil {
-		b.cacheAbort()
 		return nil, err
 	}
 
 	if err := b.updateParentDir(parent, int64(dirEntryPrefixLen+len(name)), 0); err != nil {
-		b.cacheAbort()
 		return nil, err
 	}
-	// Op end (fix B): records are in the ring; the metadata blocks move to
-	// the deferred map, durable at the next journal sync.
-	b.mergeCache()
 	return target, nil
 }
 
@@ -338,12 +328,12 @@ type renameOp struct {
 // exchange, otherwise probed with a NOREPLACE/EEXIST check (plain only;
 // WHITEOUT|NOREPLACE is not a valid combination and the whiteout path
 // ignores NOREPLACE) and a directory target pre-checked empty (the VFS
-// does not do that for ->rename).  Then begin the op cache, lock the
-// shards of every inode the op touches, and run @body under the dedup
+// does not do that for ->rename).  Then lock the shards of every inode
+// the op touches, begin the op cache, and run @body under the dedup
 // getter.  The epilogue is shared too (fix B): any error aborts the op
 // cache, success merges it — records are in the ring, the metadata blocks
 // move to the deferred map, durable at the next journal sync.
-func (b *BrieFS) beginRename(oldParentIno uint64, oldName string, newParentIno uint64, newName string, flags uint32, body func(op *renameOp) error) error {
+func (b *BrieFS) beginRename(oldParentIno uint64, oldName string, newParentIno uint64, newName string, flags uint32, body func(op *renameOp) error) (err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -388,27 +378,25 @@ func (b *BrieFS) beginRename(oldParentIno uint64, oldName string, newParentIno u
 		}
 	}
 
-	b.cacheBegin()
 	inos := []uint64{oldParentIno, newParentIno, movedIno}
 	if targetIno != 0 {
 		inos = append(inos, targetIno)
 	}
 	unlock := b.lockInodeShards(inos)
 	defer unlock()
+	defer b.cacheEpilogue(&err)()
 
 	g := newInodeGetter(b)
 	oldParent, err := g.get(oldParentIno)
 	if err != nil {
-		b.cacheAbort()
 		return err
 	}
 	newParent, err := g.get(newParentIno)
 	if err != nil {
-		b.cacheAbort()
 		return err
 	}
 
-	if err := body(&renameOp{
+	return body(&renameOp{
 		g:           g,
 		oldParent:   oldParent,
 		newParent:   newParent,
@@ -417,12 +405,7 @@ func (b *BrieFS) beginRename(oldParentIno uint64, oldName string, newParentIno u
 		movedFtype:  movedFtype,
 		targetIno:   targetIno,
 		targetFtype: targetFtype,
-	}); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	b.mergeCache()
-	return nil
+	})
 }
 
 // renamePlain handles a normal rename (optionally NOREPLACE, optionally

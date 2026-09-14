@@ -424,6 +424,31 @@ func (b *BrieFS) cacheAbort() {
 	b.cacheDirty = nil
 }
 
+// cacheEpilogue begins the op cache and returns the deferred op-end
+// disposition, for use as `defer b.cacheEpilogue(&err)()`.  On success the
+// op's dirty blocks merge into the deferred-metadata map (the journal
+// records are already in the ring; the blocks are durable at the next
+// journal sync); on any error the cache is aborted without writing, which
+// rolls the op back.  A panic also aborts (the named @err is not yet set
+// on the panic path, so success would otherwise merge a partial op) and is
+// re-raised.  Register AFTER the op's shard-lock defers so the merge still
+// runs under them (setDirtyBlock's whole-block contract); the named-return
+// @err must be the op's sole error result.
+func (b *BrieFS) cacheEpilogue(err *error) func() {
+	b.cacheBegin()
+	return func() {
+		if r := recover(); r != nil {
+			b.cacheAbort()
+			panic(r)
+		}
+		if *err == nil {
+			b.mergeCache()
+		} else {
+			b.cacheAbort()
+		}
+	}
+}
+
 // --- cached trie node read (write path) ---
 
 // trieRead loads a trie node's page via the cache and returns the working

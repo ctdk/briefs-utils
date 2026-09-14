@@ -328,6 +328,15 @@ func (b *BrieFS) trieSeedPool(rootRef uint64) {
 	}
 }
 
+// reserveNameHeap carves @nameSize bytes off the front of the page's name
+// heap and stamps the reservation onto slot @s.
+func reserveNameHeap(pg *briefs.TriePage, s *briefs.TrieSlot, nameSize uint16) {
+	newOff := pg.FreeNameOff + nameSize
+	pg.FreeNameOff = newOff
+	s.NameOffset = newOff
+	s.NameLen = nameSize
+}
+
 // trieAllocNode allocates a node (and name-heap space if nameLen > 0) from a
 // partial page, or a fresh page if none has room.  Mirrors
 // briefs_trie_alloc_node (trie_page.c:553), minus the hot-page cache.
@@ -366,10 +375,7 @@ func (b *BrieFS) trieAllocNode(nameLen int) (uint64, error) {
 		}
 		s := &briefs.TrieSlot{}
 		if nameSize > 0 {
-			newOff := pg.FreeNameOff + nameSize
-			pg.FreeNameOff = newOff
-			s.NameOffset = newOff
-			s.NameLen = nameSize
+			reserveNameHeap(pg, s, nameSize)
 		}
 		putPage(buf, pg)
 		putSlot(buf, slot, s)
@@ -407,10 +413,7 @@ func (b *BrieFS) trieAllocNode(nameLen int) (uint64, error) {
 		if err != nil {
 			return 0, err
 		}
-		newOff := pg.FreeNameOff + nameSize
-		pg.FreeNameOff = newOff
-		s.NameOffset = newOff
-		s.NameLen = nameSize
+		reserveNameHeap(pg, s, nameSize)
 		putPage(buf, pg)
 		putSlot(buf, 0, s)
 		if err := b.saveBlock(block, buf); err != nil {
@@ -651,6 +654,69 @@ func (b *BrieFS) trieUnlinkChild(parent, childPrev, child uint64) error {
 	return b.saveBlock(briefs.TrieRefBlock(parent), pbuf)
 }
 
+// trieRelinkSibling repoints the link to @oldChild — the parent's FirstChild
+// when it is the head, else the NextSibling of the node preceding it in the
+// sibling chain — at @newRef, updating the parent slot @pnode in place (the
+// caller commits the parent slot).  The chain walk is capped at
+// briefs.TrieSiblingMax: on a corrupt/cyclic chain the relink is abandoned,
+// as the kernel does (trie.c:597 breaks).
+func (b *BrieFS) trieRelinkSibling(pnode *briefs.TrieSlot, oldChild, newRef uint64) error {
+	if pnode.FirstChild == oldChild {
+		pnode.FirstChild = newRef
+		return nil
+	}
+	w := pnode.FirstChild
+	visited := 0
+	for !briefs.TrieRefIsNull(w) {
+		visited++
+		if visited > briefs.TrieSiblingMax {
+			return nil
+		}
+		wbuf, wnode, err := b.trieRead(w)
+		if err != nil {
+			return nil
+		}
+		if wnode.NextSibling == oldChild {
+			wnode.NextSibling = newRef
+			putSlot(wbuf, uint(briefs.TrieRefSlot(w)), wnode)
+			return b.saveBlock(briefs.TrieRefBlock(w), wbuf)
+		}
+		w = wnode.NextSibling
+	}
+	return nil
+}
+
+// commitLeafSlot re-parses the trie node's slot from its page buffer @buf
+// and commits it as a leaf referencing @ino with node type @nodeType.
+// trieStoreName rewrote the slot's name fields in the shared page buffer, so
+// the slot is re-parsed before the writeback — committing the pre-store
+// snapshot would clobber them.
+func (b *BrieFS) commitLeafSlot(buf []byte, ref uint64, nodeType uint8, ino uint64, ftype uint8) error {
+	node, err := briefs.ReadTrieSlot(buf, uint(briefs.TrieRefSlot(ref)))
+	if err != nil {
+		return err
+	}
+	node.NodeType = nodeType
+	node.FType = ftype
+	node.Inode = ino
+	putSlot(buf, uint(briefs.TrieRefSlot(ref)), node)
+	return b.saveBlock(briefs.TrieRefBlock(ref), buf)
+}
+
+// commitLeafNode stores @name on the trie node @ref (page buffer @buf) and
+// then commits it as a leaf.  The name is stored BEFORE the LEAF bit +
+// inode are committed: trieStoreName can fail (ENOSPC if the page's name
+// heap is full of live names, EIO on a bad page), and committing the leaf
+// first would leave a nameless leaf (LEAF + inode, NameLen 0) that
+// TrieLookup can never match, orphaning the inode (generic/089).  On store
+// failure the node's structural state is left as the caller built it.
+func (b *BrieFS) commitLeafNode(buf []byte, ref uint64, nodeType uint8, name string, ino uint64, ftype uint8) error {
+	if err := b.trieStoreName(ref, name); err != nil {
+		return err
+	}
+	return b.commitLeafSlot(buf, ref, nodeType, ino, ftype)
+}
+
 // trieSplitLeaf splits a pure leaf at the given position.  Mirrors
 // trie_split_leaf (trie.c:519).
 func (b *BrieFS) trieSplitLeaf(cur, child uint64, pos int, bval uint8, name string, ino uint64, ftype uint8) (uint64, error) {
@@ -683,32 +749,8 @@ func (b *BrieFS) trieSplitLeaf(cur, child uint64, pos int, bval uint8, name stri
 	if err != nil {
 		return 0, err
 	}
-	if gnode.FirstChild == child {
-		gnode.FirstChild = internal
-	} else {
-		// Capped at briefs.TrieSiblingMax: on a corrupt/cyclic chain the
-		// relink is abandoned (kernel trie.c:597 breaks).
-		w := gnode.FirstChild
-		visited := 0
-		for !briefs.TrieRefIsNull(w) {
-			visited++
-			if visited > briefs.TrieSiblingMax {
-				break
-			}
-			wbuf, wnode, err := b.trieRead(w)
-			if err != nil {
-				break
-			}
-			if wnode.NextSibling == child {
-				wnode.NextSibling = internal
-				putSlot(wbuf, uint(briefs.TrieRefSlot(w)), wnode)
-				if err := b.saveBlock(briefs.TrieRefBlock(w), wbuf); err != nil {
-					return 0, err
-				}
-				break
-			}
-			w = wnode.NextSibling
-		}
+	if err := b.trieRelinkSibling(gnode, child, internal); err != nil {
+		return 0, err
 	}
 	putSlot(gbuf, uint(briefs.TrieRefSlot(cur)), gnode)
 	if err := b.saveBlock(briefs.TrieRefBlock(cur), gbuf); err != nil {
@@ -728,36 +770,14 @@ func (b *BrieFS) trieSplitLeaf(cur, child uint64, pos int, bval uint8, name stri
 	}
 
 	// If split at the last byte, store the new name on the internal node.
+	// On failure the split's structural change — a new INTERM reparenting
+	// the old leaf — is valid trie state, so just return the error and let
+	// the caller unwind the directory op (commitLeafNode, kernel
+	// trie.c:587).
 	if pos == nameLen-1 {
 		ibuf2, _, err := b.trieRead(internal)
 		if err == nil {
-			// Store the name before committing the LEAF bit +
-			// inode.  trieStoreName can fail (ENOSPC if the page's
-			// name heap is full of live names, EIO on a bad page).
-			// Setting the LEAF bit and inode first and ignoring that
-			// error would leave a nameless leaf (LEAF + inode,
-			// NameLen 0) that TrieLookup can never match, making the
-			// entry unfindable and orphaning its inode
-			// (generic/089).  On failure the split's structural
-			// change — a new INTERM reparenting the old leaf — is
-			// valid trie state, so just return the error and let the
-			// caller unwind the directory op.  (Kernel trie.c:587.)
-			if err := b.trieStoreName(internal, name); err != nil {
-				return 0, err
-			}
-			// trieStoreName rewrote the slot's name fields in the
-			// shared page buffer; re-parse so the LEAF-bit
-			// writeback does not clobber them with a stale
-			// snapshot.
-			inode2, rerr := briefs.ReadTrieSlot(ibuf2, uint(briefs.TrieRefSlot(internal)))
-			if rerr != nil {
-				return 0, rerr
-			}
-			inode2.NodeType |= briefs.NodeStatusLeaf
-			inode2.FType = ftype
-			inode2.Inode = ino
-			putSlot(ibuf2, uint(briefs.TrieRefSlot(internal)), inode2)
-			if err := b.saveBlock(briefs.TrieRefBlock(internal), ibuf2); err != nil {
+			if err := b.commitLeafNode(ibuf2, internal, briefs.NodeTypeInterm|briefs.NodeStatusLeaf, name, ino, ftype); err != nil {
 				return 0, err
 			}
 		}
@@ -810,35 +830,16 @@ func (b *BrieFS) TrieInsert(di *briefs.Inode, name string, ino uint64, ftype uin
 							return syscall.EEXIST
 						}
 					}
-					// Store the name before committing the
-					// LEAF bit + inode.  This existing INTERM
-					// node may have been freed and re-allocated
-					// (zeroed, NameOffset/NameLen == 0) since it
-					// last held a leaf, so trieStoreName may
-					// need a fresh name-heap allocation that
-					// can fail (ENOSPC, EIO).  Setting the LEAF
-					// bit and inode first would leave a
-					// nameless leaf (LEAF + inode, NameLen 0)
-					// that TrieLookup can never match,
-					// orphaning the inode (generic/089).
-					// Propagate the error so the op fails
-					// cleanly instead.  (Kernel trie.c:662.)
-					if err := b.trieStoreName(existing, name); err != nil {
-						return err
-					}
-					// trieStoreName rewrote the slot's name
-					// fields in the shared page buffer;
-					// re-parse so the LEAF-bit writeback does
-					// not clobber them with a stale snapshot.
-					cnode, err = briefs.ReadTrieSlot(cbuf, uint(briefs.TrieRefSlot(existing)))
-					if err != nil {
-						return err
-					}
-					cnode.NodeType |= briefs.NodeStatusLeaf
-					cnode.FType = ftype
-					cnode.Inode = ino
-					putSlot(cbuf, uint(briefs.TrieRefSlot(existing)), cnode)
-					return b.saveBlock(briefs.TrieRefBlock(existing), cbuf)
+					// This existing INTERM node may have been
+					// freed and re-allocated (zeroed,
+					// NameOffset/NameLen == 0) since it last
+					// held a leaf, so the name store may need a
+					// fresh name-heap allocation and can fail
+					// (ENOSPC, EIO); commitLeafNode propagates
+					// that so the op fails cleanly instead of
+					// leaving a nameless leaf (generic/089,
+					// kernel trie.c:662).
+					return b.commitLeafNode(cbuf, existing, cnode.NodeType|briefs.NodeStatusLeaf, name, ino, ftype)
 				}
 				// Existing pure leaf: check duplicate, then split.
 				ename, _ := briefs.ReadTrieName(cbuf, cnode.NameLen, cnode.NameOffset)
@@ -862,32 +863,17 @@ func (b *BrieFS) TrieInsert(di *briefs.Inode, name string, ino uint64, ftype uin
 				_ = b.trieFreeNode(newLeaf)
 				return err
 			}
-			// Store the name before committing the leaf.
 			// trieCreateChild pre-reserved name-heap space for this
 			// node, so the store normally reuses that reservation;
-			// but it can still fail (ENOSPC if the page's heap is
-			// full of live names, EIO on a bad page).  Committing the
-			// leaf first would leave a nameless leaf (LEAF + inode,
-			// NameLen 0) that TrieLookup can never match, orphaning
-			// the inode (generic/089).  Free the freshly created node
-			// and propagate the error.  (Kernel trie.c:720.)
+			// but it can still fail (ENOSPC, EIO).  Free the freshly
+			// created node and propagate the error — committing the
+			// leaf first would orphan the inode (generic/089; see
+			// commitLeafNode, kernel trie.c:720).
 			if err := b.trieStoreName(newLeaf, name); err != nil {
 				_ = b.trieFreeNode(newLeaf)
 				return err
 			}
-			// trieStoreName rewrote the slot's name fields in the
-			// shared page buffer; re-parse before the leaf commit so
-			// the writeback carries the stored name fields, not a
-			// stale snapshot.
-			lnode, err := briefs.ReadTrieSlot(lbuf, uint(briefs.TrieRefSlot(newLeaf)))
-			if err != nil {
-				return err
-			}
-			lnode.NodeType = 0
-			lnode.FType = ftype
-			lnode.Inode = ino
-			putSlot(lbuf, uint(briefs.TrieRefSlot(newLeaf)), lnode)
-			return b.saveBlock(briefs.TrieRefBlock(newLeaf), lbuf)
+			return b.commitLeafSlot(lbuf, newLeaf, 0, ino, ftype)
 		}
 
 		// Middle byte: find or create an INTERM child.
@@ -1044,31 +1030,9 @@ func (b *BrieFS) collapseAncestry(di *briefs.Inode, ancestry []uint64, anc int) 
 		if err != nil {
 			break
 		}
-		if pnode.FirstChild == check {
-			pnode.FirstChild = cnode.NextSibling
-		} else {
-			// Capped at briefs.TrieSiblingMax: on a corrupt/cyclic chain
-			// the relink is abandoned (kernel trie.c:1042 breaks).
-			w := pnode.FirstChild
-			visited := 0
-			for !briefs.TrieRefIsNull(w) {
-				visited++
-				if visited > briefs.TrieSiblingMax {
-					break
-				}
-				wbuf, wnode, err := b.trieRead(w)
-				if err != nil {
-					break
-				}
-				if wnode.NextSibling == check {
-					wnode.NextSibling = cnode.NextSibling
-					putSlot(wbuf, uint(briefs.TrieRefSlot(w)), wnode)
-					_ = b.saveBlock(briefs.TrieRefBlock(w), wbuf)
-					break
-				}
-				w = wnode.NextSibling
-			}
-		}
+		// A relink write error here is tolerated (kernel trie.c:1042
+		// breaks out the same way) — the node is freed regardless.
+		_ = b.trieRelinkSibling(pnode, check, cnode.NextSibling)
 		pnode.ChildCount--
 		putSlot(pbuf, uint(briefs.TrieRefSlot(pblk)), pnode)
 		if err := b.saveBlock(briefs.TrieRefBlock(pblk), pbuf); err != nil {

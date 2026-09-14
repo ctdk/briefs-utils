@@ -470,14 +470,12 @@ func (b *BrieFS) symlinkInDir(parentIno uint64, name string, target string, uid,
 // FUSE bridge has no VFS inode cache.  Locking: the global dir lock + the parent
 // and child inode-block locks (parent then child; the global lock serializes
 // dir ops so the order cannot deadlock).
-func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error {
+func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) (err error) {
 	if b.readOnly {
 		return syscall.EROFS
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	b.cacheBegin()
 
 	// Lock the parent's inode-table block for the cached parent-inode RMW
 	// (removeDirEntry + updateParentDir) and trie mutation.
@@ -485,21 +483,17 @@ func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error 
 	pLock.Lock()
 	defer pLock.Unlock()
 
-	parent, err := b.readInodeCached(parentIno)
-	if err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if !parent.IsDir() {
-		b.cacheAbort()
-		return syscall.ENOTDIR
-	}
-
 	// Resolve the entry against the on-disk trie (current as of the last op's
 	// flush) to get the child ino.
-	childIno, _, err := TrieLookup(b.dev, parent.DirTrieRoot, name)
+	p0, err := b.inodes.ReadInode(parentIno)
 	if err != nil {
-		b.cacheAbort()
+		return err
+	}
+	if !p0.IsDir() {
+		return syscall.ENOTDIR
+	}
+	childIno, _, err := TrieLookup(b.dev, p0.DirTrieRoot, name)
+	if err != nil {
 		return syscall.ENOENT
 	}
 
@@ -510,37 +504,37 @@ func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error 
 		defer cLock.Unlock()
 	}
 
+	defer b.cacheEpilogue(&err)()
+
+	parent, err := b.readInodeCached(parentIno)
+	if err != nil {
+		return err
+	}
 	child, err := b.readInodeCached(childIno)
 	if err != nil {
-		b.cacheAbort()
 		return err
 	}
 
 	if isRmdir {
 		if !child.IsDir() {
-			b.cacheAbort()
 			return syscall.ENOTDIR
 		}
 		if !b.dirIsEmpty(child) {
-			b.cacheAbort()
 			return syscall.ENOTEMPTY
 		}
 	} else {
 		// unlink on a directory must fail with EISDIR (POSIX).
 		if child.IsDir() {
-			b.cacheAbort()
 			return syscall.EISDIR
 		}
 	}
 
 	// Remove the directory entry from the trie first.
 	if err := b.removeDirEntry(parent, name); err != nil {
-		b.cacheAbort()
 		return err
 	}
 	// JRN_DIR_UPDATE(del) after the trie is changed.
 	if err := b.journalDirUpdate(parentIno, 0, name, 1, 0); err != nil {
-		b.cacheAbort()
 		return err
 	}
 
@@ -556,12 +550,10 @@ func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error 
 	// (generic/755).
 	stampCtime(child)
 	if err := b.writeInodeCached(child); err != nil {
-		b.cacheAbort()
 		return err
 	}
 	// Journal the child nlink/ctime change.
 	if err := b.journalInodeUpdate(child); err != nil {
-		b.cacheAbort()
 		return err
 	}
 
@@ -580,18 +572,15 @@ func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error 
 		// page allocated, so this is what reclaims it.
 		if isRmdir && child.DirTrieRoot != 0 {
 			if err := b.trieFreeNode(child.DirTrieRoot); err != nil {
-				b.cacheAbort()
 				return err
 			}
 			child.DirTrieRoot = 0
 		}
 		// Free the file's data blocks + btree nodes (no-op for dirs/inline).
 		if err := b.freeInodeData(child); err != nil {
-			b.cacheAbort()
 			return err
 		}
 		if err := b.FreeInode(childIno); err != nil {
-			b.cacheAbort()
 			return err
 		}
 	}
@@ -600,12 +589,7 @@ func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error 
 	// was already adjusted for rmdir, so linkDelta is 0 (updateParentDir
 	// persists the already-dropped nlink).
 	if err := b.updateParentDir(parent, -int64(dirEntryPrefixLen+len(name)), 0); err != nil {
-		b.cacheAbort()
 		return err
 	}
-
-	// Op end (see file header): records are in the ring; the metadata blocks
-	// move to the deferred map, durable at the next journal sync.
-	b.mergeCache()
 	return nil
 }
