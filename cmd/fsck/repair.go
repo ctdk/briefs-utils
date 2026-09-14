@@ -50,7 +50,7 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int, opts *repairOpt
 		// Use the on-disk allocator so selective repairs only touch the requested
 		// phases.
 		var err error
-		plan.dataAlloc, err = loadAllocatorFromDisk(fs.file, fs.sb.TrieNodePoolStart, blockSize, dataBlockCount)
+		plan.dataAlloc, err = loadAllocatorFromDisk(fs.file, fs.sb.TrieNodePoolStart, blockSize)
 		if err != nil {
 			return fmt.Errorf("load data allocator: %w", err)
 		}
@@ -69,7 +69,7 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int, opts *repairOpt
 			}
 		}
 	} else {
-		plan.inodeAlloc, err = loadAllocatorFromDisk(fs.file, fs.sb.InodeBMOffset, blockSize, inodeHeader.BlockCount)
+		plan.inodeAlloc, err = loadAllocatorFromDisk(fs.file, fs.sb.InodeBMOffset, blockSize)
 		if err != nil {
 			return fmt.Errorf("load inode allocator: %w", err)
 		}
@@ -207,12 +207,11 @@ func recomputeAllocatorFreeCount(b *briefs.AllocBuilder) {
 // loadAllocatorFromDisk reads an allocator pool from disk into an AllocBuilder.
 // This is used for selective repairs that must allocate/free blocks without
 // rebuilding the allocator bitmaps from scratch.
-func loadAllocatorFromDisk(file *os.File, poolBlock, blockSize, blockCount uint64) (*briefs.AllocBuilder, error) {
+func loadAllocatorFromDisk(file *os.File, poolBlock, blockSize uint64) (*briefs.AllocBuilder, error) {
 	l0, l1, l2, hdr, err := briefs.ReadAllocatorBitmap(file, poolBlock, blockSize)
 	if err != nil {
 		return nil, err
 	}
-	_ = blockCount // kept for symmetry with NewAllocBuilder; hdr.BlockCount is authoritative
 	b := &briefs.AllocBuilder{
 		L0:         l0,
 		L1:         l1,

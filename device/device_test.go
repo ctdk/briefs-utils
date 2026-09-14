@@ -27,15 +27,6 @@ func TestGetDevice(t *testing.T) {
 	if bd.Bytes() != 1024*1024 {
 		t.Errorf("Bytes: want %d, got %d", 1024*1024, bd.Bytes())
 	}
-	if bd.Sectors() != 2048 {
-		t.Errorf("Sectors: want 2048, got %d", bd.Sectors())
-	}
-	if bd.KiloBytes() != 1024 {
-		t.Errorf("KiloBytes: want 1024, got %d", bd.KiloBytes())
-	}
-	if bd.MegaBytes() != 1 {
-		t.Errorf("MegaBytes: want 1, got %d", bd.MegaBytes())
-	}
 	if bd.Blocks() != 256 {
 		t.Errorf("Blocks: want 256, got %d", bd.Blocks())
 	}

@@ -5,10 +5,9 @@ package briefs
 import (
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/google/uuid"
-	"os"
-	"time"
 )
 
 // SuperblockLayout is the on-disk format (first 1KB block).
@@ -113,38 +112,9 @@ func NewSuperblock(totalBlocks, blockSize, inodeSize, journalBlocks uint64, labe
 		fsUuid = uuid.New()
 	}
 
-	for i, v := range fsUuid {
-		sb.Lay.UUID[i] = v
-	}
+	copy(sb.Lay.UUID[:], fsUuid[:])
 
 	return sb, nil
-}
-
-// Write writes the superblock to a file and initializes the full filesystem image.
-func (sb *Superblock) Write(path string) error {
-	// Calculate total size: superblock + bitmaps + inode table + journal + data
-	totalSize := sb.Lay.TotalBlocks * sb.Lay.BlockSize
-
-	// Create the file and truncate to full size
-	file, err := os.Create(path)
-	if err != nil {
-		return fmt.Errorf("create file: %w", err)
-	}
-	defer file.Close()
-
-	if err := file.Truncate(int64(totalSize)); err != nil {
-		return fmt.Errorf("truncate file: %w", err)
-	}
-
-	// Write superblock to first block
-	block := make([]byte, sb.Lay.BlockSize)
-	copy(block[:], sb.MarshalBinary())
-
-	if _, err := file.WriteAt(block, 0); err != nil {
-		return fmt.Errorf("write superblock: %w", err)
-	}
-
-	return nil
 }
 
 // MarshalBinary converts the superblock to binary format.

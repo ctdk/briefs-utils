@@ -22,9 +22,15 @@ func newJournalImage(t *testing.T, totalBlocks, journalBlocks uint64) (*os.File,
 		f.Close()
 		t.Fatalf("NewSuperblock: %v", err)
 	}
-	if err := sb.Write(f.Name()); err != nil {
+	if err := f.Truncate(int64(totalBlocks * 4096)); err != nil {
 		f.Close()
-		t.Fatalf("Superblock.Write: %v", err)
+		t.Fatalf("Truncate: %v", err)
+	}
+	sbBlock := make([]byte, 4096)
+	copy(sbBlock, sb.MarshalBinary())
+	if _, err := f.WriteAt(sbBlock, 0); err != nil {
+		f.Close()
+		t.Fatalf("write superblock: %v", err)
 	}
 	f.Close()
 

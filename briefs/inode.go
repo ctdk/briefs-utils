@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-var InlineExtentRangeErr = errors.New("index out of range for inode inline extents")
+var ErrInlineExtentRange = errors.New("index out of range for inode inline extents")
 
 // Inode represents a filesystem inode (512 bytes).
 //
@@ -145,7 +145,7 @@ func UnmarshalInode(data []byte) (*Inode, error) {
 // SetInlineExtent sets one of the 8 inline extents on an inode.
 func (in *Inode) SetInlineExtent(index int, offset, phys, length, flags uint64) error {
 	if index < 0 || index >= 8 {
-		return InlineExtentRangeErr
+		return ErrInlineExtentRange
 	}
 	e := Extent{Offset: offset, Phys: phys, Len: length, Flags: uint32(flags)}
 	b, _ := e.MarshalBinary()

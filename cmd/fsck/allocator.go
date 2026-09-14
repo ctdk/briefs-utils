@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"math/bits"
 	"os"
@@ -9,12 +8,12 @@ import (
 	"github.com/ctdk/briefs-utils/briefs"
 )
 
-var bytesPerWord = uint64(binary.Size(uint64(1))) 
+const bytesPerWord = 8
 // Recklessly assuming 8 bits per byte. This could cause trouble in case
 // this program (or Go itself) are ever ported to the PDP-10 or
 // something along those lines.
-var bitsPerByte = uint64(8) 
-var wordBits = bytesPerWord * bitsPerByte
+const bitsPerByte = 8
+const wordBits = bytesPerWord * bitsPerByte
 
 // verifyAllocatorPool reads and prints the allocator pool header.
 func verifyAllocatorPool(file *os.File, poolBlock, blockSize uint64, label string) error {

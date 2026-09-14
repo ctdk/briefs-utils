@@ -73,13 +73,11 @@ func verifyInode(buf []byte, ino, byteOffset, inodeSize uint64) (*briefs.Inode, 
 		}
 	}
 
-	// Validate file mode
+	// Validate file mode. Anything outside dir/file/symlink is accepted:
+	// special files (fifo/socket/blk/chr) are legal mknod creations.
 	mode := in.Filemode
 	if mode == 0 {
 		return nil, fmt.Errorf("ino %d: zero file mode", ino)
-	}
-	if mode&briefs.ModeDir == 0 && mode&briefs.ModeFile == 0 && mode&briefs.ModeSymlink == 0 {
-		// Not a dir, file, or symlink — could be a special device, which is fine
 	}
 
 	// xattr_offset/xattr_size are validated structurally by verifyXattrBlock

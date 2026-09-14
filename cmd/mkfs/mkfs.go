@@ -33,13 +33,6 @@ func stderrIsTerminal() bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
-// Calculate on-disk location of an inode.
-// The inode table starts at: inode_table_offset
-// (This matches what the kernel computes in briefs_iget.)
-func calculateInodeLocation(sb *briefs.Superblock, inodeNum uint64) (blockOffset uint64, byteOffset uint64) {
-	return briefs.InodeLocation(&sb.Lay, inodeNum)
-}
-
 func main() {
 	app := &cli.Command{
 		Name:     "mkfs.briefs",
@@ -65,7 +58,7 @@ func main() {
 			if err := device.CheckMounted(path); err != nil {
 				// Reformatting a mounted filesystem is incredibly
 				// dangerous. Refuse to continue.
-				return ctx, fmt.Errorf("refusing to create filesystem: %w\n", err)
+				return ctx, fmt.Errorf("refusing to create filesystem: %w", err)
 			}
 			return ctx, nil
 		},
@@ -443,7 +436,9 @@ func main() {
 			// so a fixed value is fine and stays constant across mounts.
 			rootInode.Generation = 1
 
-			inodeBlock, inodeByteOffset := calculateInodeLocation(sb, 1)
+			// Root-inode slot location (same math the kernel does in
+			// briefs_iget).
+			inodeBlock, inodeByteOffset := briefs.InodeLocation(&sb.Lay, 1)
 			fileOffset := int64(inodeBlock*blockSize + inodeByteOffset)
 			if err := rootInode.WriteAt(file, fileOffset); err != nil {
 				return fmt.Errorf("write root inode: %w", err)

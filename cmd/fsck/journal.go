@@ -47,7 +47,7 @@ func verifyJournal(file *os.File, journalOffset, journalBlocks, checkpointSeq, l
 	// the range of blocks in use. If logStart != logEnd or checkpointSeq
 	// is low, there may be un-replayed entries.
 	if logStart != logEnd {
-		logRange := logEnd
+		var logRange uint64
 		if logEnd >= logStart {
 			logRange = logEnd - logStart
 		} else {

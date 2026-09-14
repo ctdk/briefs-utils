@@ -38,8 +38,8 @@ var ErrChecksumMismatch = errors.New("CRC32C checksum mismatch")
 const (
 	MagicSuperblock = 0x504C434E // "PLCN"
 	MagicInode      = 0x494E4F44 // "INOD"
-	MagicTrieNode   = 0x54524E20 // "TRN "
 	MagicTriePage   = 0x54524E50 // "TRNP"
+	MagicTrieNode   = 0x54524E20 // "TRN " — legacy single-node blocks (briefs.h:801); no Go reader
 	MagicJournal    = 0x4A4E4C5A // "JNLZ"
 	MagicCheckpoint = 0x43485053 // "CHPS"
 	MagicXattr      = 0x58415454 // "XATT" -- xattr block header magic
@@ -110,8 +110,6 @@ const (
 	NodeFlagRoot    = 0x00000008
 
 	// Inode flags
-	InodeFlagReserved   = 0x00000001
-	InodeFlagCompressed = 0x00000002
 	InodeFlagIndexed    = 0x00000004
 	InodeFlagInlineData = 0x00000008
 

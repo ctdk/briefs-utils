@@ -79,7 +79,7 @@ func main() {
 			}
 			path := c.Args().First()
 			if err := device.CheckMounted(path); err != nil {
-				return ctx, fmt.Errorf("refusing to check filesystem: %w\n", err)
+				return ctx, fmt.Errorf("refusing to check filesystem: %w", err)
 			}
 			return ctx, nil
 		},
@@ -204,7 +204,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Device: %s (%d bytes)\n", path, deviceSize)
 
 			// 1. Superblock
-			sb, err := verifySuperblock(file, 4096)
+			sb, err := briefs.ReadSuperblock(file, 4096)
 			if err != nil {
 				return fmt.Errorf("superblock check FAILED: %w", err)
 			}

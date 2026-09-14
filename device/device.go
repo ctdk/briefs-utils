@@ -11,14 +11,6 @@ import (
 	"strings"
 )
 
-const (
-	sectorSize = 512
-	kbSize = 1024
-	mbSize = 1024 * 1024
-	gbSize = 1024 * 1024 * 1024
-	tbSize = 1024 * 1024 * 1024 * 1024
-)
-
 type BlockDevice struct {
 	Path 		string
 	size 		int64
@@ -55,26 +47,6 @@ func GetDevice(path string, blocksize uint64) (*BlockDevice, error) {
 
 func (bd *BlockDevice) Bytes() int64 {
 	return bd.size
-}
-
-func (bd *BlockDevice) Sectors() int64 {
-	return bd.size / sectorSize
-}
-
-func (bd *BlockDevice) KiloBytes() int64 {
-	return bd.size / kbSize
-}
-
-func (bd *BlockDevice) MegaBytes() int64 {
-	return bd.size / mbSize
-}
-
-func (bd *BlockDevice) GigaBytes() int64 {
-	return bd.size / gbSize
-}
-
-func (bd *BlockDevice) TeraBytes() int64 {
-	return bd.size / tbSize
 }
 
 // Blocks() returns the number of blocks available on the device, *rounded down*
