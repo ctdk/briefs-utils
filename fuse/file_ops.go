@@ -161,32 +161,17 @@ func (b *BrieFS) readFileData(ino uint64, dest []byte, off int64) ([]byte, error
 			readEnd = extEnd
 		}
 
-		// Iterate over block boundaries (not readStart, which may be mid-block)
-		// so the within-block offset (copyStart - blkOff) is correct. The
-		// blkOff >= 0 guard stops the increment at the final block: past
-		// MAX_LFS_FILESIZE the next blkOff += blockSize wraps to INT64_MIN,
-		// which is still < readEnd and would process a phantom block whose
-		// within-block offsets go negative (generic/525 tail).
-		firstBlk := (readStart / blockSize) * blockSize
-		for blkOff := firstBlk; blkOff < readEnd && blkOff >= 0; blkOff += blockSize {
-			absBlock := ext.Phys + uint64((blkOff-extStart)/blockSize)
-			buf, err := b.dev.ReadBlock(absBlock)
-			if err != nil {
-				return nil, err
-			}
-			blkEnd := blkOff + blockSize
-			if blkEnd < blkOff {
-				blkEnd = maxFileSize
-			}
-			copyStart := readStart
-			if copyStart < blkOff {
-				copyStart = blkOff
-			}
-			copyEnd := readEnd
-			if copyEnd > blkEnd {
-				copyEnd = blkEnd
-			}
-			copy(readBuf[copyStart-off:], buf[copyStart-blkOff:copyEnd-blkOff])
+		// The blocks within one extent are physically contiguous, so the
+		// clipped range is a single device run: one pread fetches the whole
+		// intersection (a per-block ReadBlock loop was one syscall per 4K
+		// block, which dominated large sequential reads). Mid-block
+		// endpoints are fine — the run starts inside the extent block
+		// holding readStart — and the wrap-guarded extEnd above keeps the
+		// range on this side of the MAX_LFS_FILESIZE tail (generic/525).
+		inExt := readStart - extStart
+		firstBlk := ext.Phys + uint64(inExt/blockSize)
+		if err := b.dev.ReadRun(readBuf[readStart-off:readEnd-off], firstBlk, uint64(inExt%blockSize)); err != nil {
+			return nil, err
 		}
 	}
 	return readBuf, nil

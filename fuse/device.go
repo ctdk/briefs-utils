@@ -112,6 +112,20 @@ func (bd *BlockDevice) ReadBlock(blockNum uint64) ([]byte, error) {
 	return buf, nil
 }
 
+// ReadRun reads len(dst) bytes starting at offsetInBlock within firstBlock,
+// crossing block boundaries: the run must be physically contiguous on the
+// device. File-data reads use this to fetch a whole clipped extent range in
+// one pread instead of one ReadBlock per block. Deferred metadata is never
+// involved — data blocks are written through immediately, not held in the
+// dirty view — so the read goes straight to the device.
+func (bd *BlockDevice) ReadRun(dst []byte, firstBlock, offsetInBlock uint64) error {
+	off := int64(firstBlock*bd.blockSize + offsetInBlock)
+	if _, err := bd.file.ReadAt(dst, off); err != nil {
+		return fmt.Errorf("read run at block %d: %w", firstBlock, err)
+	}
+	return nil
+}
+
 // WriteBlock writes data to a single block. data must be exactly blockSize bytes.
 func (bd *BlockDevice) WriteBlock(blockNum uint64, data []byte) error {
 	if uint64(len(data)) != bd.blockSize {
