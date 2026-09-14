@@ -217,6 +217,15 @@ func (b *BrieFS) createNamedInode(parentIno uint64, name string, mode, uid, gid 
 	if b.readOnly {
 		return nil, syscall.EROFS
 	}
+	// briefs_symlink rejects empty and oversized targets up front with
+	// -ENAMETOOLONG (file.c:3829-3830; the cap is BRIEFS_NAME_LEN*10).
+	// Without the check an empty target would store no data at all, and a
+	// target longer than one block would be silently truncated by the
+	// block-copy path below (copy clamps to the 4K buffer). Mask the type
+	// bits: S_IFLNK shares the S_IFREG bit, so a bare & would catch files.
+	if mode&briefs.ModeTypeMask == briefs.ModeSymlink && (len(symlinkTarget) == 0 || len(symlinkTarget) > symlinkMaxLen) {
+		return nil, syscall.ENAMETOOLONG
+	}
 	// The global dir lock covers the existence check (TOCTOU), the shared
 	// per-op block cache, and the partial-trie-page pool — none of which are
 	// concurrency-safe without a buffer cache. Only one dir op runs at a time.

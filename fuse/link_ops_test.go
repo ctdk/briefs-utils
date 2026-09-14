@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -108,6 +109,35 @@ func TestSymlink(t *testing.T) {
 	}
 	if di.NumExtentsTotal != 1 {
 		t.Fatalf("long symlink extents: want 1, got %d", di.NumExtentsTotal)
+	}
+
+	fsckClean(t, b, img)
+}
+
+// TestSymlinkTargetBounds mirrors briefs_symlink's up-front ENAMETOOLONG
+// checks (file.c:3829-3830): empty targets and targets over BRIEFS_NAME_LEN*10
+// are rejected instead of stored empty / truncated to the block copy.
+func TestSymlinkTargetBounds(t *testing.T) {
+	mkfs := buildMkfs(t)
+	img := mkfsImage(t, mkfs, 5000)
+	b := openBridge(t, img)
+
+	if _, err := b.symlinkInDir(1, "empty", "", 1000, 1000); err != syscall.ENAMETOOLONG {
+		t.Fatalf("empty target: want ENAMETOOLONG, got %v", err)
+	}
+	over := strings.Repeat("a", int(symlinkMaxLen)+1)
+	if _, err := b.symlinkInDir(1, "over", over, 1000, 1000); err != syscall.ENAMETOOLONG {
+		t.Fatalf("oversized target (%d bytes): want ENAMETOOLONG, got %v", len(over), err)
+	}
+
+	// A target exactly at the cap is accepted and round-trips.
+	at := strings.Repeat("b", int(symlinkMaxLen))
+	s, err := b.symlinkInDir(1, "at", at, 1000, 1000)
+	if err != nil {
+		t.Fatalf("cap-length target: %v", err)
+	}
+	if got, err := b.readSymlink(s.InodeNumber); err != nil || got != at {
+		t.Fatalf("cap-length target roundtrip: got len %d (err %v), want %d", len(got), err, len(at))
 	}
 
 	fsckClean(t, b, img)
