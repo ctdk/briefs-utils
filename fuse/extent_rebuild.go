@@ -197,39 +197,48 @@ func (b *BrieFS) extentBlocksOf(in *briefs.Inode) (uint64, error) {
 }
 
 // allNodes returns every node block of the walked tree (leaves and
-// index), the free set for the full-rebuild and dismantle cases.
-func (t *extentTree) allNodes() []uint64 {
-	nodes := make([]uint64, 0, len(t.leaves)+len(t.idx))
+// index) as contiguous runs, the free set for the full-rebuild and
+// dismantle cases.  The blocks are accumulated in walk order; addBlock
+// tail-merges adjacent entries, so a tree whose node blocks were
+// allocated contiguously (the common full-rebuild shape) frees as a
+// handful of runs, not one entry per node.
+func (t *extentTree) allNodes() []blockRun {
+	var r runAccum
 	for _, lf := range t.leaves {
-		nodes = append(nodes, lf.block)
+		r.addBlock(lf.block)
 	}
-	return append(nodes, t.idx...)
+	for _, blk := range t.idx {
+		r.addBlock(blk)
+	}
+	return r.runs
 }
 
 // rebuildExtentIndexWrite is the write path's extent-index store: the
 // localized (leaf-diff) rebuild for tree-backed inodes, falling back to
 // the full rebuild for every other shape (no old tree, inline fits,
 // truncate to zero).  Returns the blocks the caller must journal as
-// JRN_EXTENT_FREE and free after the commit: for a localized rebuild
-// the replaced leaf blocks plus the old index blocks; for the fallback
-// shapes every old node block.
-func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, exts []briefs.Extent, allocated *runAccum) ([]uint64, error) {
+// JRN_EXTENT_FREE and free after the commit, as contiguous runs: for a
+// localized rebuild the replaced leaf blocks plus the old index blocks;
+// for the fallback shapes every old node block.
+func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, exts []briefs.Extent, allocated *runAccum) ([]blockRun, error) {
 	// The full rebuild's dismantle and inline cases, verbatim.
 	if len(exts) == 0 || len(exts) <= 8 && in.Flags&briefs.InodeFlagIndexed == 0 {
-		if err := b.rebuildExtentIndex(in, exts, tree.allNodes(), allocated); err != nil {
+		oldNodes := tree.allNodes()
+		if err := b.rebuildExtentIndex(in, exts, oldNodes, allocated); err != nil {
 			return nil, err
 		}
-		return tree.allNodes(), nil
+		return oldNodes, nil
 	}
 
 	// Tree-backed: only when there is an old tree with leaves to diff
 	// against.  (An indexed inode whose walk found no leaves is
 	// inconsistent — take the full rebuild.)
 	if in.Flags&briefs.InodeFlagIndexed == 0 || len(tree.leaves) == 0 {
-		if err := b.rebuildExtentIndex(in, exts, tree.allNodes(), allocated); err != nil {
+		oldNodes := tree.allNodes()
+		if err := b.rebuildExtentIndex(in, exts, oldNodes, allocated); err != nil {
 			return nil, err
 		}
-		return tree.allNodes(), nil
+		return oldNodes, nil
 	}
 
 	newChunks := briefs.ChunkBtreeExtents(exts)
@@ -311,10 +320,15 @@ func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, ext
 	}
 	b.storeExtentTree(in.InodeNumber, newTree)
 
-	// Free set: the replaced old leaves plus every old index block.
-	freed := make([]uint64, 0, len(oldLeaves)-reuseCount+len(tree.idx))
+	// Free set: the replaced old leaves plus every old index block,
+	// accumulated as contiguous runs (journalContigRuns used to coalesce
+	// this list per block at commit time).
+	var freed runAccum
 	for i := reuseCount; i < len(oldLeaves); i++ {
-		freed = append(freed, oldLeaves[i].block)
+		freed.addBlock(oldLeaves[i].block)
 	}
-	return append(freed, tree.idx...), nil
+	for _, blk := range tree.idx {
+		freed.addBlock(blk)
+	}
+	return freed.runs, nil
 }

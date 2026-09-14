@@ -167,9 +167,12 @@ func (b *BrieFS) freeInodeData(in *briefs.Inode) error {
 			return err
 		}
 	}
-	for _, blk := range tree.allNodes() {
-		b.deferBlockFree(blk)
-		if err := b.journalExtentFree(in.InodeNumber, blk, 1); err != nil {
+	// The index nodes free the same run-encoded way: allNodes tail-merges
+	// the walk's adjacent node blocks, so a contiguously-allocated index
+	// frees as one record.
+	for _, run := range tree.allNodes() {
+		b.deferBlockFreeRun(run.first, run.n)
+		if err := b.journalExtentFree(in.InodeNumber, run.first, run.n); err != nil {
 			return err
 		}
 	}

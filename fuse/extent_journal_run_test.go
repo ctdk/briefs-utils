@@ -12,10 +12,12 @@ package fuse
 //
 // The kernel journals these records run-encoded (btree.c: one
 // briefs_journal_extent_alloc(..., ext->len, ...) per extent), so the fix
-// coalesces the block lists into contiguous runs (journalContigRuns).
-// These tests pin both halves: the producer must emit O(runs) records,
-// and the replay handlers (which always understood Length > 1) must
-// reserve/free the same allocator bits the live path did.
+// emits contiguous runs at every block-list source (runAccum; the node
+// lists join via allNodes/rebuildExtentIndexWrite).  The coalescing
+// invariants are pinned by TestRunAccum.  These tests pin both halves of
+// the journal contract: the producer must emit O(runs) records, and the
+// replay handlers (which always understood Length > 1) must reserve/free
+// the same allocator bits the live path did.
 
 import (
 	"context"
@@ -23,40 +25,6 @@ import (
 
 	"github.com/ctdk/briefs-utils/briefs"
 )
-
-func TestJournalContigRuns(t *testing.T) {
-	cases := []struct {
-		name   string
-		blocks []uint64
-		want   [][2]uint64
-	}{
-		{"empty", nil, nil},
-		{"single", []uint64{5}, [][2]uint64{{5, 1}}},
-		{"one run", []uint64{10, 11, 12}, [][2]uint64{{10, 3}}},
-		{"three runs", []uint64{10, 11, 12, 20, 21, 30}, [][2]uint64{{10, 3}, {20, 2}, {30, 1}}},
-		{"descending stays split", []uint64{7, 6, 5}, [][2]uint64{{7, 1}, {6, 1}, {5, 1}}},
-		{"duplicate splits", []uint64{3, 3, 4}, [][2]uint64{{3, 1}, {3, 2}}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var got [][2]uint64
-			if err := journalContigRuns(tc.blocks, func(first, length uint64) error {
-				got = append(got, [2]uint64{first, length})
-				return nil
-			}); err != nil {
-				t.Fatalf("journalContigRuns: %v", err)
-			}
-			if len(got) != len(tc.want) {
-				t.Fatalf("got %d runs %v, want %d runs %v", len(got), got, len(tc.want), tc.want)
-			}
-			for i := range got {
-				if got[i] != tc.want[i] {
-					t.Fatalf("run %d: got %v, want %v", i, got[i], tc.want[i])
-				}
-			}
-		})
-	}
-}
 
 // countExtentRecords walks the journal's replay range and counts
 // JRN_EXTENT_ALLOC / JRN_EXTENT_FREE records — the reader half of

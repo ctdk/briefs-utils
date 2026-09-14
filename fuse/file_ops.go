@@ -472,7 +472,7 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 	// free list is just the replaced leaves + the old index blocks.  The
 	// full rewrite per extent-adding op was the 074 write-amplification
 	// hang (~61 leaf blocks rewritten per 512 B fragmented WRITE).
-	var oldNodesToFree []uint64
+	var oldNodesToFree []blockRun
 	if rebuildNeeded {
 		oldNodesToFree, err = b.rebuildExtentIndexWrite(in, tree, exts, allocated)
 		if err != nil {
@@ -503,7 +503,7 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 // fallocate, and truncate paths. allocatedRels are the new data + btree-node
 // blocks (already written to the page cache, data-relative, run-encoded);
 // freedAbs are the freed data blocks as absolute runs; oldNodesAbs are the
-// old btree nodes (absolute, per-block — bounded by the node count, never
+// old btree nodes as absolute runs (bounded by the node count, never
 // O(#blocks)). The caller must hold the inode's inodeBlockLock and have
 // already mutated @in (size, extents, times) in memory.
 //
@@ -529,7 +529,7 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 //
 // Crash model: a crash before the next sync loses the records and the page
 // cache together — the unsynced op never happened.
-func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels *runAccum, freedAbs []blockRun, oldNodesAbs []uint64) error {
+func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels *runAccum, freedAbs []blockRun, oldNodesAbs []blockRun) error {
 	ino := in.InodeNumber
 	// Arm the pre-commit drain before the first record: a concurrent journal
 	// sync (fsync on another file, setxattr) must not commit these records
@@ -558,11 +558,11 @@ func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels *runAccum, f
 			return err
 		}
 	}
-	if err := journalContigRuns(oldNodesAbs, func(first, length uint64) error {
-		return b.journalExtentFree(ino, first, length)
-	}); err != nil {
-		b.failWrite()
-		return err
+	for _, run := range oldNodesAbs {
+		if err := b.journalExtentFree(ino, run.first, run.n); err != nil {
+			b.failWrite()
+			return err
+		}
 	}
 	// The frees apply when their records commit: SyncMeta (after the next
 	// sync's commit point) takes them from pendingFrees, draining any
@@ -571,8 +571,8 @@ func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels *runAccum, f
 	for _, run := range freedAbs {
 		b.deferBlockFreeRun(run.first, run.n)
 	}
-	for _, abs := range oldNodesAbs {
-		b.deferBlockFree(abs)
+	for _, run := range oldNodesAbs {
+		b.deferBlockFreeRun(run.first, run.n)
 	}
 	return b.writeInodeOwned(in)
 }
@@ -718,7 +718,7 @@ func (b *BrieFS) zeroEofTail(exts []briefs.Extent, oldSize int64) error {
 // journaling/rollback. Mirrors btree_spill_inline (btree.c:861)
 // generalized to a full rebuild on every index change (valid under
 // drain-before-snapshot; the incremental insert is deferred).
-func (b *BrieFS) rebuildExtentIndex(in *briefs.Inode, exts []briefs.Extent, oldNodes []uint64, allocated *runAccum) error {
+func (b *BrieFS) rebuildExtentIndex(in *briefs.Inode, exts []briefs.Extent, oldNodes []blockRun, allocated *runAccum) error {
 	// The tree this rebuild replaces is no longer the on-disk tree once the
 	// new one publishes; drop any cached walk of it (the localized path
 	// stores its own replacement instead).
@@ -876,25 +876,6 @@ func insertExtentSorted(exts []briefs.Extent, ext briefs.Extent) []briefs.Extent
 }
 
 // --- journal + rollback helpers ---
-
-// journalContigRuns calls write once per maximal contiguous run of blocks:
-// adjacent list entries whose numbers are consecutive form one run.  The
-// allocator's run path (allocUnwrittenHole) and the extent walker both
-// produce sorted, phys-contiguous lists, so a whole-device allocation or
-// truncate collapses to a handful of write calls.
-func journalContigRuns(blocks []uint64, write func(first, length uint64) error) error {
-	for i := 0; i < len(blocks); {
-		end := i + 1
-		for end < len(blocks) && blocks[end] == blocks[end-1]+1 {
-			end++
-		}
-		if err := write(blocks[i], uint64(end-i)); err != nil {
-			return err
-		}
-		i = end
-	}
-	return nil
-}
 
 // journalExtentAlloc writes a JRN_EXTENT_ALLOC record covering length blocks
 // from phys so replay reserves them in the bitmap. ExtentIndex is sentinel
