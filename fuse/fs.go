@@ -239,71 +239,23 @@ func (a *Allocator) tryAllocBlocks(n uint64) uint64 {
 		return 0
 	}
 
-	// Reserve the data-relative block-0 sentinel so a run never starts there
-	// (briefs_alloc_block's convention; mkfs normally did this already).
-	if a.l2[0]&1 != 0 {
-		a.l2[0] &^= 1
-		a.freeCount--
-		if a.l2[0] == 0 {
-			a.l1[0] &^= 1
-			if a.l1[0] == 0 {
-				a.l0[0] &^= 1
-			}
-		}
-		a.dirty = true
-		a.markL2Word(0)
-	}
+	a.reserveBlockZeroLocked()
 
+	// First-fit: the first free run that reaches n blocks wins (the scan
+	// reports it the moment it does, so a small request never walks a
+	// whole-device free run bit by bit); its n-block prefix is taken.
 	runStart, runLen := uint64(0), uint64(0)
-	for w2 := uint64(0); w2 < a.l2Words; w2++ {
-		word := a.l2[w2]
-		base := w2 * 64
-
-		// Mask trailing bits beyond blockCount in the last word.
-		if w2 == a.l2Words-1 {
-			if rem := a.blockCount % 64; rem != 0 {
-				word &= (1 << rem) - 1
-			}
+	a.scanMaximalRuns(n, func(s, l uint64) bool {
+		if l >= n {
+			runStart, runLen = s, l
+			return false
 		}
-		if word == 0 {
-			runLen = 0
-			continue
-		}
-
-		// Walk each maximal run of set bits within this word.
-		// (Named wbits: `bits` is the math/bits package.)
-		wbits := word
-		for wbits != 0 {
-			b := uint64(bits.TrailingZeros64(wbits))
-			s := base + b
-			// Count consecutive set bits from b within this word.
-			// TrailingZeros64(0) == 64, so an all-ones-from-b run
-			// (only possible at b == 0) yields cnt == 64.
-			cnt := uint64(bits.TrailingZeros64(^(wbits >> b)))
-			if runLen > 0 && s == runStart+runLen {
-				runLen += cnt // contiguous with the previous word's run
-			} else {
-				runStart, runLen = s, cnt
-			}
-			if runLen >= n {
-				goto found
-			}
-			// Clear the consumed run bits. When cnt == 64 the whole
-			// word is one run from bit b (bits below b are already
-			// 0), so clearing the entire word is equivalent and
-			// avoids the (1 << 64) that would otherwise loop forever.
-			if cnt >= 64 {
-				wbits = 0
-			} else {
-				wbits &^= ((1 << cnt) - 1) << b
-			}
-		}
+		return true
+	})
+	if runLen < n {
+		return 0 // no contiguous run of length n
 	}
 
-	// No contiguous run of length n.
-	return 0
-
-found:
 	// Clear the n bits.
 	for i := uint64(0); i < n; i++ {
 		blk := runStart + i
@@ -330,6 +282,96 @@ found:
 	return runStart
 }
 
+// reserveBlockZeroLocked idempotently reserves the data-relative block-0
+// failure sentinel so no run ever starts there (briefs_alloc_block's
+// convention; mkfs normally did this already).  The caller holds a.mu.
+func (a *Allocator) reserveBlockZeroLocked() {
+	if a.l2[0]&1 != 0 {
+		a.l2[0] &^= 1
+		a.freeCount--
+		if a.l2[0] == 0 {
+			a.l1[0] &^= 1
+			if a.l1[0] == 0 {
+				a.l0[0] &^= 1
+			}
+		}
+		a.dirty = true
+		a.markL2Word(0)
+	}
+}
+
+// scanMaximalRuns walks the L2 leaf bitmap (caller holds a.mu) and yields
+// every maximal run of set (free) bits — possibly spanning word boundaries —
+// to visit(runStart, runLen), in data-relative blocks.  The last word is
+// masked to blockCount so a run cannot run past the end of the device.
+// visit returns false to stop the scan early.  When minLen > 0 the scan
+// instead reports the FIRST run the moment it reaches minLen (a prefix of
+// a possibly longer maximal run) and stops — the first-fit shape
+// tryAllocBlocks needs.
+func (a *Allocator) scanMaximalRuns(minLen uint64, visit func(runStart, runLen uint64) bool) {
+	runStart, runLen := uint64(0), uint64(0)
+	closeRun := func() bool {
+		if runLen == 0 {
+			return true
+		}
+		ok := visit(runStart, runLen)
+		runLen = 0
+		return ok
+	}
+	for w2 := uint64(0); w2 < a.l2Words; w2++ {
+		word := a.l2[w2]
+		base := w2 * 64
+
+		// Mask trailing bits beyond blockCount in the last word.
+		if w2 == a.l2Words-1 {
+			if rem := a.blockCount % 64; rem != 0 {
+				word &= (1 << rem) - 1
+			}
+		}
+		if word == 0 {
+			if !closeRun() {
+				return
+			}
+			continue
+		}
+
+		// Walk each maximal run of set bits within this word.
+		// (Named wbits: `bits` is the math/bits package.)
+		wbits := word
+		for wbits != 0 {
+			b := uint64(bits.TrailingZeros64(wbits))
+			s := base + b
+			// TrailingZeros64(0) == 64, so an all-ones-from-b run
+			// (only possible at b == 0) yields cnt == 64.
+			cnt := uint64(bits.TrailingZeros64(^(wbits >> b)))
+			if runLen > 0 && s == runStart+runLen {
+				runLen += cnt // contiguous with the previous word's run
+			} else {
+				if !closeRun() {
+					return
+				}
+				runStart, runLen = s, cnt
+			}
+			if minLen > 0 && runLen >= minLen {
+				// First fit: report the run (its accumulated prefix)
+				// and stop scanning.
+				closeRun()
+				return
+			}
+			// Clear the consumed run bits. When cnt == 64 the whole
+			// word is one run from bit b (bits below b are already
+			// 0), so clearing the entire word is equivalent and
+			// avoids the (1 << 64) that would otherwise loop forever.
+			if cnt >= 64 {
+				wbits = 0
+			} else {
+				wbits &^= ((1 << cnt) - 1) << b
+			}
+		}
+	}
+	closeRun()
+}
+
 // AllocRunsUpTo allocates up to n data blocks as a list of maximal
 // contiguous runs (data-relative first/length pairs), in a single bitmap
 // pass, and returns them; the total may fall short of n (ENOSPC class —
@@ -354,9 +396,9 @@ func (a *Allocator) AllocRunsUpTo(n uint64) []blockRun {
 }
 
 // tryAllocRunsUpTo is AllocRunsUpTo's single scan pass: it walks the L2
-// bitmap harvesting maximal free runs (TrimFreeRuns' scan shape) until n
-// blocks are gathered or the bitmap is exhausted, taking only a prefix
-// of the final run when it overshoots the request.
+// bitmap harvesting maximal free runs (scanMaximalRuns) until n blocks are
+// gathered or the bitmap is exhausted, taking only a prefix of the final
+// run when it overshoots the request.
 func (a *Allocator) tryAllocRunsUpTo(n uint64) []blockRun {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -381,75 +423,20 @@ func (a *Allocator) tryAllocRunsUpTo(n uint64) []blockRun {
 
 	// Reserve the data-relative block-0 sentinel so no run starts there
 	// (tryAllocBlocks does the same; mkfs normally did this already).
-	if a.l2[0]&1 != 0 {
-		a.l2[0] &^= 1
-		a.freeCount--
-		dataAvail--
-		if a.l2[0] == 0 {
-			a.l1[0] &^= 1
-			if a.l1[0] == 0 {
-				a.l0[0] &^= 1
-			}
-		}
-		a.dirty = true
-		a.markL2Word(0)
-	}
+	a.reserveBlockZeroLocked()
 
 	var runs []blockRun
-	runStart, runLen := uint64(0), uint64(0)
-	// take records the pending maximal run, truncated to the remaining
-	// request, and consumes it so the scan can start the next run.
-	take := func() {
-		if runLen == 0 {
-			return
-		}
+	a.scanMaximalRuns(0, func(runStart, runLen uint64) bool {
 		if remaining == 0 {
-			runLen = 0
-			return
+			return false
 		}
 		if runLen > remaining {
 			runLen = remaining
 		}
 		runs = append(runs, blockRun{first: runStart, n: runLen})
 		remaining -= runLen
-		runLen = 0
-	}
-	for w2 := uint64(0); w2 < a.l2Words && remaining > 0; w2++ {
-		word := a.l2[w2]
-		base := w2 * 64
-
-		// Mask trailing bits beyond blockCount in the last word.
-		if w2 == a.l2Words-1 {
-			if rem := a.blockCount % 64; rem != 0 {
-				word &= (1 << rem) - 1
-			}
-		}
-		if word == 0 {
-			take() // the current run cannot continue past a zero word
-			continue
-		}
-
-		wbits := word
-		for wbits != 0 && remaining > 0 {
-			b := uint64(bits.TrailingZeros64(wbits))
-			s := base + b
-			// TrailingZeros64(0) == 64: an all-ones-from-b run
-			// (only possible at b == 0) yields cnt == 64.
-			cnt := uint64(bits.TrailingZeros64(^(wbits >> b)))
-			if runLen > 0 && s == runStart+runLen {
-				runLen += cnt // contiguous with the previous word's run
-			} else {
-				take()
-				runStart, runLen = s, cnt
-			}
-			if cnt >= 64 {
-				wbits = 0
-			} else {
-				wbits &^= ((1 << cnt) - 1) << b
-			}
-		}
-	}
-	take()
+		return remaining > 0
+	})
 
 	if len(runs) == 0 {
 		return nil
@@ -508,60 +495,15 @@ func (a *Allocator) TrimFreeRuns(visit func(runStart, runLen uint64) error) erro
 		return nil
 	}
 
-	runStart, runLen := uint64(0), uint64(0)
-	flush := func() error {
-		if runLen == 0 {
-			return nil
-		}
+	var verr error
+	a.scanMaximalRuns(0, func(runStart, runLen uint64) bool {
 		if err := visit(runStart, runLen); err != nil {
-			return err
+			verr = err
+			return false
 		}
-		runLen = 0
-		return nil
-	}
-
-	for w2 := uint64(0); w2 < a.l2Words; w2++ {
-		word := a.l2[w2]
-		base := w2 * 64
-
-		// Mask trailing bits beyond blockCount in the last word.
-		if w2 == a.l2Words-1 {
-			if rem := a.blockCount % 64; rem != 0 {
-				word &= (1 << rem) - 1
-			}
-		}
-		if word == 0 {
-			if err := flush(); err != nil {
-				return err
-			}
-			continue
-		}
-
-		// Walk each maximal run of set bits within this word
-		// (named wbits: `bits` is the math/bits package).
-		wbits := word
-		for wbits != 0 {
-			b := uint64(bits.TrailingZeros64(wbits))
-			s := base + b
-			// TrailingZeros64(0) == 64, so an all-ones-from-b run
-			// (only possible at b == 0) yields cnt == 64.
-			cnt := uint64(bits.TrailingZeros64(^(wbits >> b)))
-			if runLen > 0 && s == runStart+runLen {
-				runLen += cnt // contiguous with the previous word's run
-			} else {
-				if err := flush(); err != nil {
-					return err
-				}
-				runStart, runLen = s, cnt
-			}
-			if cnt >= 64 {
-				wbits = 0
-			} else {
-				wbits &^= ((1 << cnt) - 1) << b
-			}
-		}
-	}
-	return flush()
+		return true
+	})
+	return verr
 }
 
 // FreeBlock marks a data-relative block as free.
