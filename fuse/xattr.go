@@ -621,7 +621,8 @@ func serializeXattrBlock(d *xattrBlockDesc, kvs []xattrKV, absBlocks []uint64, i
 	hdr.UsedSize = used
 	briefs.WriteXattrHeader(buf, hdr)
 	// Zero the tail beyond used; the CRC over [0,4080) is recomputed.
-	binary.LittleEndian.PutUint64(buf[4080:], briefs.ComputeChainChecksum(buf, blockSize))
+	binary.LittleEndian.PutUint64(buf[briefs.ExtentChainChecksumOffset:],
+		briefs.ComputeChainChecksum(buf, blockSize))
 	return buf
 }
 

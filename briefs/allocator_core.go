@@ -122,12 +122,13 @@ func AllocIsAllocated(l2 []uint64, blockCount, rel uint64) bool {
 	return l2[w]&(1<<(rel%64)) == 0
 }
 
-// allocLevelWords returns the L0/L1/L2 word counts for a 3-level bitmap pyramid
-// tracking blockCount blocks (64 blocks per L2 word, 64 L2 words per L1 word,
-// 64 L1 words per L0 word), each level clamped to at least one word. It is used
-// by NewAllocBuilder; the runtime Allocator reads its counts from the on-disk
-// header instead.
-func allocLevelWords(blockCount uint64) (l0, l1, l2 uint64) {
+// AllocLevelWords returns the L0/L1/L2 word counts for a 3-level bitmap
+// pyramid tracking blockCount blocks (64 blocks per L2 word, 64 L2 words per
+// L1 word, 64 L1 words per L0 word), each level clamped to at least one word.
+// NewAllocBuilder uses it to lay out a fresh pool; fsck uses it to check an
+// existing header against the on-disk layout it must have; the runtime
+// Allocator reads its counts from the on-disk header instead.
+func AllocLevelWords(blockCount uint64) (l0, l1, l2 uint64) {
 	l2 = (blockCount + 63) / 64
 	l1 = (l2 + 63) / 64
 	l0 = (l1 + 63) / 64

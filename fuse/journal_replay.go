@@ -37,6 +37,7 @@ package fuse
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
@@ -148,74 +149,61 @@ func (b *BrieFS) replayJournal() error {
 // walkJournal walks [log_start, log_end) once, applying each record. When
 // reserveOnly is true this is the pass-1 reservation pre-scan (only allocator
 // ALLOC/FREE records + xattr metadata collection apply); otherwise it is the
-// full pass-2 apply.
+// full pass-2 apply. The ring-walk skeleton (cursor advance, block magic
+// check, record framing) is shared with fsck through briefs.WalkJournalRing
+// and briefs.IterateJournalBlockRecords; this function owns the replay
+// policy (type range, checksum strictness, handler dispatch).
 func (b *BrieFS) walkJournal(reserveOnly bool) error {
 	start, end, checkpointBlk := b.journal.ReplayLogRange()
+	journalOffset, journalBlocks := b.journal.JournalRingGeometry()
 	blockSize := b.journal.JournalBlockSize()
-	cur := start
 
-	for cur != end {
-		// Skip the reserved checkpoint block (journal_end - 1): the write path
-		// never lands ordinary records there, and reading it as an ordinary
-		// record block fails when its content is stale from a prior mount.
-		if cur == checkpointBlk {
-			cur = b.journal.NextJournalBlock(cur)
-			continue
-		}
-
-		buf, err := b.journal.ReadJournalBlock(cur)
-		if err != nil {
-			return fmt.Errorf("read journal block %d: %w", cur, err)
-		}
-
-		bh := briefs.ParseJournalBlockHeader(buf)
-		if bh.Magic != briefs.MagicJournal && bh.Magic != briefs.MagicCheckpoint {
-			// Stale/garbage block at the tail: stop (don't fail the mount).
-			break
-		}
-
-		recCount := bh.RecordCount
-		off := uint64(briefs.JournalBlockHdrSize)
-		for i := uint32(0); i < recCount && off+briefs.JournalRecordHdrSize <= blockSize; i++ {
-			hdr := briefs.ParseRecordHeader(buf[off:])
-			rtype := hdr.Type
-			dlen := uint64(hdr.DataLen)
-
-			if rtype <= briefs.JRN_NONE || rtype >= briefs.JRN_END {
-				return fmt.Errorf("invalid record type %d at block %d", rtype, cur)
-			}
-			if off+briefs.JournalRecordHdrSize+dlen > blockSize {
-				return fmt.Errorf("record overflows block %d (off=%d len=%d)", cur, off, dlen)
+	err := briefs.WalkJournalRing(b.journal.ReadJournalBlock, journalOffset, journalBlocks, start, end,
+		func(cur uint64, buf []byte) error {
+			// The reserved checkpoint block (journal_end - 1) never carries
+			// replayable records: the write path does not land ordinary
+			// records there, and its content may be stale from a prior mount.
+			// The degenerate start == end visit (clean journal) carries none
+			// either.
+			if cur == checkpointBlk || start == end {
+				return nil
 			}
 
-			recData := buf[off+briefs.JournalRecordHdrSize : off+briefs.JournalRecordHdrSize+dlen]
-			rlog("rec block=%d type=%d dlen=%d", cur, rtype, dlen)
+			bh := briefs.ParseJournalBlockHeader(buf)
+			return briefs.IterateJournalBlockRecords(buf, blockSize, bh.RecordCount,
+				func(i uint32, hdr briefs.RecordHeader, recData []byte) error {
+					rtype := hdr.Type
 
-			// Checksum verify (zero checksum = legacy, accepted).
-			if !briefs.VerifyJournalRecordChecksum(rtype, hdr.Flags, recData, hdr.Checksum) {
-				return fmt.Errorf("checksum mismatch at block %d record %d type %d", cur, i, rtype)
-			}
+					if rtype <= briefs.JRN_NONE || rtype >= briefs.JRN_END {
+						return fmt.Errorf("invalid record type %d at block %d", rtype, cur)
+					}
+					rlog("rec block=%d type=%d dlen=%d", cur, rtype, len(recData))
 
-			// JRN_CHECKPOINT marker records are not replay-able; skip.
-			if rtype == briefs.JRN_CHECKPOINT {
-				off += briefs.JournalRecordHdrSize + dlen
-				continue
-			}
+					// Checksum verify (zero checksum = legacy, accepted).
+					if !briefs.VerifyJournalRecordChecksum(rtype, hdr.Flags, recData, hdr.Checksum) {
+						return fmt.Errorf("checksum mismatch at block %d record %d type %d", cur, i, rtype)
+					}
 
-			if err := b.applyRecord(rtype, recData, reserveOnly); err != nil {
-				// Freed-inode / not-present results are skippable, not mount-fatal.
-				if err == syscall.EINVAL || err == syscall.ENOENT {
-					// skip
-				} else {
-					return fmt.Errorf("replay record type %d at block %d: %w", rtype, cur, err)
-				}
-			}
-			off += briefs.JournalRecordHdrSize + dlen
-		}
+					// JRN_CHECKPOINT marker records are not replay-able; skip.
+					if rtype == briefs.JRN_CHECKPOINT {
+						return nil
+					}
 
-		cur = b.journal.NextJournalBlock(cur)
+					if err := b.applyRecord(rtype, recData, reserveOnly); err != nil {
+						// Freed-inode / not-present results are skippable, not mount-fatal.
+						if err == syscall.EINVAL || err == syscall.ENOENT {
+							return nil
+						}
+						return fmt.Errorf("replay record type %d at block %d: %w", rtype, cur, err)
+					}
+					return nil
+				})
+		})
+	// A stale/garbage block at the tail ends the walk (don't fail the mount).
+	if errors.Is(err, briefs.ErrJournalBadMagic) {
+		return nil
 	}
-	return nil
+	return err
 }
 
 // applyRecord dispatches one journal record to its replay handler. Mirrors the
@@ -309,12 +297,13 @@ func (b *BrieFS) applyRecord(rtype uint32, data []byte, reserveOnly bool) error 
 	}
 }
 
-// offXattrOffset is the byte offset of the xattr_offset field within the
-// 512-byte on-disk inode. It matches the kernel's struct briefs_disk_inode
-// layout (see gen_disk.go: XattrOffset is marshaled at this position).
-var offXattrOffset = func() uint64 {
-	// Compute from a marshaled sentinel inode to avoid hardcoding the layout.
-	in := &briefs.Inode{InodeNumber: 0x1122334455667788, XattrOffset: 0xdeadbeefcafebabe}
+// inodeFieldOffset computes the byte offset of an 8-byte field within the
+// 512-byte on-disk inode by marshaling a sentinel inode and locating the
+// marker value, so raw-snapshot readers stay correct if the layout ever
+// shifts (see gen_disk.go for the authoritative field order).
+func inodeFieldOffset(set func(in *briefs.Inode)) uint64 {
+	in := &briefs.Inode{InodeNumber: 0x1122334455667788}
+	set(in)
 	raw, _ := in.MarshalBinary()
 	for i := uint64(0); i+8 <= uint64(len(raw)); i++ {
 		if binary.LittleEndian.Uint64(raw[i:]) == 0xdeadbeefcafebabe {
@@ -322,35 +311,42 @@ var offXattrOffset = func() uint64 {
 		}
 	}
 	return 0
-}()
+}
 
-// offGeneration is the byte offset of the generation field within the 512-byte
-// on-disk inode, computed the same way as offXattrOffset. Replay reads it
-// directly from raw snapshots (kernel 432; kernel commit 33e4019).
-var offGeneration = func() uint64 {
-	in := &briefs.Inode{InodeNumber: 0x1122334455667788, Generation: 0xdeadbeefcafebabe}
-	raw, _ := in.MarshalBinary()
-	for i := uint64(0); i+8 <= uint64(len(raw)); i++ {
-		if binary.LittleEndian.Uint64(raw[i:]) == 0xdeadbeefcafebabe {
-			return i
-		}
-	}
-	return 0
-}()
+// offXattrOffset is the byte offset of the xattr_offset field within the
+// on-disk inode (kernel struct briefs_disk_inode; 384 on the current layout).
+var offXattrOffset = inodeFieldOffset(func(in *briefs.Inode) {
+	in.XattrOffset = 0xdeadbeefcafebabe
+})
+
+// offGeneration is the byte offset of the generation field within the on-disk
+// inode (432 on the current layout). Replay reads it directly from raw
+// snapshots (kernel 432; kernel commit 33e4019).
+var offGeneration = inodeFieldOffset(func(in *briefs.Inode) {
+	in.Generation = 0xdeadbeefcafebabe
+})
+
+// offDirTrieRoot is the byte offset of the dir_trie_root field within the
+// on-disk inode (416 on the current layout; 384 is xattr_offset).
+var offDirTrieRoot = inodeFieldOffset(func(in *briefs.Inode) {
+	in.DirTrieRoot = 0xdeadbeefcafebabe
+})
 
 // xattrRecNextBlock extracts the next_block pointer from a JRN_XATTR_DATA
-// content record's block bytes. v1 blocks have no next pointer; v2 blocks carry
-// it at offset 16. Mirrors the kernel's xattr_rec_next_block() (journal.c:977).
+// content record's block bytes via the shared header codec. v1 blocks have no
+// next pointer (the codec reads it as 0); a block whose header does not
+// validate ends the chain rather than following a garbage pointer. Mirrors
+// the kernel's xattr_rec_next_block() (journal.c:977).
 func xattrRecNextBlock(data []byte, used uint32) uint64 {
-	const xattrHdrSize = 32
-	if used < xattrHdrSize || uint32(len(data)) < xattrHdrSize {
+	minHdr := uint32(briefs.XattrHeaderSize(1))
+	if used < minHdr || uint32(len(data)) < minHdr {
 		return 0
 	}
-	version := binary.LittleEndian.Uint32(data[4:])
-	if version == 1 {
+	hdr, err := briefs.ReadXattrHeader(data)
+	if err != nil {
 		return 0
 	}
-	return binary.LittleEndian.Uint64(data[16:])
+	return hdr.NextBlock
 }
 
 // buildXattrLiveSet walks each inode's final xattr chain (via the pass-1
@@ -482,8 +478,8 @@ func (b *BrieFS) replayInodeFull(ino uint64, data []byte) error {
 	// Log the DirTrieRoot carried in the snapshot (offset 416; 384 is
 	// XattrOffset).
 	var snapRoot uint64
-	if len(raw) >= 416+8 {
-		snapRoot = binary.LittleEndian.Uint64(raw[416:])
+	if uint64(len(raw)) >= offDirTrieRoot+8 {
+		snapRoot = binary.LittleEndian.Uint64(raw[offDirTrieRoot:])
 	}
 	rlog("  inode-full ino=%d snapDirTrieRoot=%d", ino, snapRoot)
 	blk, off := b.inodes.inodeLocation(ino)

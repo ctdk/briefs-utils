@@ -31,11 +31,6 @@ const (
 
 	// struct fstrim_range (uapi/linux/fsmap.h): three __u64s.
 	sizeFsTrimRange = 24
-
-	// fallocate(2) modes for the FITRIM punch-hole analogue. The syscall
-	// package does not export the FALLOC_FL_* constants.
-	fallocFlKeepSize  = 0x01
-	fallocFlPunchHole = 0x02
 )
 
 var (
@@ -149,7 +144,7 @@ func (b *BrieFS) fstrimOp(r fsTrimRange) (uint64, error) {
 			return nil
 		}
 		off := int64((b.dataRegionStart + ds) * bs)
-		if err := syscall.Fallocate(fd, fallocFlPunchHole|fallocFlKeepSize,
+		if err := syscall.Fallocate(fd, fallocPunchHole|fallocKeepSize,
 			off, int64(n*bs)); err != nil {
 			// The kernel refuses up front when the backing device cannot
 			// discard (!bdev_max_discard_sectors, file.c:260); the bridge

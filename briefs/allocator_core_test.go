@@ -90,9 +90,9 @@ func TestAllocLevelWords(t *testing.T) {
 		{1 << 18, 1, 64, 4096}, // 262144 blocks
 	}
 	for _, c := range cases {
-		l0, l1, l2 := allocLevelWords(c.blockCount)
+		l0, l1, l2 := AllocLevelWords(c.blockCount)
 		if l0 != c.l0 || l1 != c.l1 || l2 != c.l2 {
-			t.Fatalf("allocLevelWords(%d): got (%d,%d,%d), want (%d,%d,%d)",
+			t.Fatalf("AllocLevelWords(%d): got (%d,%d,%d), want (%d,%d,%d)",
 				c.blockCount, l0, l1, l2, c.l0, c.l1, c.l2)
 		}
 	}

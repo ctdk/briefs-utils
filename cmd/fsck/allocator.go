@@ -64,19 +64,8 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize, sbExpectedFree u
 			label, sbExpectedFree, headerFree)
 	}
 
-	// Compute expected level sizes
-	expectedL2 := (blockCount + (wordBits - 1)) / wordBits
-	expectedL1 := (expectedL2 + (wordBits - 1)) / wordBits
-	expectedL0 := (expectedL1 + (wordBits - 1)) / wordBits
-	if expectedL0 < 1 {
-		expectedL0 = 1
-	}
-	if expectedL1 < 1 {
-		expectedL1 = 1
-	}
-	if expectedL2 < 1 {
-		expectedL2 = 1
-	}
+	// Compute expected level sizes through the shared layout math.
+	expectedL0, expectedL1, expectedL2 := briefs.AllocLevelWords(blockCount)
 
 	if l0w != expectedL0 {
 		fs.errorf("%s: L0 word count mismatch: header says %d, expected %d", label, l0w, expectedL0)

@@ -215,7 +215,8 @@ func main() {
 			inodesPerBlock := blockSize / inodeSize // 8
 			inodeTableBlocks := roundUp(estInodes, inodesPerBlock) / inodesPerBlock
 
-			// Inode bitmap size (3-level bitmap pyramid)
+			// Inode bitmap size (3-level bitmap pyramid); the builder is
+			// kept and written out below (root inode marked allocated).
 			inodeAllocBuilder := briefs.NewAllocBuilder(estInodes)
 			inodeBitmapBlocks := inodeAllocBuilder.NbBlocks()
 			inodeAllocBlocks := inodeBitmapBlocks
@@ -232,8 +233,7 @@ func main() {
 			}
 
 			finalDataBlocks := uint64(totalBlocks) - 1 - inodeAllocBlocks - inodeTableBlocks - 1 - journalBlocks
-			builder := briefs.NewDataAllocBuilder(finalDataBlocks)
-			allocBlocks := builder.NbBlocks()
+			allocBlocks := briefs.AllocPoolBlocks(finalDataBlocks)
 			finalDataBlocks = uint64(totalBlocks) - 1 - inodeAllocBlocks - inodeTableBlocks - 1 - allocBlocks - journalBlocks
 			if finalDataBlocks < 1 {
 				return fmt.Errorf("filesystem too small")

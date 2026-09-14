@@ -14,6 +14,7 @@
 package briefs
 
 import (
+	"errors"
 	"fmt"
 )
 
@@ -42,6 +43,15 @@ func (j *Journal) JournalBlockSize() uint64 {
 	return j.blockSize
 }
 
+// JournalRingGeometry returns the absolute first journal block and the
+// number of blocks in the ring, for callers that drive WalkJournalRing with
+// a Journal's reader.
+func (j *Journal) JournalRingGeometry() (offset, blocks uint64) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.journalStart, j.journalEnd - j.journalStart
+}
+
 // NextJournalBlock advances a journal block number, wrapping at journalEnd.
 func (j *Journal) NextJournalBlock(cur uint64) uint64 {
 	j.mu.Lock()
@@ -59,6 +69,77 @@ func NextRingBlock(cur, journalStart, journalBlocks uint64) uint64 {
 		return journalStart
 	}
 	return next
+}
+
+// ErrJournalBadMagic reports a walked journal block whose magic is neither
+// MagicJournal nor MagicCheckpoint. Callers decide whether that is fatal:
+// replay treats it as the end of the live log (the torn tail of a crash),
+// while fsck reports it as an error.
+var ErrJournalBadMagic = errors.New("journal block has bad magic")
+
+// ErrJournalRecordOverflow reports a journal record whose header+payload
+// would extend past the end of its block; the record is not visited.
+var ErrJournalRecordOverflow = errors.New("journal record overflows block")
+
+// WalkJournalRing walks journal blocks around the ring starting at start and
+// stopping when end is reached (end is not visited). When start == end the
+// single block at start is visited exactly once -- fsck's clean-journal
+// checkpoint check; replay callers skip that block in their visitor. The
+// walk never visits more than journalBlocks blocks, so a corrupt log range
+// cannot spin. readBlock fetches one block's bytes; visit runs for each
+// block whose header carries a journal or checkpoint magic, and typically
+// iterates the block's records with IterateJournalBlockRecords.
+func WalkJournalRing(readBlock func(block uint64) ([]byte, error),
+	journalOffset, journalBlocks, start, end uint64,
+	visit func(cur uint64, buf []byte) error) error {
+
+	cur := start
+	for iter := uint64(0); iter < journalBlocks; iter++ {
+		buf, err := readBlock(cur)
+		if err != nil {
+			return fmt.Errorf("read journal block %d: %w", cur, err)
+		}
+		bh := ParseJournalBlockHeader(buf)
+		if bh.Magic != MagicJournal && bh.Magic != MagicCheckpoint {
+			return fmt.Errorf("%w at block %d (0x%08X)", ErrJournalBadMagic, cur, bh.Magic)
+		}
+		if err := visit(cur, buf); err != nil {
+			return err
+		}
+		if start == end {
+			return nil
+		}
+		cur = NextRingBlock(cur, journalOffset, journalBlocks)
+		if cur == end {
+			return nil
+		}
+	}
+	return nil
+}
+
+// IterateJournalBlockRecords walks the records of one journal block, handing
+// each well-formed record's index, header and payload to visit; a non-nil
+// return from visit stops the walk and is returned as-is. The first record
+// whose header+payload would extend past the block ends the walk with
+// ErrJournalRecordOverflow (wrapping the record index and data_len) -- the
+// caller decides whether that is fatal.
+func IterateJournalBlockRecords(buf []byte, blockSize uint64, recordCount uint32,
+	visit func(idx uint32, hdr RecordHeader, payload []byte) error) error {
+
+	off := uint64(JournalBlockHdrSize)
+	for i := uint32(0); i < recordCount && off+JournalRecordHdrSize <= blockSize; i++ {
+		hdr := ParseRecordHeader(buf[off:])
+		dlen := uint64(hdr.DataLen)
+		if off+JournalRecordHdrSize+dlen > blockSize {
+			return fmt.Errorf("%w: record %d (data_len=%d)", ErrJournalRecordOverflow, i, hdr.DataLen)
+		}
+		payload := buf[off+JournalRecordHdrSize : off+JournalRecordHdrSize+dlen]
+		if err := visit(i, hdr, payload); err != nil {
+			return err
+		}
+		off += JournalRecordHdrSize + dlen
+	}
+	return nil
 }
 
 // ReadJournalBlock reads a 4096-byte journal block at the given absolute block

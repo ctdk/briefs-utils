@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 
@@ -64,7 +65,11 @@ func verifyJournal(file *os.File, journalOffset, journalBlocks, checkpointSeq, l
 // verifyJournalRecords verifies the CRC32C checksum of journal records.
 // For a clean filesystem only the checkpoint block is checked. For a dirty
 // filesystem the recorded log range is walked. A zero checksum is treated
-// as a legacy record and is allowed with a single warning.
+// as a legacy record and is allowed with a single warning. The ring-walk
+// skeleton (cursor advance, block magic check, record framing, hang-proof
+// iteration cap) is shared with the FUSE bridge's replay through
+// briefs.WalkJournalRing and briefs.IterateJournalBlockRecords; this
+// function owns the verification policy.
 func verifyJournalRecords(fs *fsckState, journalOffset, journalBlocks, logStart, logEnd, blockSize uint64) {
 	legacyWarned := false
 	badRecords := 0
@@ -82,11 +87,10 @@ func verifyJournalRecords(fs *fsckState, journalOffset, journalBlocks, logStart,
 	// Bounds-check the log range against the journal's block span.  A stale
 	// or zeroed superblock JournalLogEnd/LogStart (the kernel can leave these
 	// unpersisted -- see the journal-log-end persistence issue) would otherwise
-	// point `end` outside [journalOffset, journalOffset+journalBlocks), and the
-	// circular walk below would advance forever without `cur == end` ever
-	// holding -- an infinite spin at ~100% CPU during the post-test consistency
-	// check.  Clamp out-of-range endpoints to the checkpoint block and cap the
-	// walk at journalBlocks iterations so a bogus range can never hang fsck.
+	// point an endpoint outside [journalOffset, journalOffset+journalBlocks)
+	// and the circular walk would advance forever.  Clamp out-of-range
+	// endpoints to the checkpoint block; the shared walker's iteration cap
+	// is the second line of defense so a bogus range can never hang fsck.
 	journalLast := journalOffset + journalBlocks - 1
 	if start < journalOffset || start > journalLast {
 		fs.warnf("journal log_start %d out of range [%d,%d]; clamping to checkpoint block",
@@ -100,113 +104,98 @@ func verifyJournalRecords(fs *fsckState, journalOffset, journalBlocks, logStart,
 		end = journalLast
 	}
 
-	cur := start
-	for iter := uint64(0); iter < journalBlocks; iter++ {
+	readBlock := func(block uint64) ([]byte, error) {
 		buf := make([]byte, blockSize)
-		if _, err := fs.file.ReadAt(buf, int64(cur*blockSize)); err != nil {
-			fs.errorf("journal block %d: read error: %v", cur, err)
-			break
+		if _, err := fs.file.ReadAt(buf, int64(block*blockSize)); err != nil {
+			return nil, err
 		}
+		return buf, nil
+	}
 
+	visitBlock := func(cur uint64, buf []byte) error {
 		bh := briefs.ParseJournalBlockHeader(buf)
-		if bh.Magic != briefs.MagicJournal && bh.Magic != briefs.MagicCheckpoint {
-			if logStart == logEnd && !fallbackClean && cur == journalOffset+journalBlocks-1 {
-				// Old mkfs.briefs images have the initial checkpoint in the
-				// first journal block. Try that as a fallback once.
-				fallbackClean = true
-				cur = journalOffset
-				continue
-			}
-			fs.errorf("journal block %d: bad magic 0x%08X", cur, bh.Magic)
-			break
-		}
-
-		recordCount := bh.RecordCount
-		recOff := uint64(briefs.JournalBlockHdrSize)
-		for i := uint32(0); i < recordCount && recOff+briefs.JournalRecordHdrSize <= blockSize; i++ {
-			hdr := briefs.ParseRecordHeader(buf[recOff:])
-			recType := hdr.Type
-			recFlags := hdr.Flags
-			dataLen := hdr.DataLen
-			storedChecksum := hdr.Checksum
-
-			if recOff+briefs.JournalRecordHdrSize+uint64(dataLen) > blockSize {
-				fs.errorf("journal block %d record %d: record overflows block (data_len=%d)",
-					cur, i, dataLen)
-				badRecords++
-				break
-			}
-
-			recordsChecked++
-			recData := buf[recOff+briefs.JournalRecordHdrSize : recOff+briefs.JournalRecordHdrSize+uint64(dataLen)]
-			if storedChecksum == 0 {
-				if !legacyWarned {
-					fs.warnf("journal: legacy record with no checksum at block %d record %d; skipping CRC verification",
-						cur, i)
-					legacyWarned = true
-				}
-			} else {
-				computed := briefs.ComputeJournalRecordChecksum(recType, recFlags, recData)
-				if computed != storedChecksum {
+		err := briefs.IterateJournalBlockRecords(buf, blockSize, bh.RecordCount,
+			func(i uint32, hdr briefs.RecordHeader, recData []byte) error {
+				recordsChecked++
+				if hdr.Checksum == 0 {
+					if !legacyWarned {
+						fs.warnf("journal: legacy record with no checksum at block %d record %d; skipping CRC verification",
+							cur, i)
+						legacyWarned = true
+					}
+				} else if computed := briefs.ComputeJournalRecordChecksum(hdr.Type, hdr.Flags, recData); computed != hdr.Checksum {
 					fs.errorf("journal block %d record %d: checksum mismatch (stored=0x%08X computed=0x%08X)",
-						cur, i, storedChecksum, computed)
+						cur, i, hdr.Checksum, computed)
 					badRecords++
 				}
-			}
 
-			// Parse and validate checkpoint payloads when the checksum is good.
-			if recType == uint32(briefs.JRN_CHECKPOINT) {
-				if dataLen != briefs.CheckpointSize {
-					fs.warnf("journal block %d record %d: checkpoint payload has unexpected length %d (want %d)",
-						cur, i, dataLen, briefs.CheckpointSize)
-				} else {
-					var cp briefs.Checkpoint
-					if err := cp.UnmarshalBinary(recData); err != nil {
-						fs.warnf("journal block %d record %d: checkpoint parse error: %v", cur, i, err)
+				// Parse and validate checkpoint payloads when the checksum is good.
+				if hdr.Type == uint32(briefs.JRN_CHECKPOINT) {
+					if hdr.DataLen != briefs.CheckpointSize {
+						fs.warnf("journal block %d record %d: checkpoint payload has unexpected length %d (want %d)",
+							cur, i, hdr.DataLen, briefs.CheckpointSize)
 					} else {
-						fmt.Fprintf(os.Stderr, "  checkpoint:    seq=%d records=%d log_end=%d free_data=%d free_inodes=%d\n",
-							cp.Seq, cp.RecordCount, cp.LogSequenceEnd, cp.FreeDataCount, cp.FreeInodeCount)
+						var cp briefs.Checkpoint
+						if err := cp.UnmarshalBinary(recData); err != nil {
+							fs.warnf("journal block %d record %d: checkpoint parse error: %v", cur, i, err)
+						} else {
+							fmt.Fprintf(os.Stderr, "  checkpoint:    seq=%d records=%d log_end=%d free_data=%d free_inodes=%d\n",
+								cp.Seq, cp.RecordCount, cp.LogSequenceEnd, cp.FreeDataCount, cp.FreeInodeCount)
 
-						if fs.sb != nil {
-							if cp.Seq != fs.sb.CheckpointSeq {
-								fs.warnf("checkpoint seq mismatch: payload=%d, superblock=%d",
-									cp.Seq, fs.sb.CheckpointSeq)
-							}
-							if cp.LogSequenceEnd != fs.sb.JournalLogEnd {
-								fs.warnf("checkpoint log_sequence_end mismatch: payload=%d, superblock=%d",
-									cp.LogSequenceEnd, fs.sb.JournalLogEnd)
-							}
-							if cp.FreeDataCount > fs.sb.TotalBlocks {
-								fs.warnf("checkpoint free_data_count out of range: %d > total_blocks %d",
-									cp.FreeDataCount, fs.sb.TotalBlocks)
-							}
-							if cp.FreeInodeCount > fs.sb.TotalBlocks {
-								fs.warnf("checkpoint free_inode_count out of range: %d > total_blocks %d",
-									cp.FreeInodeCount, fs.sb.TotalBlocks)
-							}
-							if cp.FreeDataCount != fs.sb.FreeDataBlks {
-								fs.warnf("checkpoint free_data_count differs from superblock: %d vs %d",
-									cp.FreeDataCount, fs.sb.FreeDataBlks)
-							}
-							if cp.FreeInodeCount != fs.sb.FreeInodes {
-								fs.warnf("checkpoint free_inode_count differs from superblock: %d vs %d",
-									cp.FreeInodeCount, fs.sb.FreeInodes)
+							if fs.sb != nil {
+								if cp.Seq != fs.sb.CheckpointSeq {
+									fs.warnf("checkpoint seq mismatch: payload=%d, superblock=%d",
+										cp.Seq, fs.sb.CheckpointSeq)
+								}
+								if cp.LogSequenceEnd != fs.sb.JournalLogEnd {
+									fs.warnf("checkpoint log_sequence_end mismatch: payload=%d, superblock=%d",
+										cp.LogSequenceEnd, fs.sb.JournalLogEnd)
+								}
+								if cp.FreeDataCount > fs.sb.TotalBlocks {
+									fs.warnf("checkpoint free_data_count out of range: %d > total_blocks %d",
+										cp.FreeDataCount, fs.sb.TotalBlocks)
+								}
+								if cp.FreeInodeCount > fs.sb.TotalBlocks {
+									fs.warnf("checkpoint free_inode_count out of range: %d > total_blocks %d",
+										cp.FreeInodeCount, fs.sb.TotalBlocks)
+								}
+								if cp.FreeDataCount != fs.sb.FreeDataBlks {
+									fs.warnf("checkpoint free_data_count differs from superblock: %d vs %d",
+										cp.FreeDataCount, fs.sb.FreeDataBlks)
+								}
+								if cp.FreeInodeCount != fs.sb.FreeInodes {
+									fs.warnf("checkpoint free_inode_count differs from superblock: %d vs %d",
+										cp.FreeInodeCount, fs.sb.FreeInodes)
+								}
 							}
 						}
 					}
 				}
-			}
+				return nil
+			})
+		if errors.Is(err, briefs.ErrJournalRecordOverflow) {
+			// A torn record ends this block's walk; later blocks may still be
+			// intact, so keep walking the ring.
+			fs.errorf("journal block %d: %v", cur, err)
+			badRecords++
+			return nil
+		}
+		return err
+	}
 
-			recOff += briefs.JournalRecordHdrSize + uint64(dataLen)
-		}
+	walk := func(start, end uint64) error {
+		return briefs.WalkJournalRing(readBlock, journalOffset, journalBlocks, start, end, visitBlock)
+	}
 
-		if logStart == logEnd {
-			break
-		}
-		cur = briefs.NextRingBlock(cur, journalOffset, journalBlocks)
-		if cur == end {
-			break
-		}
+	err := walk(start, end)
+	if errors.Is(err, briefs.ErrJournalBadMagic) && logStart == logEnd && !fallbackClean && start == journalLast {
+		// Old mkfs.briefs images have the initial checkpoint in the first
+		// journal block. Try that as a fallback once.
+		fallbackClean = true
+		err = walk(journalOffset, journalOffset)
+	}
+	if err != nil {
+		fs.errorf("journal walk: %v", err)
 	}
 
 	if badRecords == 0 && recordsChecked > 0 {

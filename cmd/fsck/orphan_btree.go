@@ -40,8 +40,8 @@ func reclaimOrphanBtree(fs *fsckState, plan *repairPlan, opts *repairOptions, bl
 
 	hdr := make([]byte, 4)
 	reclaimed := 0
-	reported := 0
-	const reportLimit = 20
+	unreadable := 0
+	orphans := 0
 
 	for relBlk := uint64(0); relBlk < dataBlockCount; relBlk++ {
 		absBlk := dataRegionStart + relBlk
@@ -59,12 +59,11 @@ func reclaimOrphanBtree(fs *fsckState, plan *repairPlan, opts *repairOptions, bl
 		// block (data extent, etc.) that is somehow not in usedBlocks is a
 		// leaked-block concern handled by verifyBlockCrossReference, not this pass.
 		if _, err := fs.file.ReadAt(hdr, int64(absBlk*blockSize)); err != nil {
-			// Unreadable: leave allocated, don't reclaim — could be a real block on
-			// a bad medium. Report once-ish and move on.
-			if reported < reportLimit {
-				fs.warnf("orphan B-tree scan: block %d unreadable (%v), left allocated", absBlk, err)
-			}
-			reported++
+			// Unreadable: leave allocated, don't reclaim — could be a real block
+			// on a bad medium.
+			fs.reportLimited(&unreadable, 20, fs.warnf,
+				"(more unreadable-block warnings suppressed)",
+				"orphan B-tree scan: block %d unreadable (%v), left allocated", absBlk, err)
 			continue
 		}
 		if binary.LittleEndian.Uint32(hdr) != briefs.BtreeMagic {
@@ -72,8 +71,11 @@ func reclaimOrphanBtree(fs *fsckState, plan *repairPlan, opts *repairOptions, bl
 		}
 
 		// Confirmed orphan: allocated, unreferenced, and still looks like a B-tree
-		// node. Free it when asked; always warn so a read-only run surfaces them.
-		fs.warnf("orphan B-tree node block %d (data-relative %d): carries B-tree magic but no inode references it",
+		// node. Free it when asked; always warn (capped) so a read-only run
+		// surfaces them without flooding a fragmented image.
+		fs.reportLimited(&orphans, 20, fs.warnf,
+			"(more orphan B-tree node warnings suppressed)",
+			"orphan B-tree node block %d (data-relative %d): carries B-tree magic but no inode references it",
 			absBlk, relBlk)
 		if opts.ReclaimOrphanBtree {
 			plan.dataAlloc.MarkFree(relBlk)

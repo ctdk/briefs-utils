@@ -51,7 +51,7 @@ type AllocBuilder struct {
 // All blocks start free. This is used for inode allocators where no
 // block reservation is needed.
 func NewAllocBuilder(dataBlockCount uint64) *AllocBuilder {
-	l0Words, l1Words, l2Words := allocLevelWords(dataBlockCount)
+	l0Words, l1Words, l2Words := AllocLevelWords(dataBlockCount)
 
 	b := &AllocBuilder{
 		L0:         make([]uint64, l0Words),
@@ -115,8 +115,23 @@ func (b *AllocBuilder) NbBlocks() uint64 {
 }
 
 func (b *AllocBuilder) wordBlocks(words []uint64) uint64 {
-	bytes := len(words) * 8
-	blk := uint64(bytes+4095) / 4096
+	return allocWordBlocks(uint64(len(words)))
+}
+
+// AllocPoolBlocks returns the number of 4096-byte blocks a fresh allocator
+// pool for blockCount blocks occupies on disk (header + L0 + L1 + L2 words).
+// mkfs uses it to lay out the pool region without constructing a throwaway
+// builder; AllocBuilder.NbBlocks reports the same number for a builder that
+// NewAllocBuilder/NewDataAllocBuilder produced.
+func AllocPoolBlocks(blockCount uint64) uint64 {
+	l0, l1, l2 := AllocLevelWords(blockCount)
+	return 1 + allocWordBlocks(l0) + allocWordBlocks(l1) + allocWordBlocks(l2)
+}
+
+// allocWordBlocks converts a word count to whole 4096-byte blocks, floored at
+// one block per level like the pyramid's one-word minimum.
+func allocWordBlocks(words uint64) uint64 {
+	blk := (words*8 + 4095) / 4096
 	if blk < 1 {
 		return 1
 	}
