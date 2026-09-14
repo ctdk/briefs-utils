@@ -20,6 +20,11 @@ type fsckState struct {
 	dirs        []dirInfo                // directories with trie roots
 	usedBlocks  *blockSet                // all blocks referenced by extents or trie nodes (interval-backed)
 	entryCounts map[uint64]int           // ino -> number of directory entries referencing it
+	// inodeExtents holds every inode's walked extents (ascending offsets),
+	// collected by the inode table scan's single extent walk; the overlap
+	// pass consumes them instead of re-walking every tree. Inodes whose walk
+	// failed (failedBtreeInos) may hold a partial list and are skipped there.
+	inodeExtents map[uint64][]briefs.Extent
 	// Tracks directories where trie walk had structural errors (bad magic, etc.)
 	failedTrieDirs map[uint64]bool // ino -> true if trie walk had unrecoverable errors
 	// Tracks tree-backed inodes whose B+ tree extent index walk had structural

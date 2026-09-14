@@ -274,25 +274,17 @@ func verifyExtentOverlaps(fs *fsckState) {
 		}
 	}
 
-	for ino, in := range fs.inodes {
-		if in.Flags&briefs.InodeFlagInlineData != 0 {
-			continue
-		}
-		// Skip inodes whose B+ tree walk already failed in collectInodeExtents;
-		// the structural error was already reported there, and re-walking would
-		// just emit a duplicate error (the tree is still torn).
+	// The per-inode extent lists were already collected in ascending offset
+	// order by the inode table scan's single walk (collectInodeExtents);
+	// consume them instead of re-walking every tree. Skip inodes whose walk
+	// failed: they are in fs.failedBtreeInos, the structural error was already
+	// reported there, and their lists may be partial.
+	for ino, extents := range fs.inodeExtents {
 		if fs.failedBtreeInos[ino] {
 			continue
 		}
-		// Walk every extent (inline array or B+ tree) in ascending offset order.
-		visit := func(ext briefs.Extent) error {
+		for _, ext := range extents {
 			addExtent(ino, ext)
-			return nil
-		}
-		if err := briefs.IterateInodeExtents(fs.file, in, fs.sb.BlockSize, briefs.InodeExtentVisitor{
-			VisitExtent: visit,
-		}); err != nil {
-			fs.errorf("ino %d: %v", ino, err)
 		}
 	}
 

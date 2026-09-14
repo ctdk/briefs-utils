@@ -11,6 +11,9 @@ import (
 //   - treats Phys == 0 as a hole and records no used block;
 //   - treats ExtentFlagUnwritten as ordinary allocated backing and records it;
 //   - tolerates no other extent flags (warns but still records the block).
+//
+// Recorded extents must also land in fs.inodeExtents (the overlap pass
+// consumes them instead of re-walking), except for holes.
 func TestCollectInodeExtentsUnwrittenAndHole(t *testing.T) {
 	tmp, err := os.CreateTemp(t.TempDir(), "extent-flags-*.briefs")
 	if err != nil {
@@ -19,19 +22,20 @@ func TestCollectInodeExtentsUnwrittenAndHole(t *testing.T) {
 	tmp.Close()
 
 	fs := &fsckState{
-		file:        mustOpen(tmp.Name()),
-		sb:          &briefs.SuperblockLayout{BlockSize: 4096},
-		usedBlocks:  newBlockSet(),
-		inodes:      make(map[uint64]*briefs.Inode),
-		entryCounts: make(map[uint64]int),
+		file:         mustOpen(tmp.Name()),
+		sb:           &briefs.SuperblockLayout{BlockSize: 4096},
+		usedBlocks:   newBlockSet(),
+		inodes:       make(map[uint64]*briefs.Inode),
+		entryCounts:  make(map[uint64]int),
+		inodeExtents: make(map[uint64][]briefs.Extent),
 	}
 	defer fs.file.Close()
 
 	tests := []struct {
-		name      string
-		ext       briefs.Extent
-		wantUsed  uint64
-		wantSet   bool
+		name     string
+		ext      briefs.Extent
+		wantUsed uint64
+		wantSet  bool
 	}{
 		{"hole", briefs.Extent{Offset: 0, Phys: 0, Len: 1}, 0, false},
 		{"unwritten", briefs.Extent{Offset: 1, Phys: 42, Len: 1, Flags: briefs.ExtentFlagUnwritten}, 42, true},
@@ -42,18 +46,25 @@ func TestCollectInodeExtentsUnwrittenAndHole(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ino := uint64(2)
 			in := &briefs.Inode{
-				InodeNumber:     ino,
-				Magic:           briefs.MagicInode,
-				Filemode:        briefs.ModeFile | 0644,
+				InodeNumber:      ino,
+				Magic:            briefs.MagicInode,
+				Filemode:         briefs.ModeFile | 0644,
 				NumExtentsInline: 1,
 				NumExtentsTotal:  1,
 			}
 			in.SetInlineExtent(0, tc.ext.Offset, tc.ext.Phys, tc.ext.Len, uint64(tc.ext.Flags))
 			fs.inodes[ino] = in
 			fs.usedBlocks = newBlockSet()
+			fs.inodeExtents = make(map[uint64][]briefs.Extent)
 			collectInodeExtents(fs, ino, in, 4096)
 			if has := fs.usedBlocks.has(tc.wantUsed); has != tc.wantSet {
 				t.Errorf("usedBlocks.has(%d) = %v, want %v", tc.wantUsed, has, tc.wantSet)
+			}
+			got := len(fs.inodeExtents[ino])
+			if tc.wantSet && got == 0 {
+				t.Errorf("inodeExtents[%d] empty; want the walked extent recorded", ino)
+			} else if !tc.wantSet && got != 0 {
+				t.Errorf("inodeExtents[%d] = %d entries; want none for a hole", ino, got)
 			}
 		})
 	}

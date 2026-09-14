@@ -98,6 +98,7 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 	fs.dirs = nil
 	fs.usedBlocks = newBlockSet()
 	fs.entryCounts = make(map[uint64]int)
+	fs.inodeExtents = make(map[uint64][]briefs.Extent)
 	fs.failedTrieDirs = make(map[uint64]bool)
 	fs.failedBtreeInos = make(map[uint64]bool)
 
@@ -176,18 +177,16 @@ func verifyInodeTable(fs *fsckState, inodeTableBlock, inodeTableBlocks, blockSiz
 				// we still record the inode data for cross-referencing.
 				fs.inodes[ino] = in
 
-				// Collect extents for block cross-reference
+				// Collect extents for the block cross-reference and the
+				// overlap pass, and verify the B+ tree's deep structure
+				// (separator ordering, child level, cross-leaf ordering,
+				// extent count) in the same walk. Populates
+				// failedBtreeInos on structural faults.
 				collectInodeExtents(fs, ino, in, blockSize)
 
 				// Validate the external xattr block (if any) and record it
 				// in fs.usedBlocks for the allocator cross-reference.
 				verifyXattrBlock(fs, ino, in, blockSize)
-
-				// Deep structural checks the basic walk skips (separator
-				// ordering, child range/level, cross-leaf ordering, extent
-				// count). Runs only for tree-backed inodes whose basic walk
-				// succeeded; populates failedBtreeInos on structural faults.
-				verifyBtreeStructures(fs, ino, in, blockSize)
 
 				// Collect trie root for directory trie walking.  A directory
 				// with DirTrieRoot == 0 is an empty directory whose trie root
@@ -275,42 +274,94 @@ func checkExtent(fs *fsckState, ino uint64, ext briefs.Extent) (phys, length uin
 	return 0, 0, false
 }
 
-// collectInodeExtents collects all blocks referenced by an inode's extents
-// (and, for tree-backed inodes, the B-tree node blocks themselves) into
-// fs.usedBlocks for cross-referencing against the allocator bitmap.
+// collectInodeExtents walks an inode's extents once and records:
+//   - every referenced block (the extents', and for tree-backed inodes the
+//     B-tree node blocks') in fs.usedBlocks for the allocator cross-reference;
+//   - the extent list in fs.inodeExtents for the overlap pass;
+//   - structural faults of a tree-backed index in fs.failedBtreeInos.
+//
+// For tree-backed inodes this is the single walk that used to be three
+// (block collection, structural verify, overlap collection). Engine faults
+// (read, magic, checksum, fanout, within-leaf ordering, cycle, depth) abort
+// the walk under the strict policy, exactly as the block-collection walk
+// always did; the deeper structural checks (level ordering, separators,
+// cross-leaf ordering, null children, extent count) record the first fault
+// and let the walk finish so usedBlocks stays complete — the inode is then
+// failed exactly as the second, structural walk used to fail it.
 func collectInodeExtents(fs *fsckState, ino uint64, in *briefs.Inode, blockSize uint64) {
 	// Inline-data inodes reference no data blocks.
 	if in.Flags&briefs.InodeFlagInlineData != 0 {
 		return
 	}
 
-	// Record the blocks from a single extent.
-	addExtentBlocks := func(ext briefs.Extent) error {
+	markExtent := func(ext briefs.Extent) {
 		if phys, length, ok := checkExtent(fs, ino, ext); ok {
 			fs.usedBlocks.markRange(phys, length)
+			fs.inodeExtents[ino] = append(fs.inodeExtents[ino], ext)
 		}
-		return nil
 	}
 
-	// Record every B-tree node block as used metadata.
-	addNodeBlock := func(block uint64) error {
-		fs.usedBlocks.mark(block)
-		return nil
+	// Inline-only: walk the inline array. There is no tree to verify, and
+	// walk errors carry no destructive allocator risk.
+	if in.Flags&briefs.InodeFlagIndexed == 0 {
+		if err := briefs.IterateInodeExtents(fs.file, in, blockSize, briefs.InodeExtentVisitor{
+			VisitExtent: func(ext briefs.Extent) error {
+				markExtent(ext)
+				return nil
+			},
+		}); err != nil {
+			fs.errorf("ino %d: %v", ino, err)
+		}
+		return
 	}
 
-	if err := briefs.IterateInodeExtents(fs.file, in, blockSize, briefs.InodeExtentVisitor{
-		VisitNode:   addNodeBlock,
-		VisitExtent: addExtentBlocks,
-	}); err != nil {
+	root := in.ExtentInlineBase
+	if root == 0 {
+		return // verifyInode rejects this already
+	}
+
+	s := &btreeVerifyState{fs: fs, ino: ino}
+	err := briefs.WalkBtree(fs.file, root, briefs.BtreeWalkOptions{
+		BlockSize: blockSize,
+		VerifyCRC: true,
+	}, briefs.BtreeNodeVisitor{
+		VisitNode: func(info briefs.BtreeNodeInfo) error {
+			fs.usedBlocks.mark(info.Block)
+			if serr := s.visitNode(info); serr != nil {
+				s.recordFault(serr)
+			}
+			return nil
+		},
+		VisitLeaf: func(info briefs.BtreeNodeInfo, extents []briefs.Extent) error {
+			if serr := s.visitLeaf(info, extents); serr != nil {
+				s.recordFault(serr)
+			}
+			for _, ext := range extents {
+				markExtent(ext)
+			}
+			return nil
+		},
+	})
+	if err != nil {
 		fs.errorf("ino %d: %v", ino, err)
-		// Record tree-backed inodes whose B+ tree walk failed. Their extents
-		// and node blocks were not reached, so they are absent from usedBlocks;
-		// an allocator rebuild would free them. Inline-only walk errors (the
-		// inline-array path) don't carry this destructive risk, so only flag
-		// InodeFlagIndexed inodes here.
-		if in.Flags&briefs.InodeFlagIndexed != 0 {
-			fs.failedBtreeInos[ino] = true
-		}
+		// Record tree-backed inodes whose walk failed. Their extents and node
+		// blocks were not all reached, so an allocator rebuild would free
+		// live data.
+		fs.failedBtreeInos[ino] = true
+		return
+	}
+	if s.fault != nil {
+		// Structural fault: the walk finished (blocks stay recorded), but
+		// the index is corrupt — fail the inode so the repair gate refuses
+		// an allocator rebuild over it.
+		fs.errorf("ino %d: %v", ino, s.fault)
+		fs.failedBtreeInos[ino] = true
+		return
+	}
+	if uint64(s.count) != in.NumExtentsTotal {
+		fs.errorf("ino %d: %v (walked %d, num_extents_total %d)",
+			ino, briefs.ErrBtreeCountMismatch, s.count, in.NumExtentsTotal)
+		fs.failedBtreeInos[ino] = true
 	}
 }
 
