@@ -34,7 +34,7 @@ func TestCallerHasCap(t *testing.T) {
 	injectCallerStatus(t, callerStatus{capEff: capsBoth}, true)
 
 	ctx := callerCtx(1000, 1000, 1234)
-	if !callerHasCap(ctx, capFSetIDBit) {
+	if !loadCallerCheck(ctx).hasCap(capFSetIDBit) {
 		t.Fatalf("CAP_FSETID reported missing")
 	}
 	if !callerCapSysAdmin(ctx) {
@@ -42,23 +42,23 @@ func TestCallerHasCap(t *testing.T) {
 	}
 
 	injectCallerStatus(t, callerStatus{capEff: 1 << capSysAdminBit}, true)
-	if callerHasCap(ctx, capFSetIDBit) {
+	if loadCallerCheck(ctx).hasCap(capFSetIDBit) {
 		t.Fatalf("CAP_FSETID reported held")
 	}
 
 	// No caller in the context (unit tests, direct internal calls):
 	// unprivileged.
-	if callerHasCap(context.Background(), capFSetIDBit) {
+	if loadCallerCheck(context.Background()).hasCap(capFSetIDBit) {
 		t.Fatalf("no-caller context reported privileged")
 	}
 	// Caller with pid 0: unprivileged.
-	if callerHasCap(callerCtx(0, 0, 0), capSysAdminBit) {
+	if loadCallerCheck(callerCtx(0, 0, 0)).hasCap(capSysAdminBit) {
 		t.Fatalf("pid 0 caller reported privileged")
 	}
 	// Unreadable /proc (exited caller, different pid namespace):
 	// unprivileged.
 	injectCallerStatus(t, callerStatus{}, false)
-	if callerHasCap(ctx, capFSetIDBit) {
+	if loadCallerCheck(ctx).hasCap(capFSetIDBit) {
 		t.Fatalf("unreadable status reported privileged")
 	}
 }
@@ -81,22 +81,22 @@ func TestCallerInGroup(t *testing.T) {
 	injectCallerStatus(t, callerStatus{groups: []uint32{1001, 1002}}, true)
 
 	// egid match (the FUSE header's Gid).
-	if !callerInGroup(callerCtx(1000, 1002, 1234), 1002) {
+	if !loadCallerCheck(callerCtx(1000, 1002, 1234)).inGroup(1002) {
 		t.Fatalf("egid match reported not-in-group")
 	}
 	// Supplementary-group match.
-	if !callerInGroup(callerCtx(1000, 1000, 1234), 1001) {
+	if !loadCallerCheck(callerCtx(1000, 1000, 1234)).inGroup(1001) {
 		t.Fatalf("supplementary-group match reported not-in-group")
 	}
-	if callerInGroup(callerCtx(1000, 1000, 1234), 5) {
+	if loadCallerCheck(callerCtx(1000, 1000, 1234)).inGroup(5) {
 		t.Fatalf("no match reported in-group")
 	}
 	// No caller / unreadable: not-in-group.
-	if callerInGroup(context.Background(), 0) {
+	if loadCallerCheck(context.Background()).inGroup(0) {
 		t.Fatalf("no-caller context reported in-group(0)")
 	}
 	injectCallerStatus(t, callerStatus{}, false)
-	if callerInGroup(callerCtx(1000, 1000, 1234), 0) {
+	if loadCallerCheck(callerCtx(1000, 1000, 1234)).inGroup(0) {
 		t.Fatalf("unreadable status reported in-group(0)")
 	}
 }

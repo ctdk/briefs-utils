@@ -82,23 +82,57 @@ func readProcCallerStatus(pid uint32) (callerStatus, bool) {
 	return st, true
 }
 
-// loadCallerStatus resolves the request's caller and reads its status.
-func loadCallerStatus(ctx context.Context) (callerStatus, bool) {
-	caller, ok := fuse.FromContext(ctx)
-	if !ok || caller == nil || caller.Pid == 0 {
-		return callerStatus{}, false
-	}
-	return procCallerStatus(caller.Pid)
+// callerCheck bundles one op's caller state: the FUSE header's egid plus
+// the /proc status, read once. removePrivs and the POSIX-ACL chmod gate on
+// two fields each; without the bundle every query would be its own
+// /proc/<tid>/status read. Every fallback is the zero value — a missing
+// caller, or an unreadable status, has no capabilities, no supplementary
+// groups, and umask 0 — so the queries need no distinct error paths.
+type callerCheck struct {
+	haveEgid bool   // the FUSE header carried a caller
+	egid     uint32 // the header's Gid (the caller's egid)
+	status   callerStatus
 }
 
-// callerHasCap reports whether the request's caller holds the given
-// capability bit. A caller whose status cannot be read is unprivileged.
-func callerHasCap(ctx context.Context, bit uint) bool {
-	st, ok := loadCallerStatus(ctx)
-	if !ok {
-		return false
+// loadCallerCheck reads the caller's state once for an op's queries.
+func loadCallerCheck(ctx context.Context) callerCheck {
+	caller, ok := fuse.FromContext(ctx)
+	if !ok || caller == nil {
+		return callerCheck{}
 	}
-	return st.capEff&(1<<bit) != 0
+	cc := callerCheck{haveEgid: true, egid: caller.Gid}
+	if caller.Pid != 0 {
+		cc.status, _ = procCallerStatus(caller.Pid)
+	}
+	return cc
+}
+
+// hasCap reports whether the caller holds the given capability bit. A
+// caller whose status cannot be read is unprivileged.
+func (cc callerCheck) hasCap(bit uint) bool {
+	return cc.status.capEff&(1<<bit) != 0
+}
+
+// umask returns the caller's umask. An unreadable status means no masking
+// (umask 0); unreachable live, see the package comment.
+func (cc callerCheck) umask() uint32 {
+	return cc.status.umask
+}
+
+// inGroup reports whether the caller's egid (the FUSE header's Gid) or any
+// supplementary group equals gid — in_group_p's check. An unreadable
+// status is not-in-group (the safe direction for the sgid killpriv
+// decision, which errs toward clearing).
+func (cc callerCheck) inGroup(gid uint32) bool {
+	if cc.haveEgid && cc.egid == gid {
+		return true
+	}
+	for _, g := range cc.status.groups {
+		if g == gid {
+			return true
+		}
+	}
+	return false
 }
 
 // callerCapSysAdmin reports whether the caller holds CAP_SYS_ADMIN, the
@@ -106,35 +140,11 @@ func callerHasCap(ctx context.Context, bit uint) bool {
 // :304). FUSE performs no capability check on the daemon's behalf, so the
 // bridge must.
 func callerCapSysAdmin(ctx context.Context) bool {
-	return callerHasCap(ctx, capSysAdminBit)
+	return loadCallerCheck(ctx).hasCap(capSysAdminBit)
 }
 
 // callerUmask returns the caller's umask. An unreadable status means no
 // masking (umask 0); unreachable live, see the package comment.
 func callerUmask(ctx context.Context) uint32 {
-	st, ok := loadCallerStatus(ctx)
-	if !ok {
-		return 0
-	}
-	return st.umask
-}
-
-// callerInGroup reports whether the caller's egid (the FUSE header's Gid)
-// or any supplementary group equals gid — in_group_p's check. An
-// unreadable status is not-in-group (the safe direction for the sgid
-// killpriv decision, which errs toward clearing).
-func callerInGroup(ctx context.Context, gid uint32) bool {
-	if caller, ok := fuse.FromContext(ctx); ok && caller != nil && caller.Gid == gid {
-		return true
-	}
-	st, ok := loadCallerStatus(ctx)
-	if !ok {
-		return false
-	}
-	for _, g := range st.groups {
-		if g == gid {
-			return true
-		}
-	}
-	return false
+	return loadCallerCheck(ctx).umask()
 }

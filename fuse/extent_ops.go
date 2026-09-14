@@ -1078,13 +1078,16 @@ func (b *BrieFS) removePrivs(ctx context.Context, in *briefs.Inode) error {
 	if in.Filemode&briefs.ModeTypeMask != briefs.ModeFile {
 		return nil
 	}
-	if !callerHasCap(ctx, capFSetIDBit) {
+	// One caller-state read serves both gates: CAP_FSETID, and — when it
+	// is absent — the group membership for the sgid rule.
+	caller := loadCallerCheck(ctx)
+	if !caller.hasCap(capFSetIDBit) {
 		var clear uint32
 		if in.Filemode&s_ISUID != 0 {
 			clear = s_ISUID
 		}
 		if in.Filemode&s_ISGID != 0 &&
-			(in.Filemode&s_IXGRP != 0 || !callerInGroup(ctx, in.Gid)) {
+			(in.Filemode&s_IXGRP != 0 || !caller.inGroup(in.Gid)) {
 			clear |= s_ISGID
 		}
 		in.Filemode &^= clear

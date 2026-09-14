@@ -190,7 +190,10 @@ func (b *BrieFS) setXattrOp(ctx context.Context, ino uint64, name string, value 
 	// same trick removePrivs uses for killpriv). Setid and type bits pass
 	// through untouched.
 	in.Filemode = (in.Filemode &^ sIRWXUGO) | accessAclMode(acl)
-	if !callerInGroup(ctx, in.Gid) && !callerHasCap(ctx, capFOwnerBit) {
+	// One caller-state read serves both gates (group membership and
+	// CAP_FOWNER, in_group_or_capable).
+	caller := loadCallerCheck(ctx)
+	if !caller.inGroup(in.Gid) && !caller.hasCap(capFOwnerBit) {
 		in.Filemode &^= s_ISGID
 	}
 	return b.setXattrLocked(in, name, value, flags)
