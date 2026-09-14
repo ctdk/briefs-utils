@@ -31,6 +31,13 @@ type fsckState struct {
 	// runs when no verify walk failed, so the cached lists are complete.
 	// Reset by every verification pass.
 	dirEntries map[uint64][]trieEntry
+	// allocPools caches each allocator pool (header plus 3-level bitmap),
+	// read once per verification pass by allocatorPool and consumed by every
+	// check that needs a pool's header or bits. Cleared at the start of each
+	// pass, so the post-repair pass re-reads the pools repair rewrote. The
+	// selective repair phases alias the cached words into their
+	// AllocBuilders, which mutate them in memory only.
+	allocPools map[uint64]*allocPool
 	// Tracks directories where trie walk had structural errors (bad magic, etc.)
 	failedTrieDirs map[uint64]bool // ino -> true if trie walk had unrecoverable errors
 	// Tracks tree-backed inodes whose B+ tree extent index walk had structural

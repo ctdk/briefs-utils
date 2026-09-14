@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -186,14 +187,17 @@ func main() {
 			}
 			defer file.Close()
 
-			// Probe the device size using seeking (works for both regular
+			// Probe the device size by seeking (works for both regular
 			// files and block devices; os.Stat().Size() returns 0 for
-			// block devices).
-			bd, err := device.GetDevice(path, 4096)
+			// block devices). Seeking on the already-open device avoids
+			// opening the same path a second time just to learn its size.
+			deviceSize, err := file.Seek(0, io.SeekEnd)
 			if err != nil {
 				return fmt.Errorf("probe device size: %w", err)
 			}
-			deviceSize := bd.Bytes()
+			if deviceSize <= 0 {
+				return fmt.Errorf("probe device size: seek end returned %d, which is invalid", deviceSize)
+			}
 
 			fs := &fsckState{
 				file:    file,

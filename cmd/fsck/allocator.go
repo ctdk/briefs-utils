@@ -15,12 +15,41 @@ const bytesPerWord = 8
 const bitsPerByte = 8
 const wordBits = bytesPerWord * bitsPerByte
 
-// verifyAllocatorPool reads and prints the allocator pool header.
-func verifyAllocatorPool(file *os.File, poolBlock, blockSize uint64, label string) error {
-	hdr, err := briefs.ReadAllocatorHeader(file, poolBlock, blockSize)
-	if err != nil {
-		return err
+// allocPool is one allocator pool's header and all three bitmap levels,
+// read from disk once and shared by every consumer of a verification pass.
+type allocPool struct {
+	l0, l1, l2 []uint64
+	hdr        *briefs.AllocHeader
+	err        error // read failure; hdr and the words are nil then
+}
+
+// allocatorPool returns the pool at poolBlock, reading it from disk on
+// first use. One verification pass touches each pool many times — header
+// print, bitmap pyramid check, inode-table slot filter, block
+// cross-reference, free-count cross-check, extent-region bound — and the
+// selective repair phases load the same pools again; the cache turns all
+// of those into one read per pool per pass. runVerificationPass clears it
+// so the post-repair pass re-reads the pools repair rewrote.
+func (fs *fsckState) allocatorPool(poolBlock uint64) *allocPool {
+	if fs.allocPools == nil {
+		fs.allocPools = make(map[uint64]*allocPool)
 	}
+	if p, ok := fs.allocPools[poolBlock]; ok {
+		return p
+	}
+	p := &allocPool{}
+	p.l0, p.l1, p.l2, p.hdr, p.err = briefs.ReadAllocatorBitmap(fs.file, poolBlock, fs.sb.BlockSize)
+	fs.allocPools[poolBlock] = p
+	return p
+}
+
+// verifyAllocatorPool reads and prints the allocator pool header.
+func verifyAllocatorPool(fs *fsckState, poolBlock uint64, label string) error {
+	p := fs.allocatorPool(poolBlock)
+	if p.err != nil {
+		return p.err
+	}
+	hdr := p.hdr
 
 	fmt.Fprintf(os.Stderr, "  %s: pool at block %d, %d entries, %d free\n", label, poolBlock, hdr.BlockCount, hdr.FreeCount)
 	fmt.Fprintf(os.Stderr, "    levels: L0=%d words, L1=%d words, L2=%d words\n", hdr.L0Words, hdr.L1Words, hdr.L2Words)
@@ -35,15 +64,16 @@ func verifyAllocatorPool(file *os.File, poolBlock, blockSize uint64, label strin
 //   - Trailing bits in the last L0/L1/L2 word are properly masked
 //   - Computed free count from L2 matches the header's free count
 //   - The header's free count matches the superblock's expectation (sbExpectedFree)
-func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize, sbExpectedFree uint64, label string) {
+func verifyAllocatorBitmap(fs *fsckState, poolBlock, sbExpectedFree uint64, label string) {
 	errorReportLimit := 10
 
-	// Read the header and all three bitmap levels through the shared codec.
-	l0, l1, l2, hdr, err := briefs.ReadAllocatorBitmap(fs.file, poolBlock, blockSize)
-	if err != nil {
-		fs.errorf("%s: read allocator bitmap: %v", label, err)
+	// The header and all three bitmap levels, read once per pass.
+	p := fs.allocatorPool(poolBlock)
+	if p.err != nil {
+		fs.errorf("%s: read allocator bitmap: %v", label, p.err)
 		return
 	}
+	l0, l1, l2, hdr := p.l0, p.l1, p.l2, p.hdr
 	l0w := hdr.L0Words
 	l1w := hdr.L1Words
 	l2w := hdr.L2Words
@@ -148,29 +178,24 @@ func verifyAllocatorBitmap(fs *fsckState, poolBlock, blockSize, sbExpectedFree u
 		label, l0w, l1w, l2w, computedFree)
 }
 
-// readAllocatorL2 reads the L2 bitmap words from an allocator pool.
-func readAllocatorL2(file *os.File, poolBlock, blockSize uint64) (l2 []uint64, blockCount uint64, err error) {
-	_, _, l2, hdr, err := briefs.ReadAllocatorBitmap(file, poolBlock, blockSize)
-	if err != nil {
-		return nil, 0, err
-	}
-	return l2, hdr.BlockCount, nil
-}
-
 // verifySuperblockFreeCounts cross-checks the superblock free counts against
-// the allocator headers and the actual inode/found counts.
+// the allocator headers and the actual inode/found counts. The headers come
+// from the pass-cached pools (a header read failure was already reported by
+// whichever pool consumer touched it first, so err is silently skipped here
+// exactly as before).
 func verifySuperblockFreeCounts(fs *fsckState, totalInodesFound int) {
 	// Read data allocator free count
-	if hdr, err := briefs.ReadAllocatorHeader(fs.file, fs.sb.TrieNodePoolStart, fs.sb.BlockSize); err == nil {
-		if hdr.FreeCount != fs.sb.FreeDataBlks {
+	if p := fs.allocatorPool(fs.sb.TrieNodePoolStart); p.err == nil {
+		if p.hdr.FreeCount != fs.sb.FreeDataBlks {
 			fs.errorf("superblock free data blocks mismatch: superblock says %d, allocator says %d",
-				fs.sb.FreeDataBlks, hdr.FreeCount)
+				fs.sb.FreeDataBlks, p.hdr.FreeCount)
 		}
 	}
 
-	// Read the inode allocator header once: its free count cross-checks the
+	// The inode allocator header: its free count cross-checks the
 	// superblock, and its block count drives the in-use tally below.
-	if inoHdr, err := briefs.ReadAllocatorHeader(fs.file, fs.sb.InodeBMOffset, fs.sb.BlockSize); err == nil {
+	if p := fs.allocatorPool(fs.sb.InodeBMOffset); p.err == nil {
+		inoHdr := p.hdr
 		if inoHdr.FreeCount != fs.sb.FreeInodes {
 			fs.errorf("superblock free inodes mismatch: superblock says %d, allocator says %d",
 				fs.sb.FreeInodes, inoHdr.FreeCount)

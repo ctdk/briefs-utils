@@ -10,13 +10,15 @@ import (
 )
 
 // readJournalMagic reads the first 4 bytes of the given journal block and
-// returns the magic value, or an error if the block cannot be read.
+// returns the magic value, or an error if the block cannot be read. Only the
+// 4 magic bytes are read — the two checkpoint-block probes per run have no
+// use for the rest of the block.
 func readJournalMagic(file *os.File, block, blockSize uint64) (uint32, error) {
-	buf := make([]byte, blockSize)
-	if _, err := file.ReadAt(buf, int64(block*blockSize)); err != nil {
+	var magic [4]byte
+	if _, err := file.ReadAt(magic[:], int64(block*blockSize)); err != nil {
 		return 0, err
 	}
-	return binary.LittleEndian.Uint32(buf[0:]), nil
+	return binary.LittleEndian.Uint32(magic[:]), nil
 }
 
 // verifyJournal checks the journal checkpoint block and detects dirty

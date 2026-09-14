@@ -16,14 +16,16 @@ import (
 // The data allocator tracks data-relative block numbers (0 = first block of
 // the data region). The absolute block number of the first data block is
 // TrieNodePoolStart + TrieNodePoolSize.
-func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
+func verifyBlockCrossReference(fs *fsckState) {
 	dataRegionStart := fs.dataRegionStart()
 
-	l2, dataBlockCount, err := readAllocatorL2(fs.file, fs.sb.TrieNodePoolStart, blockSize)
-	if err != nil {
-		fs.errorf("block cross-ref: %v", err)
+	pool := fs.allocatorPool(fs.sb.TrieNodePoolStart)
+	if pool.err != nil {
+		fs.errorf("block cross-ref: %v", pool.err)
 		return
 	}
+	l2 := pool.l2
+	dataBlockCount := pool.hdr.BlockCount
 
 	// Check 1: Blocks used by inodes/tries that are NOT marked allocated.
 	// The allocator bitmap itself is the membership structure (allocated =
@@ -304,8 +306,8 @@ func verifyExtentOverlaps(fs *fsckState) {
 	// verifyInodeTable scans with.
 	itStart := fs.sb.InodeTableOffset
 	itEnd := itStart
-	if hdr, err := briefs.ReadAllocatorHeader(fs.file, fs.sb.InodeBMOffset, fs.sb.BlockSize); err == nil {
-		itEnd = itStart + (hdr.BlockCount*fs.sb.InodeSize+fs.sb.BlockSize-1)/fs.sb.BlockSize
+	if p := fs.allocatorPool(fs.sb.InodeBMOffset); p.err == nil {
+		itEnd = itStart + (p.hdr.BlockCount*fs.sb.InodeSize+fs.sb.BlockSize-1)/fs.sb.BlockSize
 	}
 	regions = append(regions, region{"inode table", itStart, itEnd})
 

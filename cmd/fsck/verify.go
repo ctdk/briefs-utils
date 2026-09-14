@@ -3,8 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-
-	"github.com/ctdk/briefs-utils/briefs"
 )
 
 // runVerificationPass runs the read-only checks and populates fsckState.
@@ -15,30 +13,34 @@ func runVerificationPass(fs *fsckState, blockSize, inodeSize uint64) int {
 	file := fs.file
 	sb := fs.sb
 
+	// Drop any cached allocator pools: the post-repair pass must re-read the
+	// pools repair rewrote (see fsckState.allocPools).
+	fs.allocPools = nil
+
 	// 1. Superblock fields have already been read and validated.
 
 	// 2. Allocator pools
 	fmt.Fprintf(os.Stderr, "\nInode bitmap:\n")
-	if err := verifyAllocatorPool(file, sb.InodeBMOffset, blockSize, "inode bitmap"); err != nil {
+	if err := verifyAllocatorPool(fs, sb.InodeBMOffset, "inode bitmap"); err != nil {
 		fs.errorf("%v", err)
 	}
 
 	fmt.Fprintf(os.Stderr, "\nData block allocator:\n")
-	if err := verifyAllocatorPool(file, sb.TrieNodePoolStart, blockSize, "data allocator"); err != nil {
+	if err := verifyAllocatorPool(fs, sb.TrieNodePoolStart, "data allocator"); err != nil {
 		fs.errorf("%v", err)
 	}
 
-	verifyAllocatorBitmap(fs, sb.InodeBMOffset, blockSize, sb.FreeInodes, "inode")
+	verifyAllocatorBitmap(fs, sb.InodeBMOffset, sb.FreeInodes, "inode")
 
-	verifyAllocatorBitmap(fs, sb.TrieNodePoolStart, blockSize, sb.FreeDataBlks, "data")
+	verifyAllocatorBitmap(fs, sb.TrieNodePoolStart, sb.FreeDataBlks, "data")
 
 	// 3. Inode table
 	inodeTableStart := sb.InodeTableOffset
 	var inodeTableBlocks uint64
-	if inoHdr, err := briefs.ReadAllocatorHeader(file, sb.InodeBMOffset, blockSize); err != nil {
-		fs.errorf("read inode allocator header: %v", err)
+	if p := fs.allocatorPool(sb.InodeBMOffset); p.err != nil {
+		fs.errorf("read inode allocator header: %v", p.err)
 	} else {
-		inodeTableBlocks = (inoHdr.BlockCount*sb.InodeSize + blockSize - 1) / blockSize
+		inodeTableBlocks = (p.hdr.BlockCount*sb.InodeSize + blockSize - 1) / blockSize
 	}
 	fmt.Fprintf(os.Stderr, "\nInode table:\n")
 	fmt.Fprintf(os.Stderr, "  start block: %d\n", inodeTableStart)
@@ -82,7 +84,7 @@ func runVerificationPass(fs *fsckState, blockSize, inodeSize uint64) int {
 	// scan already visits every bitmap-allocated slot, so a second full
 	// inode-table read would buy nothing.)
 	fmt.Fprintf(os.Stderr, "\nCross-referencing:\n")
-	verifyBlockCrossReference(fs, blockSize)
+	verifyBlockCrossReference(fs)
 	verifySuperblockFreeCounts(fs, totalInodes)
 	verifyDirEntryCrossReference(fs, allEntries)
 	verifyDuplicateNames(fs, allEntries)
