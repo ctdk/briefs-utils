@@ -131,8 +131,7 @@ func (b *BrieFS) fallocateOp(ctx context.Context, ino uint64, off, size uint64, 
 	end := off + size
 	var allocated runAccum
 	if in.Flags&briefs.InodeFlagInlineData != 0 && end > inlineDataMax {
-		var drain []uint64
-		if err := b.promoteInlineData(in, &drain, &allocated); err != nil {
+		if err := b.promoteInlineData(in, &allocated); err != nil {
 			b.rollbackAlloc(allocated)
 			return err
 		}
@@ -246,8 +245,7 @@ func (b *BrieFS) preallocate(in *briefs.Inode, start, end uint64, mode uint32, a
 	in.CtimeSec, in.CtimeNsec = sec, nsec
 
 	// Rebuild the index (new btree nodes are added to allocated) and commit.
-	var drain []uint64
-	if err := b.rebuildExtentIndex(in, exts, oldNodes, &drain, allocated); err != nil {
+	if err := b.rebuildExtentIndex(in, exts, oldNodes, allocated); err != nil {
 		b.rollbackAlloc(*allocated)
 		return err
 	}
@@ -386,8 +384,7 @@ func (b *BrieFS) punchHole(in *briefs.Inode, off, size uint64) error {
 
 	if extentChanged {
 		var allocated runAccum
-		var drain []uint64
-		if err := b.rebuildExtentIndex(in, newExts, oldNodes, &drain, &allocated); err != nil {
+		if err := b.rebuildExtentIndex(in, newExts, oldNodes, &allocated); err != nil {
 			b.rollbackAlloc(allocated)
 			return err
 		}
@@ -537,8 +534,7 @@ func (b *BrieFS) collapseRangeOp(in *briefs.Inode, off, size uint64) error {
 	in.CtimeSec, in.CtimeNsec = sec, nsec
 
 	var allocated runAccum
-	var drain []uint64
-	if err := b.rebuildExtentIndex(in, newExts, oldNodes, &drain, &allocated); err != nil {
+	if err := b.rebuildExtentIndex(in, newExts, oldNodes, &allocated); err != nil {
 		b.rollbackAlloc(allocated)
 		return err
 	}
@@ -584,8 +580,7 @@ func (b *BrieFS) insertRangeOp(in *briefs.Inode, off, size uint64) error {
 	in.CtimeSec, in.CtimeNsec = sec, nsec
 
 	var allocated runAccum
-	var drain []uint64
-	if err := b.rebuildExtentIndex(in, newExts, oldNodes, &drain, &allocated); err != nil {
+	if err := b.rebuildExtentIndex(in, newExts, oldNodes, &allocated); err != nil {
 		b.rollbackAlloc(allocated)
 		return err
 	}
@@ -623,8 +618,7 @@ func (b *BrieFS) zeroRangeOp(in *briefs.Inode, off, size uint64, mode uint32) er
 		}
 		// Promote to extent-backed, then take the extent path below; the
 		// promoted block joins this op's rollback/journal list.
-		var drain []uint64
-		if err := b.promoteInlineData(in, &drain, &allocated); err != nil {
+		if err := b.promoteInlineData(in, &allocated); err != nil {
 			b.rollbackAlloc(allocated)
 			return err
 		}
@@ -772,8 +766,7 @@ func (b *BrieFS) zeroRangeOp(in *briefs.Inode, off, size uint64, mode uint32) er
 	grew := false
 	if mode&fallocKeepSize == 0 && end > in.FileSize {
 		if oldSize%bs != 0 && oldSize/bs < sFull {
-			var drain []uint64
-			if err := b.zeroEofTail(exts, int64(oldSize), &drain); err != nil {
+			if err := b.zeroEofTail(exts, int64(oldSize)); err != nil {
 				b.rollbackAlloc(allocated)
 				return err
 			}
@@ -789,8 +782,7 @@ func (b *BrieFS) zeroRangeOp(in *briefs.Inode, off, size uint64, mode uint32) er
 	}
 
 	if converted {
-		var drain []uint64
-		if err := b.rebuildExtentIndex(in, newExts, oldNodes, &drain, &allocated); err != nil {
+		if err := b.rebuildExtentIndex(in, newExts, oldNodes, &allocated); err != nil {
 			b.rollbackAlloc(allocated)
 			return err
 		}
@@ -1085,8 +1077,7 @@ func (b *BrieFS) truncateLocked(ctx context.Context, in *briefs.Inode, newSize u
 		in.MtimeSec, in.MtimeNsec = sec, nsec
 		in.CtimeSec, in.CtimeNsec = sec, nsec
 		var allocated runAccum
-		var drain []uint64
-		if err := b.rebuildExtentIndex(in, newExts, oldNodes, &drain, &allocated); err != nil {
+		if err := b.rebuildExtentIndex(in, newExts, oldNodes, &allocated); err != nil {
 			b.rollbackAlloc(allocated)
 			return err
 		}
@@ -1121,8 +1112,7 @@ func (b *BrieFS) truncateLocked(ctx context.Context, in *briefs.Inode, newSize u
 	// before a down-truncate.
 	var allocated runAccum
 	if in.Flags&briefs.InodeFlagInlineData != 0 && newSize > inlineDataMax {
-		var drain []uint64
-		if err := b.promoteInlineData(in, &drain, &allocated); err != nil {
+		if err := b.promoteInlineData(in, &allocated); err != nil {
 			b.rollbackAlloc(allocated)
 			return err
 		}

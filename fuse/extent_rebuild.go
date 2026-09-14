@@ -250,10 +250,10 @@ func (b *BrieFS) buildLeafBuf(chunk []briefs.Extent, next uint64) []byte {
 // JRN_EXTENT_FREE and free after the commit: for a localized rebuild
 // the replaced leaf blocks plus the old index blocks; for the fallback
 // shapes every old node block.
-func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, exts []briefs.Extent, drain *[]uint64, allocated *runAccum) ([]uint64, error) {
+func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, exts []briefs.Extent, allocated *runAccum) ([]uint64, error) {
 	// The full rebuild's dismantle and inline cases, verbatim.
 	if len(exts) == 0 || len(exts) <= 8 && in.Flags&briefs.InodeFlagIndexed == 0 {
-		if err := b.rebuildExtentIndex(in, exts, tree.allNodes(), drain, allocated); err != nil {
+		if err := b.rebuildExtentIndex(in, exts, tree.allNodes(), allocated); err != nil {
 			return nil, err
 		}
 		return tree.allNodes(), nil
@@ -263,7 +263,7 @@ func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, ext
 	// against.  (An indexed inode whose walk found no leaves is
 	// inconsistent — take the full rebuild.)
 	if in.Flags&briefs.InodeFlagIndexed == 0 || len(tree.leaves) == 0 {
-		if err := b.rebuildExtentIndex(in, exts, tree.allNodes(), drain, allocated); err != nil {
+		if err := b.rebuildExtentIndex(in, exts, tree.allNodes(), allocated); err != nil {
 			return nil, err
 		}
 		return tree.allNodes(), nil
@@ -308,7 +308,6 @@ func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, ext
 		if err := b.dev.WriteBlock(leafBlocks[i], b.buildLeafBuf(newChunks[i], next)); err != nil {
 			return nil, err
 		}
-		*drain = append(*drain, leafBlocks[i])
 	}
 
 	// Index levels: always rebuilt fresh on top of the mixed leaf list.
@@ -332,7 +331,6 @@ func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, ext
 		if err := b.dev.WriteBlock(blk, idxBufs[i]); err != nil {
 			return nil, err
 		}
-		*drain = append(*drain, blk)
 	}
 
 	in.Flags |= briefs.InodeFlagIndexed

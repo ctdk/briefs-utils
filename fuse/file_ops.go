@@ -286,22 +286,20 @@ func (b *BrieFS) writeFileData(ctx context.Context, ino uint64, data []byte, off
 			return len(data), nil
 		}
 		// Write exceeds inline capacity: promote to extent-backed first.
-		var drain []uint64
 		var allocated runAccum
-		if err := b.promoteInlineData(in, &drain, &allocated); err != nil {
+		if err := b.promoteInlineData(in, &allocated); err != nil {
 			b.rollbackAlloc(allocated)
 			return 0, err
 		}
-		n, err := b.writeExtentData(in, data, off, oldSize, &drain, &allocated)
+		n, err := b.writeExtentData(in, data, off, oldSize, &allocated)
 		if err != nil {
 			return 0, err // writeExtentData cleaned up (rollback or read-only).
 		}
 		return n, nil
 	}
 
-	var drain []uint64
 	var allocated runAccum
-	n, err := b.writeExtentData(in, data, off, oldSize, &drain, &allocated)
+	n, err := b.writeExtentData(in, data, off, oldSize, &allocated)
 	if err != nil {
 		return 0, err
 	}
@@ -335,11 +333,11 @@ func (b *BrieFS) writeInlineData(in *briefs.Inode, data []byte, off, totalSize i
 // briefs_promote_inline_data (file.c:352). For a non-empty inline file it
 // allocates one data block, copies the old inline content into it, and sets a
 // single inline extent; for an empty file it just clears the flag. The
-// promoted block is written to the page cache and recorded in *drain (drained
-// before the commit by writeExtentData). The inode is mutated in memory only;
-// the caller persists it once at the end of the op. The caller must hold the
-// inode's inodeBlockLock.
-func (b *BrieFS) promoteInlineData(in *briefs.Inode, drain *[]uint64, allocated *runAccum) error {
+// promoted block is written to the page cache and recorded in the writeback
+// tracker (drained before the commit by writeExtentData). The inode is
+// mutated in memory only; the caller persists it once at the end of the op.
+// The caller must hold the inode's inodeBlockLock.
+func (b *BrieFS) promoteInlineData(in *briefs.Inode, allocated *runAccum) error {
 	oldSize := in.FileSize
 	// Capture the old inline content BEFORE clearing the region.
 	oldRegion := in.InlineData()
@@ -368,7 +366,6 @@ func (b *BrieFS) promoteInlineData(in *briefs.Inode, drain *[]uint64, allocated 
 	if err := b.dev.WriteBlock(abs, buf); err != nil {
 		return err
 	}
-	*drain = append(*drain, abs)
 
 	var exts [8]briefs.Extent
 	exts[0] = briefs.Extent{Offset: 0, Phys: abs, Len: 1, Flags: 0}
@@ -387,7 +384,7 @@ func (b *BrieFS) promoteInlineData(in *briefs.Inode, drain *[]uint64, allocated 
 // needs only the file's inodeBlockLock, not the global dir lock. The caller
 // must hold the inode's inodeBlockLock and pass the in-memory inode @in (mutated
 // in place; persisted once at the end).
-func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int64, drain *[]uint64, allocated *runAccum) (int, error) {
+func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int64, allocated *runAccum) (int, error) {
 	blockSize := int64(b.blockSize)
 
 	// --- Phase 1: allocate + write (no journaling) ---
@@ -407,7 +404,7 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 	// past it. BrieFS zeroes freshly allocated blocks, so this is usually a
 	// no-op; it covers blocks written by paths that did not zero the tail.
 	if off > oldSize && oldSize > 0 && oldSize%blockSize != 0 {
-		if err := b.zeroEofTail(exts, oldSize, drain); err != nil {
+		if err := b.zeroEofTail(exts, oldSize); err != nil {
 			b.rollbackAlloc(*allocated)
 			return 0, err
 		}
@@ -466,7 +463,6 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 				b.rollbackAlloc(*allocated)
 				return 0, err
 			}
-			*drain = append(*drain, abs)
 			// A write into an unwritten (fallocate) extent converts the written
 			// block to written and splits the extent: the blocks before/after stay
 			// unwritten (they still read as zeros). Clearing the flag on the whole
@@ -490,7 +486,6 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 				b.rollbackAlloc(*allocated)
 				return 0, err
 			}
-			*drain = append(*drain, abs)
 			exts = insertExtentSorted(exts, briefs.Extent{Offset: iblock, Phys: abs, Len: 1, Flags: 0})
 			rebuildNeeded = true
 		}
@@ -505,7 +500,7 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 	// hang (~61 leaf blocks rewritten per 512 B fragmented WRITE).
 	var oldNodesToFree []uint64
 	if rebuildNeeded {
-		oldNodesToFree, err = b.rebuildExtentIndexWrite(in, tree, exts, drain, allocated)
+		oldNodesToFree, err = b.rebuildExtentIndexWrite(in, tree, exts, allocated)
 		if err != nil {
 			b.rollbackAlloc(*allocated)
 			return 0, err
@@ -704,9 +699,9 @@ func (b *BrieFS) zeroBlockTail(abs uint64, from uint64) error {
 // zeroEofTail zeroes [oldSize, block_end) of the block containing oldSize,
 // mirroring briefs_zero_eof_tail (file.c:61). Defensive: BrieFS zeroes freshly
 // allocated blocks, so the tail is already zero unless a prior writer left it.
-// The written block is added to the caller's drain list (fdatasynced with the
-// rest of the operation's data).
-func (b *BrieFS) zeroEofTail(exts []briefs.Extent, oldSize int64, drain *[]uint64) error {
+// The write lands in the page cache / writeback tracker and is made durable
+// with the rest of the operation's data.
+func (b *BrieFS) zeroEofTail(exts []briefs.Extent, oldSize int64) error {
 	blockSize := int64(b.blockSize)
 	eofBlock := uint64((oldSize - 1) / blockSize)
 	ext, found := lookupExtent(exts, eofBlock)
@@ -714,22 +709,19 @@ func (b *BrieFS) zeroEofTail(exts []briefs.Extent, oldSize int64, drain *[]uint6
 		return nil // nothing mapped at EOF
 	}
 	abs := ext.Phys + (eofBlock - ext.Offset)
-	if err := b.zeroBlockTail(abs, uint64(oldSize%blockSize)); err != nil {
-		return err
-	}
-	*drain = append(*drain, abs)
-	return nil
+	return b.zeroBlockTail(abs, uint64(oldSize%blockSize))
 }
 
 // rebuildExtentIndex stores the (possibly changed) extent list back into the
 // inode: inline if it fits in 8 extents and the inode is not already
 // tree-backed, otherwise a full B+ tree rebuild. The rebuild allocates fresh
 // node blocks (the old ones are freed by the caller after the commit), writes
-// them to the page cache (recorded in *drain), and records new allocations in
-// *allocated for journaling/rollback. Mirrors btree_spill_inline (btree.c:861)
+// them to the page cache (tracked by the writeback tracker, drained before
+// the commit), and records new allocations in *allocated for
+// journaling/rollback. Mirrors btree_spill_inline (btree.c:861)
 // generalized to a full rebuild on every index change (valid under
 // drain-before-snapshot; the incremental insert is deferred).
-func (b *BrieFS) rebuildExtentIndex(in *briefs.Inode, exts []briefs.Extent, oldNodes []uint64, drain *[]uint64, allocated *runAccum) error {
+func (b *BrieFS) rebuildExtentIndex(in *briefs.Inode, exts []briefs.Extent, oldNodes []uint64, allocated *runAccum) error {
 	// The tree this rebuild replaces is no longer the on-disk tree once the
 	// new one publishes; drop any cached walk of it (the localized path
 	// stores its own replacement instead).
@@ -784,13 +776,11 @@ func (b *BrieFS) rebuildExtentIndex(in *briefs.Inode, exts []briefs.Extent, oldN
 		if err := b.dev.WriteBlock(blk, leafBufs[i]); err != nil {
 			return err
 		}
-		*drain = append(*drain, blk)
 	}
 	for i, blk := range idxBlocks {
 		if err := b.dev.WriteBlock(blk, idxBufs[i]); err != nil {
 			return err
 		}
-		*drain = append(*drain, blk)
 	}
 
 	in.Flags |= briefs.InodeFlagIndexed
