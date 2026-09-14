@@ -5,19 +5,20 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
-	"github.com/ctdk/briefs-utils/fuse"
 	"github.com/ctdk/briefs-utils/briefs"
+	"github.com/ctdk/briefs-utils/fuse"
 	"github.com/ctdk/briefs-utils/manpage"
 	"github.com/urfave/cli/v3"
 )
 
 func main() {
 	app := &cli.Command{
-		Name:  "fuse.briefs",
-		Usage: "Mount a BrieFS filesystem image via FUSE",
-		UsageText: "fuse.briefs [global options]",
-		Version: briefs.VersionStr,
+		Name:            "fuse.briefs",
+		Usage:           "Mount a BrieFS filesystem image via FUSE",
+		UsageText:       "fuse.briefs [global options]",
+		Version:         briefs.VersionStr,
 		HideHelpCommand: true,
 		Description: "Mount a BrieFS filesystem image as a FUSE filesystem.  " +
 			"The bridge is read-write with full kernel parity: all directory " +
@@ -48,6 +49,13 @@ func main() {
 				Aliases: []string{"d"},
 				Usage:   "enable FUSE debug output",
 			},
+			&cli.StringFlag{
+				Name: "mount-opts",
+				Usage: "comma-separated mount options to apply to the FUSE mount " +
+					"(as forwarded by mount.fuse.briefs from `mount -t fuse.briefs -o <opts>`); " +
+					"[no]suid/[no]dev/[no]exec override the kernel-parity defaults, " +
+					"anything unrecognized is passed to the kernel mount, which rejects it",
+			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.Bool("generate-man-page") {
@@ -77,9 +85,16 @@ func main() {
 			}
 
 			fmt.Fprintf(os.Stderr, "Mounting %s on %s\n", imagePath, mountPoint)
+			var mountOpts []string
+			for _, o := range strings.Split(c.String("mount-opts"), ",") {
+				if o = strings.TrimSpace(o); o != "" {
+					mountOpts = append(mountOpts, o)
+				}
+			}
 			return fuse.Mount(imagePath, fuse.MountOptions{
 				MountPoint: mountPoint,
 				Debug:      debug,
+				MountOpts:  mountOpts,
 			})
 		},
 	}

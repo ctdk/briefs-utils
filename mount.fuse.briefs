@@ -8,8 +8,14 @@
 # This helper translates that into the fuse.briefs daemon invocation
 # (`fuse.briefs -i <src> -m <target>`), backgrounds it detached from the
 # controlling terminal (so mount doesn't wait on it), and waits for the
-# FUSE mount to become visible.  Unmounting is handled by the kernel via
-# the normal `umount <target>` path (which delivers DESTROY to the daemon,
+# FUSE mount to become visible.  Mount options are forwarded to the
+# daemon via --mount-opts: the [no]suid/[no]dev/[no]exec words override
+# the daemon's kernel-parity defaults (so `-o nosuid` mounts really do
+# ignore setid bits — generic/128), and anything unrecognized is handed
+# to the kernel mount, which rejects unknown options rather than
+# silently mounting with different semantics than the caller asked for.
+# Unmounting is handled by the kernel via the
+# normal `umount <target>` path (which delivers DESTROY to the daemon,
 # letting it checkpoint the journal and exit cleanly).
 #
 # The helper is a userspace convenience only; `mount -t fuse.briefs` works
@@ -19,10 +25,11 @@ set -uo pipefail
 
 src=""
 target=""
+mount_opts=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    -o)   shift; shift ;;
-    -o*)  shift ;;
+    -o)   if [ "$#" -ge 2 ]; then mount_opts="$2"; shift 2; else shift; fi ;;
+    -o*)  mount_opts="${1#-o}"; shift ;;
     -t)   shift; shift ;;
     -t*)  shift ;;
     -v|-f|-n|-i) shift ;;
@@ -79,6 +86,9 @@ pidfile="/tmp/fuse-briefs-$(echo "$target" | tr / _).pid"
 # systems, non-root callers, or a lingering unit name collision).
 pid=""
 unit="fuse-briefs-$(echo "$target" | tr / _ | tr -cd '[:alnum:]_.-')-$$"
+# Forwarded mount options, if any (see the header comment).
+dargs=()
+[ -n "$mount_opts" ] && dargs+=(--mount-opts "$mount_opts")
 # systemd-run starts the unit with a clean environment, so any daemon
 # debug knobs set in the caller's environment must be forwarded
 # explicitly (currently just the BRIEFS_MEM_TICK memstats self-dumper).
@@ -89,7 +99,7 @@ if [ "$(id -u)" = 0 ] && command -v systemd-run >/dev/null 2>&1; then
   if systemd-run --unit="$unit" --collect --quiet \
        -p StandardOutput="append:$log" -p StandardError="append:$log" \
        "${prop[@]}" \
-       "$daemon" -i "$src" -m "$target" >/dev/null 2>&1; then
+       "$daemon" -i "$src" -m "$target" "${dargs[@]}" >/dev/null 2>&1; then
     # systemd-run returns once the unit is started; MainPID should be set
     # by then, but retry briefly in case we race the service's fork.
     for i in $(seq 1 20); do
@@ -104,7 +114,7 @@ if [ -n "$pid" ] && [ "$pid" != 0 ]; then
 else
   # In a non-interactive helper (no job control) `setsid prog &` does not
   # fork, so $! is the daemon's real PID.
-  setsid "$daemon" -i "$src" -m "$target" </dev/null >>"$log" 2>&1 &
+  setsid "$daemon" -i "$src" -m "$target" "${dargs[@]}" </dev/null >>"$log" 2>&1 &
   echo $! > "$pidfile"
 fi
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -187,6 +188,64 @@ type BrieFS struct {
 type MountOptions struct {
 	MountPoint string
 	Debug      bool
+	// MountOpts holds caller-requested mount options, as forwarded by
+	// mount.fuse.briefs from `mount -t fuse.briefs -o <opts>`.  They are
+	// merged into the go-fuse mount by mergeMountOptions.
+	MountOpts []string
+}
+
+// defaultMountOpts mirrors the kernel `mount -t briefs` mount, which —
+// unlike fusermount3's nosuid,nodev,noexec FUSE defaults — allows suid,
+// dev, and exec (generic/633 exec's a chowned setid copy of itself from
+// the mount; device-node tests open nodes from it).  The daemon runs as
+// root, which fusermount3 permits to lift the restrictions.
+var defaultMountOpts = []string{"suid", "dev", "exec"}
+
+// opposite maps each restrictive VFS flag to the permissive default it
+// overrides.  fusermount3 turns the [no]suid/[no]dev/[no]exec words into
+// MS_* bits itself; dropping the matching default instead of relying on
+// option-order tie-breaking inside fusermount3 makes the caller's word
+// the only one in the set.
+var opposite = map[string]string{
+	"nosuid": "suid",
+	"nodev":  "dev",
+	"noexec": "exec",
+}
+
+// mergeMountOptions combines the kernel-parity defaults with
+// caller-requested options.  Anything unrecognized is forwarded verbatim:
+// the kernel validates the option set (fs/fuse/inode.c
+// fuse_fs_parameters plus the generic fs_context options) and fails the
+// mount on unknown options — the same thing `mount -t briefs -o <bad>`
+// does — so a request like noacl surfaces as a failed mount rather than
+// silently mounting with different semantics than the caller asked for.
+func mergeMountOptions(requested []string) []string {
+	opts := append([]string{}, defaultMountOpts...)
+	for _, r := range requested {
+		r = strings.TrimSpace(r)
+		if r == "" {
+			continue
+		}
+		if def, ok := opposite[r]; ok {
+			for i, o := range opts {
+				if o == def {
+					opts = append(opts[:i], opts[i+1:]...)
+					break
+				}
+			}
+		}
+		dup := false
+		for _, o := range opts {
+			if o == r {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			opts = append(opts, r)
+		}
+	}
+	return opts
 }
 
 // Mount mounts a BrieFS image at the given mount point.
@@ -334,14 +393,21 @@ func Mount(imagePath string, opts MountOptions) error {
 			ExtraCapabilities: fuse.CAP_DONT_MASK,
 			// fusermount3 mounts FUSE filesystems
 			// nosuid,nodev,noexec by default, while the kernel
-			// `mount -t briefs` mount allows suid,dev,exec.  Mirror
-			// the kernel mount: generic/633's vfstest exec's a
-			// chowned 5000:5000 suid copy of itself from the mount
-			// and expects euid 5000 (impossible under nosuid, and
-			// the exec itself needs exec), and device-node tests
-			// open nodes from the mount.  The daemon runs as root,
+			// `mount -t briefs` mount allows suid,dev,exec.  The
+			// defaults in mergeMountOptions mirror the kernel
+			// mount: generic/633's vfstest exec's a chowned
+			// 5000:5000 suid copy of itself from the mount and
+			// expects euid 5000 (impossible under nosuid, and the
+			// exec itself needs exec), and device-node tests open
+			// nodes from the mount.  The daemon runs as root,
 			// which fusermount3 permits to lift the restrictions.
-			Options: []string{"suid", "dev", "exec"},
+			// Caller-requested options from `mount -t
+			// fuse.briefs -o <opts>` (forwarded by
+			// mount.fuse.briefs via --mount-opts) merge in on
+			// top: -o nosuid replaces the suid default
+			// (generic/128), anything unrecognized passes through
+			// for the kernel to validate.
+			Options: mergeMountOptions(opts.MountOpts),
 		},
 		// Report modes exactly as stored.  Without this, go-fuse patches
 		// any zero-permission mode in Getattr/Lookup replies to 0644 (+0111
