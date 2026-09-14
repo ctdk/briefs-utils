@@ -112,19 +112,6 @@ func (bd *BlockDevice) ReadBlock(blockNum uint64) ([]byte, error) {
 	return buf, nil
 }
 
-// ReadBlocks reads count consecutive blocks starting at blockNum.
-func (bd *BlockDevice) ReadBlocks(blockNum uint64, count uint64) ([][]byte, error) {
-	blocks := make([][]byte, count)
-	for i := uint64(0); i < count; i++ {
-		b, err := bd.ReadBlock(blockNum + i)
-		if err != nil {
-			return nil, fmt.Errorf("read block %d (batch): %w", blockNum+i, err)
-		}
-		blocks[i] = b
-	}
-	return blocks, nil
-}
-
 // WriteBlock writes data to a single block. data must be exactly blockSize bytes.
 func (bd *BlockDevice) WriteBlock(blockNum uint64, data []byte) error {
 	if uint64(len(data)) != bd.blockSize {

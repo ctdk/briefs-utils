@@ -39,18 +39,6 @@ func TestBlockDeviceReadWrite(t *testing.T) {
 	if string(read[:16]) != "BRIEFS TEST DATA" {
 		t.Errorf("ReadBlock: want 'BRIEFS TEST DATA', got '%s'", string(read[:16]))
 	}
-
-	// ReadBlocks
-	blocks, err := bd.ReadBlocks(5, 3)
-	if err != nil {
-		t.Fatalf("ReadBlocks: %v", err)
-	}
-	if len(blocks) != 3 {
-		t.Fatalf("ReadBlocks: want 3 blocks, got %d", len(blocks))
-	}
-	if string(blocks[0][:16]) != "BRIEFS TEST DATA" {
-		t.Errorf("blocks[0]: want 'BRIEFS TEST DATA', got '%s'", string(blocks[0][:16]))
-	}
 }
 
 func TestBlockDeviceReadAt(t *testing.T) {

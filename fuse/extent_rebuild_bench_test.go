@@ -35,7 +35,6 @@ func TestFragmentedWritePerf(t *testing.T) {
 	}
 	ino := in.InodeNumber
 
-	const bs = 4096
 	const frag = 512
 	const stride = 1024
 	const size = 30 << 20

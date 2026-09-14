@@ -230,7 +230,7 @@ func (b *BrieFS) syncAccessAclToMode(in *briefs.Inode) error {
 	return b.setXattrLocked(in, aclAccessName, newBlob, 0)
 }
 
-// encodePosixAcl serializes entries into the on-wire blob format (tests).
+// encodePosixAcl serializes entries into the on-wire blob format.
 func encodePosixAcl(entries []posixAclEntry) []byte {
 	buf := make([]byte, 4+posixAclEntrySz*len(entries))
 	binary.LittleEndian.PutUint32(buf, posixAclVersion)

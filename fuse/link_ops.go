@@ -191,9 +191,8 @@ func (b *BrieFS) freeInodeData(in *briefs.Inode) error {
 // and new parent are one inode) mutates one struct and the trie-root pointer
 // changes (collapse on remove, create on add) are not split across two copies.
 type inodeGetter struct {
-	b  *BrieFS
-	m  map[uint64]*briefs.Inode
-	ok bool
+	b *BrieFS
+	m map[uint64]*briefs.Inode
 }
 
 func (g *inodeGetter) get(ino uint64) (*briefs.Inode, error) {

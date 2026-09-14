@@ -479,8 +479,8 @@ func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error 
 	}
 
 	// Resolve the entry against the on-disk trie (current as of the last op's
-	// flush) to get the child ino and d_type.
-	childIno, ftype, err := TrieLookup(b.dev, parent.DirTrieRoot, name)
+	// flush) to get the child ino.
+	childIno, _, err := TrieLookup(b.dev, parent.DirTrieRoot, name)
 	if err != nil {
 		b.cacheAbort()
 		return syscall.ENOENT
@@ -591,6 +591,5 @@ func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error 
 	// Op end (see file header): records are in the ring; the metadata blocks
 	// move to the deferred map, durable at the next journal sync.
 	b.mergeCache()
-	_ = ftype
 	return nil
 }

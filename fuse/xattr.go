@@ -132,7 +132,7 @@ func (b *BrieFS) setXattr(ino uint64, name string, value []byte, flags uint32) e
 	if len(name) > xattrMaxNameLen {
 		return syscall.ERANGE
 	}
-	if value != nil && len(value) > xattrMaxValueLen {
+	if len(value) > xattrMaxValueLen {
 		return syscall.E2BIG
 	}
 	if b.readOnly {

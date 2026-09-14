@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"syscall"
 	"testing"
 
@@ -89,15 +90,15 @@ func TestXattrSetGetListRemove(t *testing.T) {
 	}
 
 	// --- handler-level size query + ERANGE ---
-	if sz, errno := n.Getxattr(nil, "user.foo", nil); errno != 0 || sz != uint32(len("updated")) {
+	if sz, errno := n.Getxattr(context.Background(), "user.foo", nil); errno != 0 || sz != uint32(len("updated")) {
 		t.Fatalf("Getxattr size query: sz=%d errno=%v", sz, errno)
 	}
 	small := make([]byte, 2)
-	if _, errno := n.Getxattr(nil, "user.foo", small); errno != syscall.ERANGE {
+	if _, errno := n.Getxattr(context.Background(), "user.foo", small); errno != syscall.ERANGE {
 		t.Fatalf("Getxattr ERANGE: want ERANGE, got %v", errno)
 	}
 	// listxattr size query
-	if sz, errno := n.Listxattr(nil, nil); errno != 0 || sz == 0 {
+	if sz, errno := n.Listxattr(context.Background(), nil); errno != 0 || sz == 0 {
 		t.Fatalf("Listxattr size query: sz=%d errno=%v", sz, errno)
 	}
 

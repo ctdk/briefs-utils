@@ -857,7 +857,7 @@ func (b *BrieFS) TrieInsert(di *briefs.Inode, name string, ino uint64, ftype uin
 			if err != nil || briefs.TrieRefIsNull(newLeaf) {
 				return syscall.ENOSPC
 			}
-			lbuf, lnode, err := b.trieRead(newLeaf)
+			lbuf, _, err := b.trieRead(newLeaf)
 			if err != nil {
 				_ = b.trieFreeNode(newLeaf)
 				return err
@@ -879,7 +879,7 @@ func (b *BrieFS) TrieInsert(di *briefs.Inode, name string, ino uint64, ftype uin
 			// shared page buffer; re-parse before the leaf commit so
 			// the writeback carries the stored name fields, not a
 			// stale snapshot.
-			lnode, err = briefs.ReadTrieSlot(lbuf, uint(briefs.TrieRefSlot(newLeaf)))
+			lnode, err := briefs.ReadTrieSlot(lbuf, uint(briefs.TrieRefSlot(newLeaf)))
 			if err != nil {
 				return err
 			}

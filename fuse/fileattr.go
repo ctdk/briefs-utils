@@ -48,7 +48,6 @@ const (
 // Linux _IOC encoding for the FS_IOC_* commands (sizeof(long)=8,
 // sizeof(struct fsxattr)=28 on amd64).
 const (
-	iocNone     uint32 = 0
 	iocWrite    uint32 = 1
 	iocRead     uint32 = 2
 	sizeLong           = 8

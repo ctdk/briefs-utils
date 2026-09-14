@@ -120,7 +120,7 @@ func TestFileattrIoctl(t *testing.T) {
 
 	// GETFLAGS initially 0.
 	out := make([]byte, 8)
-	if _, errno := n.Ioctl(nil, nil, fsIocGetflags, 0, nil, out); errno != 0 {
+	if _, errno := n.Ioctl(context.Background(), nil, fsIocGetflags, 0, nil, out); errno != 0 {
 		t.Fatalf("GETFLAGS: %v", errno)
 	}
 	if got := binary.LittleEndian.Uint32(out); got != 0 {
@@ -130,11 +130,11 @@ func TestFileattrIoctl(t *testing.T) {
 	// SETFLAGS +i (immutable + nodump).
 	inFlags := make([]byte, 8)
 	binary.LittleEndian.PutUint32(inFlags, fsImmutableFl|fsNodumpFl)
-	if _, errno := n.Ioctl(nil, nil, fsIocSetflags, 0, inFlags, nil); errno != 0 {
+	if _, errno := n.Ioctl(context.Background(), nil, fsIocSetflags, 0, inFlags, nil); errno != 0 {
 		t.Fatalf("SETFLAGS: %v", errno)
 	}
 	out = make([]byte, 8)
-	if _, errno := n.Ioctl(nil, nil, fsIocGetflags, 0, nil, out); errno != 0 {
+	if _, errno := n.Ioctl(context.Background(), nil, fsIocGetflags, 0, nil, out); errno != 0 {
 		t.Fatalf("GETFLAGS: %v", errno)
 	}
 	if got := binary.LittleEndian.Uint32(out); got&fsImmutableFl == 0 || got&fsNodumpFl == 0 {
@@ -143,7 +143,7 @@ func TestFileattrIoctl(t *testing.T) {
 
 	// FSGETXATTR translates to XFLAG_IMMUTABLE|XFLAG_NODUMP.
 	fsx := make([]byte, sizeFsxattr)
-	if _, errno := n.Ioctl(nil, nil, fsIocFsgetxattr, 0, nil, fsx); errno != 0 {
+	if _, errno := n.Ioctl(context.Background(), nil, fsIocFsgetxattr, 0, nil, fsx); errno != 0 {
 		t.Fatalf("FSGETXATTR: %v", errno)
 	}
 	if got := binary.LittleEndian.Uint32(fsx[0:]); got&(fsXflagImmutable|fsXflagNodump) != (fsXflagImmutable | fsXflagNodump) {
@@ -153,11 +153,11 @@ func TestFileattrIoctl(t *testing.T) {
 	// FSSETXATTR with XFLAG_SYNC -> GETFLAGS shows FS_SYNC_FL.
 	setFsx := make([]byte, sizeFsxattr)
 	binary.LittleEndian.PutUint32(setFsx[0:], fsXflagSync)
-	if _, errno := n.Ioctl(nil, nil, fsIocFssetxattr, 0, setFsx, nil); errno != 0 {
+	if _, errno := n.Ioctl(context.Background(), nil, fsIocFssetxattr, 0, setFsx, nil); errno != 0 {
 		t.Fatalf("FSSETXATTR: %v", errno)
 	}
 	out = make([]byte, 8)
-	if _, errno := n.Ioctl(nil, nil, fsIocGetflags, 0, nil, out); errno != 0 {
+	if _, errno := n.Ioctl(context.Background(), nil, fsIocGetflags, 0, nil, out); errno != 0 {
 		t.Fatalf("GETFLAGS: %v", errno)
 	}
 	if got := binary.LittleEndian.Uint32(out); got&fsSyncFl == 0 || got&fsImmutableFl != 0 {
@@ -167,18 +167,18 @@ func TestFileattrIoctl(t *testing.T) {
 	// FSSETXATTR with unsupported xflag / extsize -> EOPNOTSUPP.
 	setFsx = make([]byte, sizeFsxattr)
 	binary.LittleEndian.PutUint32(setFsx[0:], 0x00000002) // FS_XFLAG_PREALLOC (unsupported)
-	if _, errno := n.Ioctl(nil, nil, fsIocFssetxattr, 0, setFsx, nil); errno != syscall.EOPNOTSUPP {
+	if _, errno := n.Ioctl(context.Background(), nil, fsIocFssetxattr, 0, setFsx, nil); errno != syscall.EOPNOTSUPP {
 		t.Fatalf("FSSETXATTR unsupported xflag: want EOPNOTSUPP, got %v", errno)
 	}
 	setFsx = make([]byte, sizeFsxattr)
 	binary.LittleEndian.PutUint32(setFsx[0:], fsXflagSync)
 	binary.LittleEndian.PutUint32(setFsx[4:], 1) // extsize != 0
-	if _, errno := n.Ioctl(nil, nil, fsIocFssetxattr, 0, setFsx, nil); errno != syscall.EOPNOTSUPP {
+	if _, errno := n.Ioctl(context.Background(), nil, fsIocFssetxattr, 0, setFsx, nil); errno != syscall.EOPNOTSUPP {
 		t.Fatalf("FSSETXATTR extsize: want EOPNOTSUPP, got %v", errno)
 	}
 
 	// Unknown ioctl -> ENOTTY.
-	if _, errno := n.Ioctl(nil, nil, 0x12345678, 0, nil, nil); errno != syscall.ENOTTY {
+	if _, errno := n.Ioctl(context.Background(), nil, 0x12345678, 0, nil, nil); errno != syscall.ENOTTY {
 		t.Fatalf("unknown ioctl: want ENOTTY, got %v", errno)
 	}
 

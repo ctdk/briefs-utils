@@ -95,7 +95,7 @@ func TestFsckCorruptInode(t *testing.T) {
 	f.Close()
 
 	cmd = exec.Command(fsckPath, imgPath)
-	out, err = cmd.CombinedOutput()
+	out, _ = cmd.CombinedOutput()
 	// fsck currently exits 0 even with errors (it reports them in output)
 	output := string(out)
 	if !contains(output, "bad magic") {
