@@ -25,6 +25,12 @@ type fsckState struct {
 	// pass consumes them instead of re-walking every tree. Inodes whose walk
 	// failed (failedBtreeInos) may hold a partial list and are skipped there.
 	inodeExtents map[uint64][]briefs.Extent
+	// dirEntries holds each directory's entries as collected by the verify
+	// pass's trie walk; the repair phases (link-count recompute, trie
+	// compaction) consume them instead of re-walking every trie. Repair only
+	// runs when no verify walk failed, so the cached lists are complete.
+	// Reset by every verification pass.
+	dirEntries map[uint64][]trieEntry
 	// Tracks directories where trie walk had structural errors (bad magic, etc.)
 	failedTrieDirs map[uint64]bool // ino -> true if trie walk had unrecoverable errors
 	// Tracks tree-backed inodes whose B+ tree extent index walk had structural

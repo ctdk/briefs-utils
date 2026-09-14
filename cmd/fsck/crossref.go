@@ -110,28 +110,22 @@ func verifyBlockCrossReference(fs *fsckState, blockSize uint64) {
 	}
 }
 
-// computeDirSubdirCounts walks each directory's trie and returns a map of
-// ino -> number of subdirectory entries it contains. A directory's nlink is
-// 2 (., ..) plus its subdirectory count, so this is the computation behind
-// repairLinkCounts (fix). The verify pass no longer uses it: it re-derives
-// the counts from the entries verifyAllDirTries already collected, avoiding
-// a second walk of every trie.
-// It is strict: a collectDirectoryEntries error aborts and is returned, since
-// a partial count would make directory nlink checks wrong. The repair path is
-// gated on fs.failedTrieDirs being empty, so it always gets a complete count.
-func computeDirSubdirCounts(fs *fsckState, blockSize uint64) (map[uint64]int, error) {
+// computeDirSubdirCounts returns a map of ino -> number of subdirectory
+// entries the directory contains, derived from the entries the verify pass
+// already collected (fs.dirEntries) instead of walking every trie a second
+// time. A directory's nlink is 2 (., ..) plus its subdirectory count, so
+// this is the computation behind repairLinkCounts (fix). The repair path is
+// gated on fs.failedTrieDirs being empty, so the cached lists are complete;
+// a missing cache means repair ran without a verification pass, which the
+// caller must treat as an error rather than repairing from empty counts.
+func computeDirSubdirCounts(fs *fsckState) (map[uint64]int, error) {
+	if fs.dirEntries == nil {
+		return nil, fmt.Errorf("directory entries not collected (repair before verify)")
+	}
 	subdirCount := make(map[uint64]int)
 	for _, d := range fs.dirs {
-		entries, err := collectDirectoryEntries(fs, d.ino, d.trieRoot, blockSize)
-		if err != nil {
-			return nil, fmt.Errorf("ino %d: collect directory entries: %w", d.ino, err)
-		}
-		for _, e := range entries {
-			target, ok := fs.inodes[e.Inode]
-			if !ok {
-				continue
-			}
-			if target.IsDir() {
+		for _, e := range fs.dirEntries[d.ino] {
+			if target, ok := fs.inodes[e.Inode]; ok && target.IsDir() {
 				subdirCount[d.ino]++
 			}
 		}

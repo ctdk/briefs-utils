@@ -164,26 +164,34 @@ func verifyDirectoryTrie(fs *fsckState, parentIno uint64, rootRef uint64, blockS
 }
 
 // verifyAllDirTries walks the trie of every directory inode found during the inode table scan.
-// It collects all entries and returns them for cross-referencing.
+// It collects all entries and returns them for cross-referencing, and caches
+// each directory's list in fs.dirEntries for the repair phases to consume
+// without re-walking (the entries and the trie pages they came from are
+// identical: no phase between the verify pass and compaction touches a
+// directory trie).
 func verifyAllDirTries(fs *fsckState, blockSize uint64, dirs []dirInfo) []trieEntry {
 	var allEntries []trieEntry
+	fs.dirEntries = make(map[uint64][]trieEntry, len(dirs))
 
 	for _, d := range dirs {
 		entries := verifyDirectoryTrie(fs, d.ino, d.trieRoot, blockSize)
+		fs.dirEntries[d.ino] = entries
 		allEntries = append(allEntries, entries...)
 	}
 
 	return allEntries
 }
 
-// fsckTrieNote builds the WalkTrie Note hook shared by the collection walks:
-// read/page/slot problems abort the walk wrapped with context, and a
-// sibling-read problem is always tolerated (the chain gathered so far is
-// kept).  A cycle note aborts the entry collector — it must not loop
-// forever on a corrupt trie — but is tolerated by the block collector
-// (already visited: skip); a sibling-cap note is the reverse, since the
-// block collector must see every page it is going to free.
-func fsckTrieNote(abortOnCycle, abortOnSiblingCap bool) func(ref uint64, kind briefs.TrieWalkNote, nerr error) error {
+// fsckTrieNote builds the WalkTrie Note hook for the trie block collector
+// (collectDirectoryTrieBlocks): read/page/slot problems abort the walk
+// wrapped with context, and a sibling-read problem is tolerated (the chain
+// gathered so far is kept).  A cycle is tolerated (already visited: skip —
+// the walker's visited set already guarantees the walk terminates), while
+// a sibling-cap note aborts, since the block collector must see every page
+// it is going to free.  The entry lists the block-freeing pairs with are
+// collected by the verify pass's own walk (verifyDirectoryTrie) and cached
+// in fs.dirEntries.
+func fsckTrieNote() func(ref uint64, kind briefs.TrieWalkNote, nerr error) error {
 	return func(ref uint64, kind briefs.TrieWalkNote, nerr error) error {
 		switch kind {
 		case briefs.TrieNoteRead:
@@ -193,54 +201,15 @@ func fsckTrieNote(abortOnCycle, abortOnSiblingCap bool) func(ref uint64, kind br
 		case briefs.TrieNoteSlot:
 			return nerr
 		case briefs.TrieNoteCycle:
-			if abortOnCycle {
-				return fmt.Errorf("cycle detected at ref %d", ref)
-			}
 			return nil // already visited: skip
 		case briefs.TrieNoteSiblingCap:
-			if abortOnSiblingCap {
-				return fmt.Errorf("sibling chain from ref %d exceeds %d nodes (corrupt/cyclic trie)",
-					ref, briefs.TrieSiblingMax)
-			}
-			return nil // keep the chain gathered so far
+			return fmt.Errorf("sibling chain from ref %d exceeds %d nodes (corrupt/cyclic trie)",
+				ref, briefs.TrieSiblingMax)
 		case briefs.TrieNoteSiblingRead:
 			return nil // keep the chain gathered so far
 		}
 		return nil
 	}
-}
-
-// collectDirectoryEntries walks a directory trie and returns all live
-// entries.  Unlike verifyDirectoryTrie, it does not emit fsck errors; it
-// returns an error only on structural problems that prevent collection.
-func collectDirectoryEntries(fs *fsckState, parentIno uint64, rootRef uint64, blockSize uint64) ([]trieEntry, error) {
-	if rootRef == 0 {
-		return nil, nil
-	}
-	var entries []trieEntry
-	err := briefs.WalkTrie(trieReadAt(fs, blockSize), rootRef, briefs.TrieVisitor{
-		Note: fsckTrieNote(true, false),
-		VisitLeaf: func(ref uint64, buf []byte, node *briefs.TrieSlot) error {
-			if node.Flags&uint16(briefs.NodeFlagDeleted) != 0 {
-				return nil
-			}
-			name, err := briefs.ReadTrieName(buf, node.NameLen, node.NameOffset)
-			if err != nil {
-				return nil // unverifiable name: skip the entry, keep walking
-			}
-			entries = append(entries, trieEntry{
-				Inode:  node.Inode,
-				FType:  node.FType,
-				Name:   name,
-				Parent: parentIno,
-			})
-			return nil
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	return entries, nil
 }
 
 // collectDirectoryTrieBlocks returns the set of absolute block numbers used
@@ -251,7 +220,7 @@ func collectDirectoryTrieBlocks(fs *fsckState, rootRef uint64, blockSize uint64)
 		return blocks, nil
 	}
 	err := briefs.WalkTrie(trieReadAt(fs, blockSize), rootRef, briefs.TrieVisitor{
-		Note: fsckTrieNote(false, true),
+		Note: fsckTrieNote(),
 		VisitNode: func(ref uint64, emitted bool, buf []byte, page *briefs.TriePage, node *briefs.TrieSlot) error {
 			blocks[briefs.TrieRefBlock(ref)] = true
 			return nil

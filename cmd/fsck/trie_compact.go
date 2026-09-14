@@ -32,18 +32,21 @@ type compactTriePage struct {
 	Nodes     []*compactTrieNode
 }
 
-// compactDirectoryTries rebuilds every directory trie from its collected entries,
-// packing nodes and names tightly into fresh pages and freeing any old pages that
-// are no longer needed. This covers step 4 of the fsck repair roadmap.
+// compactDirectoryTries rebuilds every directory trie from the entries the
+// verify pass collected (fs.dirEntries — no trie re-walk here; repair is
+// gated on the verify walks having succeeded, so the cached lists are
+// complete), packing nodes and names tightly into fresh pages and freeing
+// any old pages that are no longer needed. This covers step 4 of the fsck
+// repair roadmap.
 func compactDirectoryTries(fs *fsckState, plan *repairPlan, blockSize uint64) error {
+	if fs.dirEntries == nil {
+		return fmt.Errorf("directory entries not collected (repair before verify)")
+	}
 	dataRegionStart := fs.dataRegionStart()
 	allocBlock := allocDataBlock(plan, dataRegionStart)
 
 	for _, d := range fs.dirs {
-		entries, err := collectDirectoryEntries(fs, d.ino, d.trieRoot, blockSize)
-		if err != nil {
-			return fmt.Errorf("ino %d: collect directory entries: %w", d.ino, err)
-		}
+		entries := fs.dirEntries[d.ino]
 
 		oldBlocks, err := collectDirectoryTrieBlocks(fs, d.trieRoot, blockSize)
 		if err != nil {

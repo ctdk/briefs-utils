@@ -138,7 +138,7 @@ func runRepair(fs *fsckState, blockSize uint64, totalInodes int, opts *repairOpt
 
 	// 5. Repair link counts.
 	if opts.RepairLinks {
-		if err := repairLinkCounts(fs, plan, blockSize); err != nil {
+		if err := repairLinkCounts(fs, plan); err != nil {
 			return fmt.Errorf("repair link counts: %w", err)
 		}
 	}
@@ -343,10 +343,10 @@ func writeCheckpoint(file *os.File, sb *briefs.SuperblockLayout, blockSize uint6
 // should have nlinks equal to the number of directory entries that reference them;
 // directories should have nlinks equal to 2 (for . and ..) plus the number of
 // subdirectories they contain.
-func repairLinkCounts(fs *fsckState, plan *repairPlan, blockSize uint64) error {
-	// Count how many subdirectory entries each directory contains, via the
-	// shared helper used by verifyLinkCounts too.
-	subdirCount, err := computeDirSubdirCounts(fs, blockSize)
+func repairLinkCounts(fs *fsckState, plan *repairPlan) error {
+	// Count how many subdirectory entries each directory contains, from the
+	// entries the verify pass already collected.
+	subdirCount, err := computeDirSubdirCounts(fs)
 	if err != nil {
 		return err
 	}
