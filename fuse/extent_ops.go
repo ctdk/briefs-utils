@@ -247,24 +247,15 @@ func (b *BrieFS) preallocate(in *briefs.Inode, start, end uint64, mode uint32, a
 	if mode&fallocKeepSize == 0 && end > in.FileSize {
 		in.FileSize = end
 	}
-	sec, nsec := nowTime()
-	in.MtimeSec, in.MtimeNsec = sec, nsec
-	in.CtimeSec, in.CtimeNsec = sec, nsec
+	stampMtimeCtime(in)
 
 	// Rebuild the index (new btree nodes are added to allocated) and commit.
-	// The localized rebuild only re-emits the leaves whose chunks changed and
-	// returns the nodes it actually replaced for the commit's free list.
-	oldNodes, err := b.rebuildExtentIndexWrite(in, tree, exts, allocated)
-	if err != nil {
-		b.rollbackAlloc(*allocated)
-		return err
-	}
-	// Raise the metadata shield for the unwritten blocks this preallocate
-	// inserted, before the commit (kernel briefs_raise_unwritten_reserve
-	// after the fallocate loop, file.c:3762-3772).  Recompute-from-extents
-	// also no-ops a re-fallocate over already-unwritten blocks.
-	b.updateUnwrittenRes(in.InodeNumber, exts)
-	return b.commitExtentChange(in, allocated, nil, oldNodes)
+	// The localized rebuild only re-emits the leaves whose chunks changed;
+	// the shield recompute both raises it for the unwritten blocks this
+	// preallocate inserted (kernel briefs_raise_unwritten_reserve after the
+	// fallocate loop, file.c:3762-3772) and no-ops a re-fallocate over
+	// already-unwritten blocks.
+	return b.commitRebuiltExtents(in, tree, exts, allocated, nil)
 }
 
 // punchHole frees the data blocks in [off, off+size) and leaves a hole, mirroring
@@ -288,15 +279,8 @@ func (b *BrieFS) punchHole(in *briefs.Inode, off, size uint64) error {
 				region[i] = 0
 			}
 			in.SetInlineData(region)
-			sec, nsec := nowTime()
-			in.MtimeSec, in.MtimeNsec = sec, nsec
-			in.CtimeSec, in.CtimeNsec = sec, nsec
-			if err := b.journalInodeFull(in); err != nil {
-				b.failWrite()
-				return err
-			}
-			if err := b.writeInodeOwned(in); err != nil {
-				b.failWrite()
+			stampMtimeCtime(in)
+			if err := b.commitInodeMetadata(in); err != nil {
 				return err
 			}
 		}
@@ -390,22 +374,15 @@ func (b *BrieFS) punchHole(in *briefs.Inode, off, size uint64) error {
 	// the mtime/ctime update on `changed`, file.c:1972) — and before the
 	// commit, so the journaled INODE_FULL carries them.
 	if changed {
-		sec, nsec := nowTime()
-		in.MtimeSec, in.MtimeNsec = sec, nsec
-		in.CtimeSec, in.CtimeNsec = sec, nsec
+		stampMtimeCtime(in)
 	}
 
 	if extentChanged {
 		var allocated runAccum
-		oldNodes, err := b.rebuildExtentIndexWrite(in, tree, newExts, &allocated)
-		if err != nil {
-			b.rollbackAlloc(allocated)
-			return err
-		}
-		// The punched-out blocks may have been unwritten: release their share of
-		// the shield before the commit (kernel release in briefs_do_punch_hole).
-		b.updateUnwrittenRes(in.InodeNumber, newExts)
-		return b.commitExtentChange(in, &allocated, freed, oldNodes)
+		// The punched-out blocks may have been unwritten: the commit's
+		// shield recompute releases their share (kernel release in
+		// briefs_do_punch_hole).
+		return b.commitRebuiltExtents(in, tree, newExts, &allocated, freed)
 	}
 
 	if !changed {
@@ -419,18 +396,7 @@ func (b *BrieFS) punchHole(in *briefs.Inode, off, size uint64) error {
 	// write the kernel leaves to writeback, and the drain lets concurrent
 	// ops coalesce into one device flush at the next journal sync.
 	b.markDataDrain()
-	if err := b.journalInodeFull(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	// Fix B: defer the inode block — no per-op journal sync (kernel parity:
-	// the kernel does not sync per metadata op); durable at the next journal
-	// sync after the commit point.
-	if err := b.writeInodeOwned(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	return nil
+	return b.commitInodeMetadata(in)
 }
 
 // shiftExtents rewrites the extent list for COLLAPSE_RANGE (dir < 0) and
@@ -545,20 +511,13 @@ func (b *BrieFS) collapseRangeOp(in *briefs.Inode, off, size uint64) error {
 	newExts, freed := shiftExtents(tree.exts, S, L, -1)
 
 	in.FileSize -= size
-	sec, nsec := nowTime()
-	in.MtimeSec, in.MtimeNsec = sec, nsec
-	in.CtimeSec, in.CtimeNsec = sec, nsec
+	stampMtimeCtime(in)
 
 	var allocated runAccum
-	oldNodes, err := b.rebuildExtentIndexWrite(in, tree, newExts, &allocated)
-	if err != nil {
-		b.rollbackAlloc(allocated)
-		return err
-	}
-	// Freed collapsed blocks may have been unwritten: shrink the shield for
-	// the remainder (kernel release in briefs_do_collapse_range).
-	b.updateUnwrittenRes(in.InodeNumber, newExts)
-	return b.commitExtentChange(in, &allocated, freed, oldNodes)
+	// Freed collapsed blocks may have been unwritten: the commit's shield
+	// recompute shrinks it for the remainder (kernel release in
+	// briefs_do_collapse_range).
+	return b.commitRebuiltExtents(in, tree, newExts, &allocated, freed)
 }
 
 // insertRangeOp mirrors briefs_do_insert_range (file.c:3316): open a
@@ -594,17 +553,12 @@ func (b *BrieFS) insertRangeOp(in *briefs.Inode, off, size uint64) error {
 	newExts, _ := shiftExtents(tree.exts, S, L, +1)
 
 	in.FileSize += size
-	sec, nsec := nowTime()
-	in.MtimeSec, in.MtimeNsec = sec, nsec
-	in.CtimeSec, in.CtimeNsec = sec, nsec
+	stampMtimeCtime(in)
 
 	var allocated runAccum
-	oldNodes, err := b.rebuildExtentIndexWrite(in, tree, newExts, &allocated)
-	if err != nil {
-		b.rollbackAlloc(allocated)
-		return err
-	}
-	return b.commitExtentChange(in, &allocated, nil, oldNodes)
+	// The inserted range is a plain hole (no unwritten blocks), so the
+	// commit's shield recompute is a no-op here.
+	return b.commitRebuiltExtents(in, tree, newExts, &allocated, nil)
 }
 
 // zeroRangeOp mirrors briefs_do_zero_range (file.c:2846): zero the contents
@@ -798,24 +752,15 @@ func (b *BrieFS) zeroRangeOp(in *briefs.Inode, off, size uint64, mode uint32) er
 		grew = true
 	}
 
-	sec, nsec := nowTime()
-	in.CtimeSec, in.CtimeNsec = sec, nsec
-	if grew {
-		in.MtimeSec, in.MtimeNsec = sec, nsec
-	}
+	stampDataTimes(in, grew)
 
 	if converted {
-		oldNodes, err := b.rebuildExtentIndexWrite(in, tree, newExts, &allocated)
-		if err != nil {
-			b.rollbackAlloc(allocated)
-			return err
-		}
 		// The conversion may both raise the shield (holes became unwritten,
 		// flipped-written blocks newly count — kernel do_zero_range raises
 		// for every block that ends the op unwritten but did not start it,
-		// file.c:3017-3019) and keep it (unwritten->unwritten stays counted).
-		b.updateUnwrittenRes(in.InodeNumber, newExts)
-		return b.commitExtentChange(in, &allocated, nil, oldNodes)
+		// file.c:3017-3019) and keep it (unwritten->unwritten stays counted):
+		// the commit's shield recompute handles both directions.
+		return b.commitRebuiltExtents(in, tree, newExts, &allocated, nil)
 	}
 
 	// No extent change: persist the inode (times, possible growth) and the
@@ -824,18 +769,7 @@ func (b *BrieFS) zeroRangeOp(in *briefs.Inode, off, size uint64, mode uint32) er
 	// drain instead of an immediate Fdatasync (kernel parity: lazy
 	// writeback; concurrent ops coalesce into one flush at the next sync).
 	b.markDataDrain()
-	if err := b.journalInodeFull(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	// Fix B: defer the inode block — no per-op journal sync (kernel parity:
-	// the kernel does not sync per metadata op); durable at the next journal
-	// sync after the commit point.
-	if err := b.writeInodeOwned(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	return nil
+	return b.commitInodeMetadata(in)
 }
 
 // zeroRangeInline applies ZERO_RANGE to an inline-data file whose range fits
@@ -862,24 +796,9 @@ func (b *BrieFS) zeroRangeInline(in *briefs.Inode, off, end uint64, mode uint32)
 		in.FileSize = end
 		grew = true
 	}
-	sec, nsec := nowTime()
-	in.CtimeSec, in.CtimeNsec = sec, nsec
-	if grew {
-		in.MtimeSec, in.MtimeNsec = sec, nsec
-	}
+	stampDataTimes(in, grew)
 
-	if err := b.journalInodeFull(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	// Fix B: defer the inode block — no per-op journal sync (kernel parity:
-	// the kernel does not sync per metadata op); durable at the next journal
-	// sync after the commit point.
-	if err := b.writeInodeOwned(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	return nil
+	return b.commitInodeMetadata(in)
 }
 
 // truncateInode is the public truncate entry: lock + read + truncateLocked.
@@ -1008,20 +927,8 @@ func (b *BrieFS) setattrOp(ctx context.Context, ino uint64, in *fuseSetAttrIn) e
 		return nil
 	}
 	// ctime advances on any metadata change.
-	sec, nsec := nowTime()
-	di.CtimeSec, di.CtimeNsec = sec, nsec
-	if err := b.journalInodeFull(di); err != nil {
-		b.failWrite()
-		return err
-	}
-	// Fix B: defer the inode block — no per-op journal sync (kernel parity:
-	// the kernel does not sync per setattr); durable at the next journal
-	// sync after the commit point.
-	if err := b.writeInodeOwned(di); err != nil {
-		b.failWrite()
-		return err
-	}
-	return nil
+	stampCtime(di)
+	return b.commitInodeMetadata(di)
 }
 
 // truncateLocked is the size-change path assuming the inode-block lock is held
@@ -1070,17 +977,8 @@ func (b *BrieFS) truncateLocked(ctx context.Context, in *briefs.Inode, newSize u
 				in.SetInlineData(region)
 			}
 			in.FileSize = newSize
-			sec, nsec := nowTime()
-			in.MtimeSec, in.MtimeNsec = sec, nsec
-			in.CtimeSec, in.CtimeNsec = sec, nsec
-			if err := b.journalInodeFull(in); err != nil {
-				b.failWrite()
-				return err
-			}
-			// Fix B: defer the inode block — durable at the next journal sync
-			// after the commit point, like every other metadata op.
-			if err := b.writeInodeOwned(in); err != nil {
-				b.failWrite()
+			stampMtimeCtime(in)
+			if err := b.commitInodeMetadata(in); err != nil {
 				return err
 			}
 			return nil
@@ -1099,19 +997,12 @@ func (b *BrieFS) truncateLocked(ctx context.Context, in *briefs.Inode, newSize u
 				return err
 			}
 		}
-		sec, nsec := nowTime()
-		in.MtimeSec, in.MtimeNsec = sec, nsec
-		in.CtimeSec, in.CtimeNsec = sec, nsec
+		stampMtimeCtime(in)
 		var allocated runAccum
-		oldNodes, err := b.rebuildExtentIndexWrite(in, tree, newExts, &allocated)
-		if err != nil {
-			b.rollbackAlloc(allocated)
-			return err
-		}
-		// Truncated-away blocks may have been unwritten: shrink the shield
-		// for the remainder (kernel release in briefs_setattr truncate).
-		b.updateUnwrittenRes(in.InodeNumber, newExts)
-		return b.commitExtentChange(in, &allocated, freed, oldNodes)
+		// Truncated-away blocks may have been unwritten: the commit's
+		// shield recompute shrinks it for the remainder (kernel release in
+		// briefs_setattr truncate).
+		return b.commitRebuiltExtents(in, tree, newExts, &allocated, freed)
 	}
 	// Truncate up.
 	if oldSize%bs != 0 && oldSize > 0 && in.Flags&briefs.InodeFlagInlineData == 0 {
@@ -1154,9 +1045,7 @@ func (b *BrieFS) truncateLocked(ctx context.Context, in *briefs.Inode, newSize u
 		in.SetInlineData(region)
 	}
 	in.FileSize = newSize
-	sec, nsec := nowTime()
-	in.MtimeSec, in.MtimeNsec = sec, nsec
-	in.CtimeSec, in.CtimeNsec = sec, nsec
+	stampMtimeCtime(in)
 	if allocated.count() > 0 {
 		// The promotion moved the inline tail to a freshly allocated data
 		// block: journal a JRN_EXTENT_ALLOC for it (allocator parity —
@@ -1166,18 +1055,7 @@ func (b *BrieFS) truncateLocked(ctx context.Context, in *briefs.Inode, newSize u
 		// promoted block and snapshots the inode with its new extent list.
 		return b.commitExtentChange(in, &allocated, nil, nil)
 	}
-	if err := b.journalInodeFull(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	// Fix B: defer the inode block — no per-op journal sync (kernel parity:
-	// the kernel does not sync per metadata op); durable at the next journal
-	// sync after the commit point.
-	if err := b.writeInodeOwned(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	return nil
+	return b.commitInodeMetadata(in)
 }
 
 // removePrivs strips suid/sgid and clears security.capability (killpriv),

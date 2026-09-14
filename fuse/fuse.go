@@ -784,28 +784,35 @@ func callerCreds(ctx context.Context) (uid, gid uint32) {
 	return 0, 0
 }
 
-// fillEntryOut populates a FUSE EntryOut from an on-disk inode, including the
-// block count derived from its extents. The returned error is the extent-walk
-// failure, if any: read-only callers propagate it (EIO); post-mutation
-// callers ignore it deliberately — the on-disk change already happened, so
-// the entry is reported with a best-effort block count.
-func (n *brieFSNode) fillEntryOut(out *fuse.EntryOut, in *briefs.Inode) error {
-	out.Mode = in.Filemode
-	out.Size = in.FileSize
-	out.Uid = in.Uid
-	out.Gid = in.Gid
-	out.Nlink = in.Nlinks
-	out.Atime = in.AtimeSec
-	out.Atimensec = uint32(in.AtimeNsec)
-	out.Mtime = in.MtimeSec
-	out.Mtimensec = uint32(in.MtimeNsec)
-	out.Ctime = in.CtimeSec
-	out.Ctimensec = uint32(in.CtimeNsec)
+// fillAttr populates a FUSE Attr (embedded by both EntryOut and AttrOut)
+// from an on-disk inode, including the block count derived from its
+// extents. The returned error is the extent-walk failure, if any:
+// read-only callers propagate it (EIO); post-mutation callers ignore it
+// deliberately — the on-disk change already happened, so the attr is
+// reported with a best-effort block count.
+func (n *brieFSNode) fillAttr(a *fuse.Attr, in *briefs.Inode) error {
+	a.Mode = in.Filemode
+	a.Size = in.FileSize
+	a.Uid = in.Uid
+	a.Gid = in.Gid
+	a.Nlink = in.Nlinks
+	a.Atime = in.AtimeSec
+	a.Atimensec = uint32(in.AtimeNsec)
+	a.Mtime = in.MtimeSec
+	a.Mtimensec = uint32(in.MtimeNsec)
+	a.Ctime = in.CtimeSec
+	a.Ctimensec = uint32(in.CtimeNsec)
 
 	totalBlocks, err := n.bfs.extentBlocksOf(in)
-	out.Blocks = totalBlocks * (n.bfs.blockSize / 512)
-	out.Blksize = uint32(n.bfs.blockSize)
+	a.Blocks = totalBlocks * (n.bfs.blockSize / 512)
+	a.Blksize = uint32(n.bfs.blockSize)
 	return err
+}
+
+// fillEntryOut populates a FUSE EntryOut from an on-disk inode. See
+// fillAttr for the returned error's contract.
+func (n *brieFSNode) fillEntryOut(out *fuse.EntryOut, in *briefs.Inode) error {
+	return n.fillAttr(&out.Attr, in)
 }
 
 // newChildNode wraps a freshly created inode in a go-fuse Inode linked to its
@@ -1012,25 +1019,10 @@ func (n *brieFSNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 	return []byte(target), 0
 }
 
-// fillAttrOut populates a FUSE AttrOut from an on-disk inode, including the
-// block count derived from its extents. Shared by Getattr and Setattr; the
-// returned error is the extent-walk failure, if any (callers return EIO).
+// fillAttrOut populates a FUSE AttrOut from an on-disk inode. Shared by
+// Getattr and Setattr; see fillAttr for the returned error's contract.
 func (n *brieFSNode) fillAttrOut(out *fuse.AttrOut, in *briefs.Inode) error {
-	out.Mode = in.Filemode
-	out.Size = in.FileSize
-	out.Uid = in.Uid
-	out.Gid = in.Gid
-	out.Nlink = in.Nlinks
-	out.Atime = in.AtimeSec
-	out.Atimensec = uint32(in.AtimeNsec)
-	out.Mtime = in.MtimeSec
-	out.Mtimensec = uint32(in.MtimeNsec)
-	out.Ctime = in.CtimeSec
-	out.Ctimensec = uint32(in.CtimeNsec)
-	totalBlocks, err := n.bfs.extentBlocksOf(in)
-	out.Blocks = totalBlocks * (n.bfs.blockSize / 512)
-	out.Blksize = uint32(n.bfs.blockSize)
-	return err
+	return n.fillAttr(&out.Attr, in)
 }
 
 // Setattr handles chmod/chown/utimes/truncate. Mirrors briefs_setattr

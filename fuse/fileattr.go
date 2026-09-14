@@ -167,22 +167,11 @@ func (b *BrieFS) fileattrSet(ino uint64, setFlags bool, flags uint32, setXflags 
 	// each write is already on disk, so there is no pending data to flush (the
 	// kernel's filemap_write_and_wait here is a no-op equivalent).
 	in.UserFlags = newFlags
-	sec, nsec := nowTime()
-	in.CtimeSec, in.CtimeNsec = sec, nsec
+	stampCtime(in)
 
-	// Journal the snapshot (user_flags is carried by JRN_INODE_FULL) and defer
-	// the inode block: no per-op sync (kernel parity — the kernel does not
-	// sync on chflags); the block is durable at the next journal sync after
-	// the commit point, and the snapshot record makes it replay-derivable.
-	if err := b.journalInodeFull(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	if err := b.writeInodeOwned(in); err != nil {
-		b.failWrite()
-		return err
-	}
-	return nil
+	// The snapshot record carries user_flags and makes the change
+	// replay-derivable.
+	return b.commitInodeMetadata(in)
 }
 
 // --- ioctl payload (de)serialization ---

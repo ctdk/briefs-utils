@@ -241,8 +241,7 @@ func (b *BrieFS) setXattrLocked(in *briefs.Inode, name string, value []byte, fla
 	if len(kvs) == 0 {
 		in.XattrOffset = 0
 		in.XattrSize = 0
-		sec, nsec := nowTime()
-		in.CtimeSec, in.CtimeNsec = sec, nsec
+		stampCtime(in)
 		if err := b.commitXattrOp(in, nil, nil, oldHead, true); err != nil {
 			return err
 		}
@@ -282,8 +281,7 @@ func (b *BrieFS) setXattrLocked(in *briefs.Inode, name string, value []byte, fla
 	// Publish the new head + size on the in-memory inode.
 	in.XattrOffset = absBlocks[0]
 	in.XattrSize = uint64(usedSizeOf(bufs[0]))
-	sec, nsec := nowTime()
-	in.CtimeSec, in.CtimeNsec = sec, nsec
+	stampCtime(in)
 
 	if err := b.commitXattrOp(in, absBlocks, bufs, oldHead, false); err != nil {
 		return err

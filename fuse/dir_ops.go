@@ -64,6 +64,25 @@ func nowTime() (sec, nsec uint64) {
 	return uint64(t.Unix()), uint64(t.Nanosecond())
 }
 
+// stampMtimeCtime stamps mtime and ctime from one clock read — the
+// data-modification stamp (kernel current_time() at every data-write site).
+func stampMtimeCtime(in *briefs.Inode) { stampDataTimes(in, true) }
+
+// stampCtime stamps only ctime — the metadata-change stamp (kernel
+// current_time() at the metadata-only sites: xattrs, chattr, unlink target).
+func stampCtime(in *briefs.Inode) { stampDataTimes(in, false) }
+
+// stampDataTimes stamps ctime from one clock read, and mtime too when @mtime
+// is set (the kernel's zero-range tail: mtime only when the file grew,
+// file.c:3085).
+func stampDataTimes(in *briefs.Inode, mtime bool) {
+	sec, nsec := nowTime()
+	in.CtimeSec, in.CtimeNsec = sec, nsec
+	if mtime {
+		in.MtimeSec, in.MtimeNsec = sec, nsec
+	}
+}
+
 // journalInodeFull marshals the inode and writes a JRN_INODE_FULL record (the
 // 560-byte ino + 512-byte raw snapshot).  Mirrors briefs_journal_inode_full,
 // but written directly rather than deferred: the FUSE bridge serializes every
@@ -178,9 +197,7 @@ func (b *BrieFS) updateParentDir(parent *briefs.Inode, sizeDelta int64, linkDelt
 	}
 	// A create/unlink/rename changes the directory's contents, so mtime/ctime
 	// must advance (generic/003).
-	sec, nsec := nowTime()
-	parent.MtimeSec, parent.MtimeNsec = sec, nsec
-	parent.CtimeSec, parent.CtimeNsec = sec, nsec
+	stampMtimeCtime(parent)
 
 	if err := b.writeInodeCached(parent); err != nil {
 		return err
@@ -537,8 +554,7 @@ func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) error 
 	}
 	// Bump the target's ctime: an nlink change is a metadata change
 	// (generic/755).
-	sec, nsec := nowTime()
-	child.CtimeSec, child.CtimeNsec = sec, nsec
+	stampCtime(child)
 	if err := b.writeInodeCached(child); err != nil {
 		b.cacheAbort()
 		return err

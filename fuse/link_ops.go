@@ -94,8 +94,7 @@ func (b *BrieFS) linkInDir(parentIno uint64, name string, targetIno uint64) (*br
 
 	// Bump the target's nlink + ctime.
 	target.Nlinks++
-	sec, nsec := nowTime()
-	target.CtimeSec, target.CtimeNsec = sec, nsec
+	stampCtime(target)
 	if err := b.writeInodeCached(target); err != nil {
 		b.cacheAbort()
 		return nil, err
@@ -234,8 +233,7 @@ func (b *BrieFS) removeRenameTarget(newParent *briefs.Inode, newParentIno uint64
 	} else {
 		target.Nlinks--
 	}
-	sec, nsec := nowTime()
-	target.CtimeSec, target.CtimeNsec = sec, nsec
+	stampCtime(target)
 	if err := b.writeInodeCached(target); err != nil {
 		return err
 	}
@@ -297,8 +295,7 @@ func (b *BrieFS) finishCrossDirMove(oldParent, newParent *briefs.Inode, oldParen
 
 	// The moved inode's ctime advances unconditionally (POSIX; kernel
 	// dir.c:1379 stamps it after the cross-dir block).
-	sec, nsec := nowTime()
-	moved.CtimeSec, moved.CtimeNsec = sec, nsec
+	stampCtime(moved)
 	if err := b.writeInodeCached(moved); err != nil {
 		return err
 	}
@@ -323,9 +320,30 @@ func (b *BrieFS) renameInDir(oldParentIno uint64, oldName string, newParentIno u
 	return b.renamePlain(oldParentIno, oldName, newParentIno, newName, flags)
 }
 
-// renamePlain handles a normal rename (optionally NOREPLACE, optionally
-// replacing an existing target). Mirrors briefs_rename's main path (dir.c:1202).
-func (b *BrieFS) renamePlain(oldParentIno uint64, oldName string, newParentIno uint64, newName string, flags uint32) error {
+// renameOp carries the shared rename prologue's results to the op body.
+type renameOp struct {
+	g           *inodeGetter
+	oldParent   *briefs.Inode
+	newParent   *briefs.Inode
+	inos        []uint64 // the shard list locked for the op
+	movedIno    uint64
+	movedFtype  uint8
+	targetIno   uint64
+	targetFtype uint8
+}
+
+// beginRename is the shared skeleton of the three rename variants: under
+// the global lock, read and validate both parents, look up the source entry
+// (ENOENT when missing) and the destination entry — required to exist for
+// exchange, otherwise probed with a NOREPLACE/EEXIST check (plain only;
+// WHITEOUT|NOREPLACE is not a valid combination and the whiteout path
+// ignores NOREPLACE) and a directory target pre-checked empty (the VFS
+// does not do that for ->rename).  Then begin the op cache, lock the
+// shards of every inode the op touches, and run @body under the dedup
+// getter.  The epilogue is shared too (fix B): any error aborts the op
+// cache, success merges it — records are in the ring, the metadata blocks
+// move to the deferred map, durable at the next journal sync.
+func (b *BrieFS) beginRename(oldParentIno uint64, oldName string, newParentIno uint64, newName string, flags uint32, body func(op *renameOp) error) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -344,19 +362,29 @@ func (b *BrieFS) renamePlain(oldParentIno uint64, oldName string, newParentIno u
 	if err != nil {
 		return syscall.ENOENT
 	}
-	targetIno, _, _ := TrieLookup(b.dev, newP0.DirTrieRoot, newName)
-	if targetIno != 0 && flags&renameNoreplace != 0 {
-		return syscall.EEXIST
-	}
 
-	// Pre-check a directory target is empty (the VFS does not for ->rename).
-	if targetIno != 0 {
-		tt, err := b.inodes.ReadInode(targetIno)
+	var targetIno uint64
+	var targetFtype uint8
+	if flags&renameExchange != 0 {
+		targetIno, targetFtype, err = TrieLookup(b.dev, newP0.DirTrieRoot, newName)
 		if err != nil {
-			return err
+			return syscall.ENOENT
 		}
-		if tt.IsDir() && !b.dirIsEmpty(tt) {
-			return syscall.ENOTEMPTY
+	} else {
+		targetIno, targetFtype, _ = TrieLookup(b.dev, newP0.DirTrieRoot, newName)
+		if targetIno != 0 && flags&renameNoreplace != 0 && flags&renameWhiteout == 0 {
+			return syscall.EEXIST
+		}
+		// Pre-check a directory target is empty (the VFS does not for
+		// ->rename).
+		if targetIno != 0 {
+			tt, err := b.inodes.ReadInode(targetIno)
+			if err != nil {
+				return err
+			}
+			if tt.IsDir() && !b.dirIsEmpty(tt) {
+				return syscall.ENOTEMPTY
+			}
 		}
 	}
 
@@ -379,54 +407,62 @@ func (b *BrieFS) renamePlain(oldParentIno uint64, oldName string, newParentIno u
 		b.cacheAbort()
 		return err
 	}
-	moved, err := g.get(movedIno)
-	if err != nil {
-		b.cacheAbort()
-		return err
-	}
 
-	// 1. Remove an existing target.
-	if targetIno != 0 {
-		target, err := g.get(targetIno)
-		if err != nil {
-			b.cacheAbort()
-			return err
-		}
-		if err := b.removeRenameTarget(newParent, newParentIno, newName, targetIno, target); err != nil {
-			b.cacheAbort()
-			return err
-		}
-	}
-
-	// 2. Remove the old entry, add the new entry.
-	if err := b.removeDirEntry(oldParent, oldName); err != nil {
+	if err := body(&renameOp{
+		g:           g,
+		oldParent:   oldParent,
+		newParent:   newParent,
+		inos:        inos,
+		movedIno:    movedIno,
+		movedFtype:  movedFtype,
+		targetIno:   targetIno,
+		targetFtype: targetFtype,
+	}); err != nil {
 		b.cacheAbort()
 		return err
 	}
-	if err := b.journalDirUpdate(oldParentIno, 0, oldName, 1, 0); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.addDirEntry(newParent, movedIno, newName, movedFtype); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.journalDirUpdate(newParentIno, movedIno, newName, 0, movedFtype); err != nil {
-		b.cacheAbort()
-		return err
-	}
-
-	// 3. Cross-dir dir move (parent_inode + parent nlinks), parent
-	// mtime/ctime, and the moved inode's ctime.
-	if err := b.finishCrossDirMove(oldParent, newParent, oldParentIno, newParentIno, moved); err != nil {
-		b.cacheAbort()
-		return err
-	}
-
-	// Op end (fix B): records are in the ring; the metadata blocks move to
-	// the deferred map, durable at the next journal sync.
 	b.mergeCache()
 	return nil
+}
+
+// renamePlain handles a normal rename (optionally NOREPLACE, optionally
+// replacing an existing target). Mirrors briefs_rename's main path (dir.c:1202).
+func (b *BrieFS) renamePlain(oldParentIno uint64, oldName string, newParentIno uint64, newName string, flags uint32) error {
+	return b.beginRename(oldParentIno, oldName, newParentIno, newName, flags, func(op *renameOp) error {
+		moved, err := op.g.get(op.movedIno)
+		if err != nil {
+			return err
+		}
+
+		// 1. Remove an existing target.
+		if op.targetIno != 0 {
+			target, err := op.g.get(op.targetIno)
+			if err != nil {
+				return err
+			}
+			if err := b.removeRenameTarget(op.newParent, newParentIno, newName, op.targetIno, target); err != nil {
+				return err
+			}
+		}
+
+		// 2. Remove the old entry, add the new entry.
+		if err := b.removeDirEntry(op.oldParent, oldName); err != nil {
+			return err
+		}
+		if err := b.journalDirUpdate(oldParentIno, 0, oldName, 1, 0); err != nil {
+			return err
+		}
+		if err := b.addDirEntry(op.newParent, op.movedIno, newName, op.movedFtype); err != nil {
+			return err
+		}
+		if err := b.journalDirUpdate(newParentIno, op.movedIno, newName, 0, op.movedFtype); err != nil {
+			return err
+		}
+
+		// 3. Cross-dir dir move (parent_inode + parent nlinks), parent
+		// mtime/ctime, and the moved inode's ctime.
+		return b.finishCrossDirMove(op.oldParent, op.newParent, oldParentIno, newParentIno, moved)
+	})
 }
 
 // renameExchange swaps two existing entries. Mirrors briefs_rename_exchange
@@ -434,141 +470,83 @@ func (b *BrieFS) renamePlain(oldParentIno uint64, oldName string, newParentIno u
 // records so replay re-derives the swap (a bare repoint would leave the old
 // pointer on replay).
 func (b *BrieFS) renameExchange(oldParentIno uint64, oldName string, newParentIno uint64, newName string) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	oldP0, err := b.inodes.ReadInode(oldParentIno)
-	if err != nil {
-		return err
-	}
-	newP0, err := b.inodes.ReadInode(newParentIno)
-	if err != nil {
-		return err
-	}
-	if !oldP0.IsDir() || !newP0.IsDir() {
-		return syscall.ENOTDIR
-	}
-	oldIno, oldFtype, err := TrieLookup(b.dev, oldP0.DirTrieRoot, oldName)
-	if err != nil {
-		return syscall.ENOENT
-	}
-	newIno, newFtype, err := TrieLookup(b.dev, newP0.DirTrieRoot, newName)
-	if err != nil {
-		return syscall.ENOENT
-	}
-
-	b.cacheBegin()
-	unlock := b.lockInodeShards([]uint64{oldParentIno, newParentIno, oldIno, newIno})
-	defer unlock()
-
-	g := newInodeGetter(b)
-	oldParent, err := g.get(oldParentIno)
-	if err != nil {
-		b.cacheAbort()
-		return err
-	}
-	newParent, err := g.get(newParentIno)
-	if err != nil {
-		b.cacheAbort()
-		return err
-	}
-	oldIn, err := g.get(oldIno)
-	if err != nil {
-		b.cacheAbort()
-		return err
-	}
-	newIn, err := g.get(newIno)
-	if err != nil {
-		b.cacheAbort()
-		return err
-	}
-
-	// Swap: old_name -> newIno, new_name -> oldIno.
-	if err := b.removeDirEntry(oldParent, oldName); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.journalDirUpdate(oldParentIno, 0, oldName, 1, 0); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.addDirEntry(oldParent, newIno, oldName, newFtype); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.journalDirUpdate(oldParentIno, newIno, oldName, 0, newFtype); err != nil {
-		b.cacheAbort()
-		return err
-	}
-
-	if err := b.removeDirEntry(newParent, newName); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.journalDirUpdate(newParentIno, 0, newName, 1, 0); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.addDirEntry(newParent, oldIno, newName, oldFtype); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.journalDirUpdate(newParentIno, oldIno, newName, 0, oldFtype); err != nil {
-		b.cacheAbort()
-		return err
-	}
-
-	// Cross-directory directory moves: swap parent_inode + .. nlinks.
-	cross := oldParentIno != newParentIno
-	if cross {
-		if oldIn.IsDir() {
-			oldIn.ParentInode = newParentIno
-			oldParent.Nlinks--
-			newParent.Nlinks++
-		}
-		if newIn.IsDir() {
-			newIn.ParentInode = oldParentIno
-			newParent.Nlinks--
-			oldParent.Nlinks++
-		}
-	}
-
-	// ctime on both moved inodes.
-	sec, nsec := nowTime()
-	oldIn.CtimeSec, oldIn.CtimeNsec = sec, nsec
-	newIn.CtimeSec, newIn.CtimeNsec = sec, nsec
-	if err := b.writeInodeCached(oldIn); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.journalInodeFull(oldIn); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.writeInodeCached(newIn); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.journalInodeFull(newIn); err != nil {
-		b.cacheAbort()
-		return err
-	}
-
-	if err := b.updateParentDir(oldParent, 0, 0); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if cross {
-		if err := b.updateParentDir(newParent, 0, 0); err != nil {
-			b.cacheAbort()
+	return b.beginRename(oldParentIno, oldName, newParentIno, newName, renameExchange, func(op *renameOp) error {
+		oldIn, err := op.g.get(op.movedIno)
+		if err != nil {
 			return err
 		}
-	}
+		newIn, err := op.g.get(op.targetIno)
+		if err != nil {
+			return err
+		}
 
-	// Op end (fix B): records are in the ring; the metadata blocks move to
-	// the deferred map, durable at the next journal sync.
-	b.mergeCache()
-	return nil
+		// Swap: old_name -> newIno, new_name -> oldIno.
+		if err := b.removeDirEntry(op.oldParent, oldName); err != nil {
+			return err
+		}
+		if err := b.journalDirUpdate(oldParentIno, 0, oldName, 1, 0); err != nil {
+			return err
+		}
+		if err := b.addDirEntry(op.oldParent, op.targetIno, oldName, op.targetFtype); err != nil {
+			return err
+		}
+		if err := b.journalDirUpdate(oldParentIno, op.targetIno, oldName, 0, op.targetFtype); err != nil {
+			return err
+		}
+
+		if err := b.removeDirEntry(op.newParent, newName); err != nil {
+			return err
+		}
+		if err := b.journalDirUpdate(newParentIno, 0, newName, 1, 0); err != nil {
+			return err
+		}
+		if err := b.addDirEntry(op.newParent, op.movedIno, newName, op.movedFtype); err != nil {
+			return err
+		}
+		if err := b.journalDirUpdate(newParentIno, op.movedIno, newName, 0, op.movedFtype); err != nil {
+			return err
+		}
+
+		// Cross-directory directory moves: swap parent_inode + .. nlinks.
+		cross := oldParentIno != newParentIno
+		if cross {
+			if oldIn.IsDir() {
+				oldIn.ParentInode = newParentIno
+				op.oldParent.Nlinks--
+				op.newParent.Nlinks++
+			}
+			if newIn.IsDir() {
+				newIn.ParentInode = oldParentIno
+				op.newParent.Nlinks--
+				op.oldParent.Nlinks++
+			}
+		}
+
+		// ctime on both moved inodes.
+		sec, nsec := nowTime()
+		oldIn.CtimeSec, oldIn.CtimeNsec = sec, nsec
+		newIn.CtimeSec, newIn.CtimeNsec = sec, nsec
+		if err := b.writeInodeCached(oldIn); err != nil {
+			return err
+		}
+		if err := b.journalInodeFull(oldIn); err != nil {
+			return err
+		}
+		if err := b.writeInodeCached(newIn); err != nil {
+			return err
+		}
+		if err := b.journalInodeFull(newIn); err != nil {
+			return err
+		}
+
+		if err := b.updateParentDir(op.oldParent, 0, 0); err != nil {
+			return err
+		}
+		if cross {
+			return b.updateParentDir(op.newParent, 0, 0)
+		}
+		return nil
+	})
 }
 
 // renameWhiteout renames the source to the destination and leaves a chardev
@@ -577,147 +555,81 @@ func (b *BrieFS) renameExchange(oldParentIno uint64, oldName string, newParentIn
 // it, and the old entry is repointed in place (no trie alloc) so an ENOSPC
 // abort leaves the source intact.
 func (b *BrieFS) renameWhiteout(oldParentIno uint64, oldName string, newParentIno uint64, newName string) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	oldP0, err := b.inodes.ReadInode(oldParentIno)
-	if err != nil {
-		return err
-	}
-	newP0, err := b.inodes.ReadInode(newParentIno)
-	if err != nil {
-		return err
-	}
-	if !oldP0.IsDir() || !newP0.IsDir() {
-		return syscall.ENOTDIR
-	}
-	movedIno, movedFtype, err := TrieLookup(b.dev, oldP0.DirTrieRoot, oldName)
-	if err != nil {
-		return syscall.ENOENT
-	}
-	targetIno, _, _ := TrieLookup(b.dev, newP0.DirTrieRoot, newName)
-	if targetIno != 0 {
-		tt, err := b.inodes.ReadInode(targetIno)
+	return b.beginRename(oldParentIno, oldName, newParentIno, newName, renameWhiteout, func(op *renameOp) error {
+		moved, err := op.g.get(op.movedIno)
 		if err != nil {
 			return err
 		}
-		if tt.IsDir() && !b.dirIsEmpty(tt) {
-			return syscall.ENOTEMPTY
+
+		// 1. Replace an existing target (failure here leaves the source intact).
+		if op.targetIno != 0 {
+			target, err := op.g.get(op.targetIno)
+			if err != nil {
+				return err
+			}
+			if err := b.removeRenameTarget(op.newParent, newParentIno, newName, op.targetIno, target); err != nil {
+				return err
+			}
 		}
-	}
 
-	b.cacheBegin()
-	inos := []uint64{oldParentIno, newParentIno, movedIno}
-	if targetIno != 0 {
-		inos = append(inos, targetIno)
-	}
-	unlock := b.lockInodeShards(inos)
-	defer unlock()
-
-	g := newInodeGetter(b)
-	oldParent, err := g.get(oldParentIno)
-	if err != nil {
-		b.cacheAbort()
-		return err
-	}
-	newParent, err := g.get(newParentIno)
-	if err != nil {
-		b.cacheAbort()
-		return err
-	}
-	moved, err := g.get(movedIno)
-	if err != nil {
-		b.cacheAbort()
-		return err
-	}
-
-	// 1. Replace an existing target (failure here leaves the source intact).
-	if targetIno != 0 {
-		target, err := g.get(targetIno)
+		// 2. Allocate the whiteout chardev and journal its snapshot BEFORE any dir
+		//    record references it.  S_IFCHR | 0600 like the kernel (dir.c:1036):
+		//    a zero-perm whiteout made go-fuse's reply patcher (without
+		//    NullPermissions) advertise it as drwxr-xr-x, so nothing could
+		//    remove it (generic/585).
+		whiteout, err := b.AllocInode(modeWhiteout, 0, 0, oldParentIno)
 		if err != nil {
-			b.cacheAbort()
 			return err
 		}
-		if err := b.removeRenameTarget(newParent, newParentIno, newName, targetIno, target); err != nil {
-			b.cacheAbort()
+		// Dedup the whiteout's shard against ALL shards held above, not just the
+		// parent's: the fresh slot can share a shard with the moved or target
+		// inode's block, and re-locking it would self-deadlock (see
+		// lockInodeBlockUnlessHeld).
+		wUnlock := b.lockInodeBlockUnlessHeld(op.inos, whiteout.InodeNumber)
+		defer func() {
+			if wUnlock != nil {
+				wUnlock.Unlock()
+			}
+		}()
+		if err := b.writeInodeCached(whiteout); err != nil {
+			_ = b.FreeInode(whiteout.InodeNumber)
 			return err
 		}
-	}
-
-	// 2. Allocate the whiteout chardev and journal its snapshot BEFORE any dir
-	//    record references it.  S_IFCHR | 0600 like the kernel (dir.c:1036):
-	//    a zero-perm whiteout made go-fuse's reply patcher (without
-	//    NullPermissions) advertise it as drwxr-xr-x, so nothing could
-	//    remove it (generic/585).
-	whiteout, err := b.AllocInode(modeWhiteout, 0, 0, oldParentIno)
-	if err != nil {
-		b.cacheAbort()
-		return err
-	}
-	// Dedup the whiteout's shard against ALL shards held above, not just the
-	// parent's: the fresh slot can share a shard with the moved or target
-	// inode's block, and re-locking it would self-deadlock (see
-	// lockInodeBlockUnlessHeld).
-	wUnlock := b.lockInodeBlockUnlessHeld(inos, whiteout.InodeNumber)
-	defer func() {
-		if wUnlock != nil {
-			wUnlock.Unlock()
+		// Arm the fresh whiteout slot (with its new generation) in the page
+		// cache before its snapshot is committed, so replay's generation guard
+		// finds it (see writeThroughFreshInodeSlot).
+		if err := b.writeThroughFreshInodeSlot(whiteout); err != nil {
+			_ = b.FreeInode(whiteout.InodeNumber)
+			return err
 		}
-	}()
-	if err := b.writeInodeCached(whiteout); err != nil {
-		_ = b.FreeInode(whiteout.InodeNumber)
-		b.cacheAbort()
-		return err
-	}
-	// Arm the fresh whiteout slot (with its new generation) in the page
-	// cache before its snapshot is committed, so replay's generation guard
-	// finds it (see writeThroughFreshInodeSlot).
-	if err := b.writeThroughFreshInodeSlot(whiteout); err != nil {
-		_ = b.FreeInode(whiteout.InodeNumber)
-		b.cacheAbort()
-		return err
-	}
-	if err := b.journalInodeFull(whiteout); err != nil {
-		_ = b.FreeInode(whiteout.InodeNumber)
-		b.cacheAbort()
-		return err
-	}
+		if err := b.journalInodeFull(whiteout); err != nil {
+			_ = b.FreeInode(whiteout.InodeNumber)
+			return err
+		}
 
-	// 3. Repoint the old entry to the whiteout in place (no trie alloc).
-	wFtype := uint8(modeChr >> 12)
-	if err := b.TrieUpdateEntry(oldParent, oldName, whiteout.InodeNumber, wFtype); err != nil {
-		_ = b.FreeInode(whiteout.InodeNumber)
-		b.cacheAbort()
-		return err
-	}
-	if err := b.journalDirUpdate(oldParentIno, 0, oldName, 1, 0); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.journalDirUpdate(oldParentIno, whiteout.InodeNumber, oldName, 0, wFtype); err != nil {
-		b.cacheAbort()
-		return err
-	}
+		// 3. Repoint the old entry to the whiteout in place (no trie alloc).
+		wFtype := uint8(modeChr >> 12)
+		if err := b.TrieUpdateEntry(op.oldParent, oldName, whiteout.InodeNumber, wFtype); err != nil {
+			_ = b.FreeInode(whiteout.InodeNumber)
+			return err
+		}
+		if err := b.journalDirUpdate(oldParentIno, 0, oldName, 1, 0); err != nil {
+			return err
+		}
+		if err := b.journalDirUpdate(oldParentIno, whiteout.InodeNumber, oldName, 0, wFtype); err != nil {
+			return err
+		}
 
-	// 4. Add the new entry pointing at the source inode.
-	if err := b.addDirEntry(newParent, movedIno, newName, movedFtype); err != nil {
-		b.cacheAbort()
-		return err
-	}
-	if err := b.journalDirUpdate(newParentIno, movedIno, newName, 0, movedFtype); err != nil {
-		b.cacheAbort()
-		return err
-	}
+		// 4. Add the new entry pointing at the source inode.
+		if err := b.addDirEntry(op.newParent, op.movedIno, newName, op.movedFtype); err != nil {
+			return err
+		}
+		if err := b.journalDirUpdate(newParentIno, op.movedIno, newName, 0, op.movedFtype); err != nil {
+			return err
+		}
 
-	// 5. Cross-dir dir move (parent_inode + parent nlinks), parent
-	// mtime/ctime, and the moved inode's ctime.
-	if err := b.finishCrossDirMove(oldParent, newParent, oldParentIno, newParentIno, moved); err != nil {
-		b.cacheAbort()
-		return err
-	}
-
-	// Op end (fix B): records are in the ring; the metadata blocks move to
-	// the deferred map, durable at the next journal sync.
-	b.mergeCache()
-	return nil
+		// 5. Cross-dir dir move (parent_inode + parent nlinks), parent
+		// mtime/ctime, and the moved inode's ctime.
+		return b.finishCrossDirMove(op.oldParent, op.newParent, oldParentIno, newParentIno, moved)
+	})
 }

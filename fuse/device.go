@@ -215,7 +215,14 @@ func (bd *BlockDevice) kickPendingWB() error {
 	if blocks == nil {
 		return nil
 	}
+	return forEachWBRun(blocks, bd.kickWBRange)
+}
 
+// forEachWBRun coalesces a sorted block snapshot into maximal contiguous
+// runs and calls range on each [first,last] — a burst of adjacent writes
+// (extent data, allocator pool rewrites) then drains in one
+// sync_file_range call per run instead of one per block.
+func forEachWBRun(blocks []uint64, rng func(first, last uint64) error) error {
 	var first, last uint64
 	for i, b := range blocks {
 		if i > 0 && b == last+1 {
@@ -223,13 +230,13 @@ func (bd *BlockDevice) kickPendingWB() error {
 			continue
 		}
 		if i > 0 {
-			if err := bd.kickWBRange(first, last); err != nil {
+			if err := rng(first, last); err != nil {
 				return err
 			}
 		}
 		first, last = b, b
 	}
-	return bd.kickWBRange(first, last)
+	return rng(first, last)
 }
 
 // kickWBRange starts (does not wait for) writeback of blocks [first,last].
@@ -262,23 +269,7 @@ func (bd *BlockDevice) FlushPendingWB() error {
 	if blocks == nil {
 		return nil
 	}
-
-	// Coalesce into contiguous runs so a burst of adjacent writes (extent
-	// data, allocator pool rewrites) drains in one sync_file_range call.
-	var first, last uint64
-	for i, b := range blocks {
-		if i > 0 && b == last+1 {
-			last = b
-			continue
-		}
-		if i > 0 {
-			if err := bd.syncWBRange(first, last); err != nil {
-				return err
-			}
-		}
-		first, last = b, b
-	}
-	return bd.syncWBRange(first, last)
+	return forEachWBRun(blocks, bd.syncWBRange)
 }
 
 // syncWBRange waits for writeback of blocks [first,last] (inclusive) to

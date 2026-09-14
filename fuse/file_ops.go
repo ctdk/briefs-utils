@@ -263,24 +263,15 @@ func (b *BrieFS) writeFileData(ctx context.Context, ino uint64, data []byte, off
 	}
 	totalSize := off + int64(len(data))
 
-	// Inline-data path: the file is inline (or empty) and the whole write fits
-	// in the 256-byte inline region.
 	// Inline-data path: the file is already inline, or it is truly empty (no
 	// extents — a size-0 file with fallocated unwritten extents is NOT empty and
 	// must stay extent-backed, else the write orphans the preallocated extents).
 	if in.Flags&briefs.InodeFlagInlineData != 0 || (oldSize == 0 && in.NumExtentsTotal == 0) {
 		if totalSize <= inlineDataMax {
 			b.writeInlineData(in, data, off, totalSize)
-			// Inline data lives in the snapshot-trusted inode block.  Fix B:
-			// journal the snapshot and defer the block (writeInodeOwned) —
-			// the kernel does not sync per buffered write; the block is
-			// durable at the next journal sync after the commit point.
-			if err := b.journalInodeFull(in); err != nil {
-				b.failWrite()
-				return 0, err
-			}
-			if err := b.writeInodeOwned(in); err != nil {
-				b.failWrite()
+			// Inline data lives in the snapshot-trusted inode block: the
+			// metadata-only commit (journal the snapshot, defer the block).
+			if err := b.commitInodeMetadata(in); err != nil {
 				return 0, err
 			}
 			return len(data), nil
@@ -324,9 +315,7 @@ func (b *BrieFS) writeInlineData(in *briefs.Inode, data []byte, off, totalSize i
 	if totalSize > int64(in.FileSize) {
 		in.FileSize = uint64(totalSize)
 	}
-	sec, nsec := nowTime()
-	in.MtimeSec, in.MtimeNsec = sec, nsec
-	in.CtimeSec, in.CtimeNsec = sec, nsec
+	stampMtimeCtime(in)
 }
 
 // promoteInlineData converts an inline-data inode to extent-backed, mirroring
@@ -511,9 +500,7 @@ func (b *BrieFS) writeExtentData(in *briefs.Inode, data []byte, off, oldSize int
 	if end > oldSize {
 		in.FileSize = uint64(end)
 	}
-	sec, nsec := nowTime()
-	in.MtimeSec, in.MtimeNsec = sec, nsec
-	in.CtimeSec, in.CtimeNsec = sec, nsec
+	stampMtimeCtime(in)
 
 	// --- Phase 2: journal + drain + commit + free old + write inode ---
 	// A conversion shrank the unwritten region: lower the metadata shield
@@ -605,24 +592,52 @@ func (b *BrieFS) commitExtentChange(in *briefs.Inode, allocatedRels *runAccum, f
 	return b.writeInodeOwned(in)
 }
 
+// commitRebuiltExtents finishes an op that stored its new extent list
+// through the localized rebuild: on a rebuild failure roll the op's
+// allocations (including the caller's, e.g. an inline promotion folded into
+// the same accum) back out; otherwise shrink the unwritten-extent shield to
+// the new list (the freed blocks may have been unwritten — kernel parity:
+// every extent-changing op recompute-releases) and hand the commit the
+// rebuild's replaced-node set.
+func (b *BrieFS) commitRebuiltExtents(in *briefs.Inode, tree *extentTree, newExts []briefs.Extent, allocated *runAccum, freed []blockRun) error {
+	oldNodes, err := b.rebuildExtentIndexWrite(in, tree, newExts, allocated)
+	if err != nil {
+		b.rollbackAlloc(*allocated)
+		return err
+	}
+	b.updateUnwrittenRes(in.InodeNumber, newExts)
+	return b.commitExtentChange(in, allocated, freed, oldNodes)
+}
+
+// patchInodeSlot reads the inode-table block containing @in, patches its
+// slot with the marshaled inode, and returns the patched block (and its
+// number) for the caller to store.  The caller must hold the inode's
+// inodeBlockLock so no other op touches the same block concurrently.
+func (b *BrieFS) patchInodeSlot(in *briefs.Inode) (blk uint64, buf []byte, err error) {
+	blk, off := b.inodes.inodeLocation(in.InodeNumber)
+	buf, err = b.dev.ReadBlock(blk)
+	if err != nil {
+		return 0, nil, err
+	}
+	data, err := in.MarshalBinary()
+	if err != nil {
+		return 0, nil, err
+	}
+	copy(buf[off:], data)
+	return blk, buf, nil
+}
+
 // writeInodeDirect reads the inode-table block, patches the inode's slot with
-// the marshaled inode, and writes the whole 4K block back atomically. The
-// caller must hold the inode's inodeBlockLock so no other op touches the same
-// block concurrently. Used by the file-write paths that commit the journal
+// the marshaled inode, and writes the whole 4K block back atomically.
+// Used by the file-write paths that commit the journal
 // first (free-gating syncs / commitExtentChange): the block is written to the
 // device page cache AND upserted into the deferred-metadata map so a later
 // drain can never regress the page cache to a version without this patch.
 func (b *BrieFS) writeInodeDirect(in *briefs.Inode) error {
-	blk, off := b.inodes.inodeLocation(in.InodeNumber)
-	buf, err := b.dev.ReadBlock(blk)
+	blk, buf, err := b.patchInodeSlot(in)
 	if err != nil {
 		return err
 	}
-	data, err := in.MarshalBinary()
-	if err != nil {
-		return err
-	}
-	copy(buf[off:], data)
 	if err := b.dev.WriteBlock(blk, buf); err != nil {
 		return err
 	}
@@ -637,17 +652,31 @@ func (b *BrieFS) writeInodeDirect(in *briefs.Inode) error {
 // metadata buffers dirty only at sync time).  Like writeInodeDirect the
 // caller must hold the inode's inodeBlockLock.
 func (b *BrieFS) writeInodeOwned(in *briefs.Inode) error {
-	blk, off := b.inodes.inodeLocation(in.InodeNumber)
-	buf, err := b.dev.ReadBlock(blk)
+	blk, buf, err := b.patchInodeSlot(in)
 	if err != nil {
 		return err
 	}
-	data, err := in.MarshalBinary()
-	if err != nil {
-		return err
-	}
-	copy(buf[off:], data)
 	b.setDirtyBlock(blk, buf)
+	return nil
+}
+
+// commitInodeMetadata is the metadata-only commit shared by every op that
+// changes no extents (chmod/chown/utimes, chattr, punch/zero-range boundary
+// zeroing, inline truncates): journal a JRN_INODE_FULL snapshot of @in and
+// defer the inode block (writeInodeOwned).  Fix B: no per-op journal sync
+// (kernel parity: the kernel does not sync per metadata op); the block is
+// durable at the next journal sync after the commit point.  A failure
+// fails the write — the daemon stops taking new ops, so the change never
+// partially happened.
+func (b *BrieFS) commitInodeMetadata(in *briefs.Inode) error {
+	if err := b.journalInodeFull(in); err != nil {
+		b.failWrite()
+		return err
+	}
+	if err := b.writeInodeOwned(in); err != nil {
+		b.failWrite()
+		return err
+	}
 	return nil
 }
 
