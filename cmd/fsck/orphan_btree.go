@@ -38,10 +38,24 @@ func reclaimOrphanBtree(fs *fsckState, plan *repairPlan, opts *repairOptions, bl
 		return nil
 	}
 
-	hdr := make([]byte, 4)
 	reclaimed := 0
 	unreadable := 0
 	orphans := 0
+
+	// Chunked magic peek: candidates are visited in ascending block order, so
+	// one large read window serves every candidate it covers. The window is
+	// reloaded only when a candidate falls outside it — a dense run of
+	// candidates costs one read per window instead of a 4-byte ReadAt (a
+	// syscall per block), which dominated this pass on fragmented
+	// multi-gigabyte images. The magic check itself is unchanged: the first
+	// 4 bytes of the block, compared against BtreeMagic. A non-B-tree
+	// allocated block (data extent, etc.) that is somehow not in usedBlocks
+	// is a leaked-block concern handled by verifyBlockCrossReference, not
+	// this pass.
+	const windowBytes = 1 << 20
+	win := make([]byte, windowBytes)
+	winBase := ^uint64(0) // byte offset of win[0]; the impossible value = none loaded
+	winLen := uint64(0)   // valid bytes in win
 
 	for relBlk := uint64(0); relBlk < dataBlockCount; relBlk++ {
 		absBlk := dataRegionStart + relBlk
@@ -55,18 +69,22 @@ func reclaimOrphanBtree(fs *fsckState, plan *repairPlan, opts *repairOptions, bl
 			continue
 		}
 
-		// Read the first 4 bytes and check for BtreeMagic. A non-B-tree allocated
-		// block (data extent, etc.) that is somehow not in usedBlocks is a
-		// leaked-block concern handled by verifyBlockCrossReference, not this pass.
-		if _, err := fs.file.ReadAt(hdr, int64(absBlk*blockSize)); err != nil {
-			// Unreadable: leave allocated, don't reclaim — could be a real block
-			// on a bad medium.
-			fs.reportLimited(&unreadable, 20, fs.warnf,
-				"(more unreadable-block warnings suppressed)",
-				"orphan B-tree scan: block %d unreadable (%v), left allocated", absBlk, err)
-			continue
+		off := absBlk * blockSize
+		if off < winBase || off+4 > winBase+winLen {
+			winBase = off
+			n, err := fs.file.ReadAt(win, int64(off))
+			winLen = uint64(n)
+			if winLen < 4 || (err != nil && winLen == 0) {
+				// Unreadable: leave allocated, don't reclaim — could be a real
+				// block on a bad medium. A short read that still covers the 4
+				// magic bytes (end of device) is fine.
+				fs.reportLimited(&unreadable, 20, fs.warnf,
+					"(more unreadable-block warnings suppressed)",
+					"orphan B-tree scan: block %d unreadable (%v), left allocated", absBlk, err)
+				continue
+			}
 		}
-		if binary.LittleEndian.Uint32(hdr) != briefs.BtreeMagic {
+		if binary.LittleEndian.Uint32(win[off-winBase:]) != briefs.BtreeMagic {
 			continue
 		}
 
