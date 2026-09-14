@@ -8,7 +8,9 @@ ports the kernel journal write path + journal-replay-on-mount to Go, making a
 FUSE-written volume crash-consistent, recoverable, and kernel-mountable.
 
 This document records the xfstests status for the FUSE-mounted BrieFS as of
-2026-09-06.
+2026-09-14 — the close of the 09-06→09-14 campaign series, which took the
+full generic suite from 188 PASS / 110 FAIL / 63 HANG to
+328 / 32 / 0 (see "Current status").
 
 > **Correction history — two harness bugs, two invalid records.**
 >
@@ -34,6 +36,75 @@ This document records the xfstests status for the FUSE-mounted BrieFS as of
 > trustworthy per-test FUSE-bridge record, from the 2026-09-06 re-run with the
 > kernel module **removed** so any residual kernel mount fails loudly instead
 > of silently succeeding.
+
+## Current status (2026-09-14)
+
+Full generic suite (793 tests, kernel module removed, one mkfs/mount per
+test via the wrappers). The three most recent full runs:
+
+| Run | PASS | FAIL | NOT RUN | SKIP | HANG |
+|-----|-----:|-----:|--------:|-----:|-----:|
+| 20260912-132029 (baseline, post 09-08..09-12 campaigns) | 300 | 59 | 431 | 2 | 1 |
+| 20260913-201548 (Family 1 fixed) | 327 | 33 | 431 | 2 | 0 |
+| 20260914-021234 (closing run, `-o` plumbing fixed) | **328** | **32** | 431 | 2 | **0** |
+
+- **NOT RUN 431** is a constant set across all three runs (430 in the
+  2026-09-07 first honest run) — tests whose prerequisites the FUSE
+  harness cannot meet (fiemap, exchange-range, O_TMPFILE, quota, dax, …).
+- **SKIP (2)**: generic/475 (dm-error soak wedge — see Known issues) and
+  generic/492.
+- Closing run vs baseline: 27 FAIL→PASS (the 20 Family-1 tests plus
+  126 237 294 317 318 452 547), 476 HANG→PASS, and **zero PASS→FAIL
+  regressions** — the campaign's acceptance criterion.
+
+### The 32 remaining FAILs
+
+All 32 were failing at the 2026-09-12 baseline and are untouched by the
+Family-1 campaign — previously triaged residue, no new failures:
+
+```
+003 026 079 099 108 184 192 213 250 252 285 306 319 423 424 426
+434 441 467 477 484 500 504 512 520 537 563 589 631 732 741 756
+```
+
+Known characterizations:
+
+- **003** — atime never updated on read (open bridge gap; see Known
+  issues).
+- **250, 252** — DIO stress shapes that the kernel module passes and the
+  bridge does not.
+- **520** — `sync(2)` is a structural no-op on a non-fuseblk FUSE mount
+  (accepted; see the coverage gaps section).
+- **563** — cgroup writeback; the kernel module also accepts this failure
+  (`SB_I_CGROUPWB` dropped for the 6.12 CVE-2026-31703 iput race).
+- **537** — the ro/dax mount-option family.
+
+### Family 1 — permission/setid/privilege tests (closed 2026-09-13)
+
+generic/087 088 093 125 193 256 314 355 375 444 597 598 633 680 683
+684 685 688 696 697 — all 20 failed at the baseline; all 20 PASS since
+run-20260913-200549. Nine root causes, all fixed in this repo on
+`bu-refactor-1`:
+
+| Root cause | Fix |
+|---|---|
+| No `allow_other`: `fuse_permissible_uidgid` EACCES'd every non-daemon-uid process before any semantics ran | `628bd48` |
+| Unconditional killpriv — the kernel strips nothing on fallocate without killpriv_v2, so the daemon must, gated per fs/attr.c (CAP_FSETID, S_ISREG, S_IXGRP/in-group); security.capability removal always | `9aa8ae6` (caller status from /proc) + `d319c89` (gating) |
+| FUSE never runs `inode_init_owner`: setgid-directory gid inheritance missing | `846c5b6` |
+| Create modes applied verbatim — no umask, no default-ACL computation | `2aff8e9` |
+| `fc->dont_mask` comes only from the daemon's init reply (FUSE_DONT_MASK), not SB_POSIXACL — the kernel pre-masked create modes with the umask | `0eb4d12` |
+| The kernel delegates the ACL→mode update to the daemon on `setfacl`; the bridge stored the access-ACL blob verbatim | `1b2528c` |
+| `fuse_setattr` never runs `posix_acl_chmod`: a chmod left the stored access ACL stale, so a later matching `setfacl` issued no setxattr | `c4688dc` |
+| fusermount3 mounts nosuid,nodev,noexec — setid exec from the mount impossible | `5a2093b` |
+| `mount.fuse.briefs` discarded the `-o` value, so `mount -t fuse.briefs -o nosuid` never reached the FUSE mount (generic/128 was a vacuous baseline pass unmasked by allow_other) | `9bd009c` |
+
+The detailed R1–R8 root-cause table, the validation-ladder history, and
+the go-fuse 2.10.1 contract facts (no `setxattr_flags` without
+FUSE_SETXATTR_EXT; CAP numbering follows the kernel uapi not libfuse;
+CAP_DONT_MASK via `ExtraCapabilities`) live in the kernel repo's
+`tests/xfstests/xfstests-fuse-status.md`; run archives in the kernel
+repo's `tests/xfstests/runs/` (closing archive
+`run-20260914-021234-fuse.txt`).
 
 ## How to run xfstests against the FUSE mount
 
@@ -136,7 +207,9 @@ sudo bash -c 'export HOST_OPTIONS=/xfstests/configs/briefs-fuse.config \
   strips it and substitutes `-t fuse.briefs` so `mount(8)` dispatches to
   `/usr/sbin/mount.fuse.briefs`, which backgrounds the `fuse.briefs` daemon,
   records its PID, and waits for the mountpoint to come up. `-o` opts are
-  forwarded (the daemon currently ignores them).
+  forwarded to the daemon via `--mount-opts` (briefs-utils `9bd009c`):
+  nosuid/nodev/noexec drop the matching permissive default, and anything
+  unrecognized passes through for the kernel mount to validate.
 - `mount.fuse.briefs <src> <target>`: the `mount(8)` type helper. Launches
   `fuse.briefs -i <src> -m <target>` as a transient systemd service
   (`systemd-run --unit=… --collect` in `system.slice`, so the daemon survives
@@ -170,7 +243,15 @@ teaching. These changes are in the `xfstests-dev` tree:
   xfstests treats the device as unmounted (`_check_if_dev_already_mounted` →
   `_exit 1`), the systematic empty-output failure every test hit before this.
 
-## Results (2026-09-06, kernel module removed, child-mount bypass fixed)
+## Results (2026-09-06 subset run — historical, the first honest record)
+
+The 2026-09-06 run was the first trustworthy per-test record (10-test
+replay-sensitive subset). Every real bridge bug it surfaced has since been
+fixed — 011 and 013 (readdir under concurrent modification, the fixed
+256-byte trie-iterator name stack), 029 (mmap-writeback tail loss), and
+322 (sparse-write i_size loss) all PASS in the 2026-09-12 baseline full
+run and every run since; only 003 (atime) remains open. Keep the detail
+below for the root-cause history.
 
 Pre-fix sanity run (harness fix not yet applied, module removed → bypass made
 loud): 0 PASS / 8 FAIL / 2 NOT RUN — every scratch test died with
@@ -226,6 +307,11 @@ and the rename journal-ordering scenario genuinely under FUSE.
 | 2026-09-06 (pre-fix) | 0/8/2 | valid but uninformative — proves the bypass (loud kernel-mount failures) |
 | 2026-09-06 (post-fix) | see table above | **first trustworthy per-test FUSE record** |
 | 2026-09-07 | generic/030 re-run: PASS | valid — first clean 030 pass; scope-kill harness fix (`mount.fuse.briefs`) validated |
+| 2026-09-07 (full suite) | 188/110/63 (run-20260907-225019) | first honest full-suite run — surfaced the 63-HANG class (per-op journal checkpoint throughput blowout, not deadlocks) and the four subset bugs at full-suite scale |
+| 2026-09-11 (full suite) | 277/72/11 | after fixes A/B/C + the rebuild-amplification and journal run-encoding campaigns |
+| 2026-09-12 (full suite) | 289/67/4, then 300/59/1 | re-run #2 after the OOM/replay-anchor fixes; run #3 is the Family-1 baseline (all closures held; 476 raised to a 900 s budget and solo PASS) |
+| 2026-09-13 (full suite) | 327/33/0 (run-20260913-201548) | Family 1 closed — 27 promotions, 476 HANG→PASS, one regression generic/128 (root cause R8, fixed after the run) |
+| 2026-09-14 (full suite) | **328/32/0 (run-20260914-021234)** | closing record — 128 fixed by the `-o` plumbing, zero baseline regressions |
 
 ## Kernel interop
 
@@ -275,14 +361,20 @@ body also completed its crash-replay scenario before the harness wedge.
 
 ## Known issues
 
-### generic/003 — atime never updated (real bridge gap)
+### generic/003 — atime never updated (real bridge gap — OPEN, the only remaining confirmed bridge bug)
 
 All four atime checks fail. The bridge never advances atime on read
 operations; since FUSE getattr is served by the daemon, its stored atime
 shadows whatever the kernel VFS might have cached. Fix: update atime (with
 relatime-style throttling to taste) in the bridge's read path.
 
-### generic/029 — mmap write after truncate-down/up loses the past-page tail (real bridge bug)
+### generic/029 — mmap write after truncate-down/up loses the past-page tail (FIXED)
+
+Both this and the 322 size bug below were closed by the 2026-09-09..09-12
+fix series (tail/boundary zeroing via the pre-commit drain, read-hole full
+read count, fresh-slot write-through); 029 and 322 both PASS in the
+2026-09-12 baseline full run and every run since. Original triage kept
+for the root-cause history:
 
 All three cases, both pre- and post-remount: expected file size 5120/5121
 bytes, actual 4096 — the mwrite region `[4096, 5120)` is lost while
@@ -293,7 +385,7 @@ that follows a truncate-up. Needs debug in `fuse/file_ops.go` (write-back
 handling of partial final blocks) — plausibly related to the 322 size bug
 below.
 
-### generic/322 — sparse write past EOF does not advance i_size (real bridge bug)
+### generic/322 — sparse write past EOF does not advance i_size (FIXED — see the 029 note above)
 
 `pwrite 2M 1M` on a 1 MiB file reports full success, but the file still reads
 back as 1 MiB afterward (pre-drop md5 equals the 1 MiB-file hash) — the data
@@ -301,7 +393,10 @@ extent and/or the size update for a write starting past EOF is dropped.
 Replay is not implicated (wrong before the flakey drop). Needs debug in the
 bridge's write path (hole creation + size extension for offset > i_size).
 
-### generic/475 — dm-error soak wedge (harness/daemon wedge, body passed)
+### generic/475 — dm-error soak wedge (on the SKIP list)
+
+Skipped in every full run since (SKIP_TESTS includes 475; generic/492 is
+the other skip). Original triage kept for the record:
 
 The test's crash-replay content completed, but 4 fsstress workers entered
 uninterruptible D-state against the dm-error scratch mount and stayed there
@@ -350,6 +445,11 @@ cumulative depth overflows the trie iterator's fixed 256-byte name stack,
 which drops entries silently (see the 2026-09-04 review, E1 secondary) —
 concrete root-cause lead for the 011 bug.
 
+**Fully closed since**: the E1 fix (`TrieSiblingMax` cap + the
+dynamic-stack `TrieIterator`, briefs-utils `09c7fbc`) made the iterator
+safe for deep/long name chains; 011 and 013 both PASS from the 2026-09-12
+baseline full run onward.
+
 ### Retracted: generic/547 "metadata mismatch" (was a kernel flake)
 
 The Aug-6 547 failure narrative (replay non-idempotence via the deferred
@@ -365,19 +465,23 @@ implicated in any observed failure.
 `FS_IOC_FIEMAP` ioctl. Not a failure; a feature gap. Implementing fiemap in
 the bridge would let 032 run.
 
-### generic/011 — dirstress "Directory not empty" (real bridge bug, confirmed)
+### generic/011 — dirstress "Directory not empty" (FIXED — the E1 dynamic-stack TrieIterator)
 
 First seen in the Aug-6 run (the one genuine FUSE result of that run, via
 `$TEST_DIR`), and reproduced identically by the 2026-09-06 honest run:
 `rm: … Directory not empty` during dirstress cleanup — readdir does not
 enumerate all entries under concurrent modification (rm does not see the
-entries to remove, but rmdir sees the directory as non-empty). Needs
-investigation in the bridge's readdir/trie-iteration path under concurrency.
+entries to remove, but rmdir sees the directory as non-empty). Root cause
+confirmed via 013's failure shape (long name components overflowing the
+trie iterator's fixed 256-byte name stack, silently dropping entries);
+fixed by briefs-utils `09c7fbc` (E1: `TrieSiblingMax` cap + dynamic-stack
+`TrieIterator`). 011 and 013 both PASS from the 2026-09-12 baseline full
+run onward.
 
 ## FUSE bridge coverage
 
 The FUSE bridge implements all BrieFS operations at full kernel parity
-(feature list updated 2026-09-06 for the bu-refactor-1 branch):
+(feature list updated 2026-09-14 for the bu-refactor-1 branch):
 
 - **Directory ops**: create, mkdir, unlink, rmdir (with journal ordering +
   trie root pinning).
@@ -411,11 +515,24 @@ The FUSE bridge implements all BrieFS operations at full kernel parity
   records.
 - **Per-inode-block locking**: sharded per-inode-table-block mutexes for
   concurrent file writes on disjoint blocks.
-- **Known gaps surfaced by the 2026-09-06 run**: atime maintenance on read
-  (003), mmap-writeback size extension past a truncate-up (029), sparse-write
-  i_size extension (322), fiemap (`FS_IOC_FIEMAP` — gates `generic/032` to
-  NOT RUN), and the file-range exchange ioctls (XFS_IOC_EXCHANGE_RANGE/
-  SWAP_RANGE, COMMIT_RANGE — deferred, rationale in `fuse/ioctl_mount.go`).
+- **Permissions / setid / privilege parity (Family 1, 2026-09-13/14)**:
+  `allow_other` with `default_permissions` (the kernel runs all DAC/sticky/
+  setattr_prepare/protected_* checks); caller caps/umask/groups read from
+  `/proc/<caller>/status`; kernel-parity killpriv gating
+  (CAP_FSETID/S_ISREG/S_IXGRP/in-group) with unconditional
+  security.capability removal; setgid-directory gid inheritance; create
+  modes computed from the caller's umask or the parent's default ACL
+  (`posix_acl_create_masq`); FUSE_DONT_MASK negotiated via
+  `ExtraCapabilities`; ACL→mode recompute on setfacl and chmod; and
+  suid/dev/exec mount defaults with `-o` override support.
+- **Known gaps (as of 2026-09-14)**: atime maintenance on read (003 — the
+  one remaining confirmed bridge bug from the xfstests record), fiemap
+  (`FS_IOC_FIEMAP` — gates `generic/032` to NOT RUN), and the file-range
+  exchange ioctls (XFS_IOC_EXCHANGE_RANGE/SWAP_RANGE, COMMIT_RANGE —
+  deferred, rationale in `fuse/ioctl_mount.go`). The 2026-09-06 subset run
+  additionally surfaced mmap-writeback size extension past a truncate-up
+  (029) and sparse-write i_size extension (322); both were fixed by the
+  2026-09-09..09-12 series and pass since.
   O_TMPFILE is not bridge-addressable: the 6.12 FUSE client has no O_TMPFILE
   support.  `sync(2)` on the mount is a silent no-op: the 6.12 FUSE client
   only wires `fc->sync_fs` for fuseblk mounts (`ctx->is_bdev`,
@@ -428,6 +545,6 @@ The FUSE bridge implements all BrieFS operations at full kernel parity
 
 | Repo | Branch | Role |
 |------|--------|------|
-| `~/src/briefs` (kernel) | `master` | Kernel module + xfstests wrappers (`tests/xfstests/fuse-briefs-*`, `run-suite.sh`, `run-fuse-subset.sh`) |
+| `~/src/briefs` (kernel) | `bu-refactor-1` | Kernel module + xfstests wrappers (`tests/xfstests/fuse-briefs-*`, `run-suite.sh`, `run-fuse-subset.sh`), campaign record + run archives (`tests/xfstests/xfstests-fuse-status.md`, `runs/`) |
 | `~/go/src/github.com/ctdk/briefs-utils` | `bu-refactor-1` | Go FUSE bridge (`cmd/fuse`), mkfs (`cmd/mkfs`), fsck (`cmd/fsck`), shared format (`briefs/`), `mount.fuse.briefs` helper (current dev branch; the read-write bridge work is in `master`) |
 | `~/src/xfstests-dev` | — | xfstests source + configs (`configs/briefs-fuse.config`), `common/rc` + `common/config` FUSE harness fixes |
