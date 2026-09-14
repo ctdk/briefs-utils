@@ -155,11 +155,15 @@ func (b *BrieFS) freeInodeData(in *briefs.Inode) error {
 	if in.Flags&briefs.InodeFlagInlineData != 0 {
 		return nil
 	}
-	exts, nodes, err := b.collectExtentsAndNodes(in)
+	tree, err := b.collectExtentTree(in)
 	if err != nil {
 		return err
 	}
-	for _, ext := range exts {
+	// The walk may have served (and stored) a cache entry for this inode;
+	// every block it describes is about to be freed, so drop the entry
+	// rather than leave a stale tree behind.
+	b.invalidateExtentTree(in.InodeNumber)
+	for _, ext := range tree.exts {
 		if ext.Phys == 0 {
 			continue // hole
 		}
@@ -174,7 +178,7 @@ func (b *BrieFS) freeInodeData(in *briefs.Inode) error {
 			return err
 		}
 	}
-	for _, blk := range nodes {
+	for _, blk := range tree.allNodes() {
 		b.deferBlockFree(blk)
 		if err := b.journalExtentFree(in.InodeNumber, blk, 1); err != nil {
 			return err

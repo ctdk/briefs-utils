@@ -22,6 +22,17 @@ func withMode(m uint32) func(*fuseSetAttrIn) { return func(r *fuseSetAttrIn) { r
 func withUID(u uint32) func(*fuseSetAttrIn)  { return func(r *fuseSetAttrIn) { r.uid = u } }
 func withGID(g uint32) func(*fuseSetAttrIn)  { return func(r *fuseSetAttrIn) { r.gid = g } }
 
+// extentListOf walks @in's extent index the same way the production paths do
+// (collectExtentTree), for assertions.
+func extentListOf(t *testing.T, b *BrieFS, in *briefs.Inode) []briefs.Extent {
+	t.Helper()
+	tree, err := b.collectExtentTree(in)
+	if err != nil {
+		t.Fatalf("collect extents: %v", err)
+	}
+	return tree.exts
+}
+
 // TestFallocatePreallocate covers KEEP_SIZE preallocate (unwritten extents that
 // read as zeros and convert on write) and plain preallocate (grows size).
 func TestFallocatePreallocate(t *testing.T) {
@@ -45,7 +56,7 @@ func TestFallocatePreallocate(t *testing.T) {
 	if got := b.dataAlloc.FreeCount(); got != freeBeforePre-2 {
 		t.Fatalf("preallocate allocated blocks: free %d -> %d (want -2)", freeBeforePre, got)
 	}
-	exts, _, _ := b.collectExtentsAndNodes(di)
+	exts := extentListOf(t, b, di)
 	if len(exts) != 1 || exts[0].Offset != 0 || exts[0].Len != 2 || exts[0].Flags&briefs.ExtentFlagUnwritten == 0 {
 		t.Fatalf("preallocate extents: want one unwritten {0,2}, got %+v", exts)
 	}
@@ -127,7 +138,7 @@ func TestFallocatePunchHole(t *testing.T) {
 	}
 	// The punched block's data block must be freed.
 	di, _ := b.inodes.ReadInode(ino)
-	exts, _, _ := b.collectExtentsAndNodes(di)
+	exts := extentListOf(t, b, di)
 	for _, e := range exts {
 		if e.Offset == 1 && e.Phys != 0 {
 			t.Fatalf("punched block 1 still mapped (phys %d)", e.Phys)
@@ -518,7 +529,7 @@ func TestFallocateInsertRange(t *testing.T) {
 	}
 	// The shifted tail keeps its phys (a straddling extent splits into a kept
 	// prefix and a re-pointed suffix).
-	exts, _, _ := b.collectExtentsAndNodes(di)
+	exts := extentListOf(t, b, di)
 	if len(exts) != 2 || exts[1].Offset != 2 || exts[1].Len != 1 {
 		t.Fatalf("insert extents: want kept {0,1} + shifted {2,1}, got %+v", exts)
 	}
@@ -564,7 +575,7 @@ func TestFallocateZeroRange(t *testing.T) {
 		t.Fatalf("partial zero: [100,200) must be zeroed, rest kept")
 	}
 	di, _ := b.inodes.ReadInode(ino)
-	exts, _, _ := b.collectExtentsAndNodes(di)
+	exts := extentListOf(t, b, di)
 	if len(exts) == 0 || exts[0].Flags&briefs.ExtentFlagUnwritten != 0 {
 		t.Fatalf("partial zero must not convert to unwritten: %+v", exts)
 	}
@@ -577,7 +588,7 @@ func TestFallocateZeroRange(t *testing.T) {
 	writeFile(t, b, ino, p1, bs)
 	writeFile(t, b, ino, p2, 2*bs)
 	di, _ = b.inodes.ReadInode(ino)
-	exts, _, _ = b.collectExtentsAndNodes(di)
+	exts = extentListOf(t, b, di)
 	physBefore := exts[0].Phys
 	freeBefore := b.dataAlloc.FreeCount()
 
@@ -591,7 +602,7 @@ func TestFallocateZeroRange(t *testing.T) {
 		t.Fatalf("block past the range changed")
 	}
 	di, _ = b.inodes.ReadInode(ino)
-	exts, _, _ = b.collectExtentsAndNodes(di)
+	exts = extentListOf(t, b, di)
 	if len(exts) != 2 || exts[0].Len != 2 || exts[0].Flags&briefs.ExtentFlagUnwritten == 0 || exts[0].Phys != physBefore {
 		t.Fatalf("middle must flip to unwritten in place: %+v", exts)
 	}
@@ -724,7 +735,7 @@ func TestFallocateFragmentedHole(t *testing.T) {
 	if got := b.dataAlloc.FreeCount(); got != 0 {
 		t.Fatalf("FreeCount after fallocate = %d, want 0", got)
 	}
-	exts, _, _ := b.collectExtentsAndNodes(di)
+	exts := extentListOf(t, b, di)
 	type wantExt struct{ off, rel, n uint64 }
 	want := []wantExt{{0, 100, 3}, {3, 200, 2}, {5, 300, 3}}
 	if len(exts) != len(want) {

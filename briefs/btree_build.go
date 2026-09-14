@@ -16,6 +16,42 @@ import (
 // marks the block allocated in the builder, so callers need not re-mark new
 // blocks; they only MarkFree the old node blocks being replaced.
 
+// ChunkBtreeExtents splits extents into positional chunks of at most
+// BtreeLeafFanout, the exact grouping BuildBtreeLeaves packs into leaf
+// nodes. The bridge's localized index rebuild chunks the same way to diff
+// new leaves against the old tree's leaves position by position.
+func ChunkBtreeExtents(extents []Extent) [][]Extent {
+	var chunks [][]Extent
+	for start := 0; start < len(extents); start += BtreeLeafFanout {
+		end := start + BtreeLeafFanout
+		if end > len(extents) {
+			end = len(extents)
+		}
+		chunks = append(chunks, extents[start:end])
+	}
+	return chunks
+}
+
+// BuildBtreeLeafBuf marshals one extent chunk into a fresh leaf block buffer
+// wired to @next (0 terminates the chain), checksummed exactly as
+// BuildBtreeLeaves does. The bridge's localized index rebuild uses it to
+// re-emit single leaves.
+func BuildBtreeLeafBuf(chunk []Extent, next, blockSize uint64) []byte {
+	buf := make([]byte, blockSize)
+	MarshalBtreeHeader(buf, BtreeNodeHeader{
+		Magic:    BtreeMagic,
+		Flags:    BtreeFlagLeaf,
+		Level:    0,
+		NumKeys:  uint16(len(chunk)),
+		NextLeaf: next,
+	})
+	for i, ext := range chunk {
+		PutBtreeLeafExtent(buf, i, ext)
+	}
+	SetBtreeNodeChecksum(buf, blockSize)
+	return buf
+}
+
 // BuildBtreeLeaves packs extents into leaf nodes (BtreeLeafFanout per leaf),
 // allocating one block per leaf via alloc. Leaves are wired into a next_leaf
 // chain left-to-right (last leaf's next_leaf = 0). Returns the absolute leaf
@@ -28,7 +64,8 @@ func BuildBtreeLeaves(extents []Extent, blockSize uint64, alloc func() (uint64, 
 	if len(extents) == 0 {
 		return nil, nil, nil, fmt.Errorf("BuildBtreeLeaves: no extents")
 	}
-	nLeaves := (len(extents) + BtreeLeafFanout - 1) / BtreeLeafFanout
+	chunks := ChunkBtreeExtents(extents)
+	nLeaves := len(chunks)
 
 	// Allocate all leaf blocks up front so the next_leaf chain can be wired.
 	leafBlocks = make([]uint64, nLeaves)
@@ -42,30 +79,12 @@ func BuildBtreeLeaves(extents []Extent, blockSize uint64, alloc func() (uint64, 
 
 	bufs = make([][]byte, nLeaves)
 	leafFirstOffsets = make([]uint64, nLeaves)
-	for li := 0; li < nLeaves; li++ {
-		start := li * BtreeLeafFanout
-		end := start + BtreeLeafFanout
-		if end > len(extents) {
-			end = len(extents)
-		}
-		chunk := extents[start:end]
-		buf := make([]byte, blockSize)
+	for li, chunk := range chunks {
 		var next uint64
 		if li+1 < nLeaves {
 			next = leafBlocks[li+1]
 		}
-		MarshalBtreeHeader(buf, BtreeNodeHeader{
-			Magic:    BtreeMagic,
-			Flags:    BtreeFlagLeaf,
-			Level:    0,
-			NumKeys:  uint16(len(chunk)),
-			NextLeaf: next,
-		})
-		for i, ext := range chunk {
-			PutBtreeLeafExtent(buf, i, ext)
-		}
-		SetBtreeNodeChecksum(buf, blockSize)
-		bufs[li] = buf
+		bufs[li] = BuildBtreeLeafBuf(chunk, next, blockSize)
 		leafFirstOffsets[li] = chunk[0].Offset
 	}
 	return leafBlocks, leafFirstOffsets, bufs, nil

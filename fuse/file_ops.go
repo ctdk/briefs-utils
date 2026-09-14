@@ -651,23 +651,6 @@ func (b *BrieFS) writeInodeOwned(in *briefs.Inode) error {
 	return nil
 }
 
-// collectExtentsAndNodes returns the inode's current extents (ascending offset)
-// and, for a tree-backed inode, every B+ tree node block it owns (so the rebuild
-// can free them). For inline-only/inline-data inodes the node list is empty.
-func (b *BrieFS) collectExtentsAndNodes(in *briefs.Inode) (exts []briefs.Extent, nodes []uint64, err error) {
-	err = briefs.IterateInodeExtents(b.dev.File(), in, b.blockSize, briefs.InodeExtentVisitor{
-		VisitNode: func(block uint64) error {
-			nodes = append(nodes, block)
-			return nil
-		},
-		VisitExtent: func(ext briefs.Extent) error {
-			exts = append(exts, ext)
-			return nil
-		},
-	})
-	return
-}
-
 // zeroBlockRange reads the block at abs, zeroes [from, to), and writes it
 // back (from >= to is a no-op). zeroBlockTail is the [from, blockSize)
 // special case; zeroRangeOp uses arbitrary sub-block ranges for the partial

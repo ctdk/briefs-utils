@@ -193,10 +193,17 @@ func VerifyBtreeNodeChecksum(buf []byte, blockSize uint64) error {
 // internal) so the caller can record it as a used metadata block;
 // VisitExtent is invoked once per leaf extent in ascending offset order. For
 // inline-only inodes only VisitExtent is called (no nodes). A non-nil error
-// from either aborts the walk.
+// from any hook aborts the walk.
 type InodeExtentVisitor struct {
 	VisitNode   func(block uint64) error
 	VisitExtent func(ext Extent) error
+	// VisitLeafChunk, when set, is invoked once per tree leaf with the
+	// leaf's block number and its whole extent chunk -- the exact on-disk
+	// grouping, the slice VisitExtent then sees extent by extent. Callers
+	// that need the per-leaf layout (the bridge's localized index rebuild
+	// diffs whole leaves against the new extent list) use it instead of
+	// re-walking the tree with their own WalkBtree visitor.
+	VisitLeafChunk func(block uint64, chunk []Extent) error
 }
 
 // IterateInodeExtents walks every extent of @in in ascending logical-offset
@@ -249,6 +256,11 @@ func IterateInodeExtents(file *os.File, in *Inode, blockSize uint64, v InodeExte
 			return nil
 		},
 		VisitLeaf: func(info BtreeNodeInfo, extents []Extent) error {
+			if v.VisitLeafChunk != nil {
+				if err := v.VisitLeafChunk(info.Block, extents); err != nil {
+					return err
+				}
+			}
 			if v.VisitExtent != nil {
 				for _, ext := range extents {
 					if err := v.VisitExtent(ext); err != nil {

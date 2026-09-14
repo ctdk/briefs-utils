@@ -5,14 +5,17 @@
 // briefs_setattr (file.c:836), and the killpriv (file_remove_privs) that
 // strips suid/sgid and clears security.capability on file-modifying ops. The
 // extent-list changes (punch hole, truncate down, preallocate, collapse,
-// insert, zero-range conversion) reuse the Phase-5 infrastructure: collect the
-// extents + btree nodes, mutate the sorted extent list, rebuild the index, and
-// commit via commitExtentChange.
+// insert, zero-range conversion) reuse the shared extent-index pipeline:
+// collect the extents through the cached walk (collectExtentTree), mutate
+// the sorted extent list, store it back through the localized rebuild
+// (rebuildExtentIndexWrite, which falls back to the full rebuild for the
+// non-tree shapes), and commit via commitExtentChange.
 
 package fuse
 
 import (
 	"context"
+	"slices"
 	"syscall"
 
 	"github.com/ctdk/briefs-utils/briefs"
@@ -204,10 +207,14 @@ func (b *BrieFS) preallocate(in *briefs.Inode, start, end uint64, mode uint32, a
 	startBlk := start / bs
 	endBlk := (end + bs - 1) / bs // ceiling
 
-	exts, oldNodes, err := b.collectExtentsAndNodes(in)
+	tree, err := b.collectExtentTree(in)
 	if err != nil {
 		return err
 	}
+	// Clone: the cached tree is shared read-only (the localized rebuild
+	// diffs its leaf chunks against this pre-op state) and the inserts
+	// below mutate the extent list in place.
+	exts := slices.Clone(tree.exts)
 
 	for blk := startBlk; blk < endBlk; {
 		if _, found := lookupExtent(exts, blk); found {
@@ -245,7 +252,10 @@ func (b *BrieFS) preallocate(in *briefs.Inode, start, end uint64, mode uint32, a
 	in.CtimeSec, in.CtimeNsec = sec, nsec
 
 	// Rebuild the index (new btree nodes are added to allocated) and commit.
-	if err := b.rebuildExtentIndex(in, exts, oldNodes, allocated); err != nil {
+	// The localized rebuild only re-emits the leaves whose chunks changed and
+	// returns the nodes it actually replaced for the commit's free list.
+	oldNodes, err := b.rebuildExtentIndexWrite(in, tree, exts, allocated)
+	if err != nil {
 		b.rollbackAlloc(*allocated)
 		return err
 	}
@@ -302,10 +312,13 @@ func (b *BrieFS) punchHole(in *briefs.Inode, off, size uint64) error {
 	// (kernel file.c:1599-1612).
 	sameBoundary := needPartialStart && needPartialEnd && startBlk == endBlk-1
 
-	exts, oldNodes, err := b.collectExtentsAndNodes(in)
+	tree, err := b.collectExtentTree(in)
 	if err != nil {
 		return err
 	}
+	// Read-only below (freeExtentRange builds the new list fresh), so the
+	// cached tree's extent list may be used without cloning.
+	exts := tree.exts
 
 	// Partially-punched boundary blocks stay allocated; only their punched
 	// byte ranges are zeroed in place (kernel briefs_zero_block_range
@@ -384,7 +397,8 @@ func (b *BrieFS) punchHole(in *briefs.Inode, off, size uint64) error {
 
 	if extentChanged {
 		var allocated runAccum
-		if err := b.rebuildExtentIndex(in, newExts, oldNodes, &allocated); err != nil {
+		oldNodes, err := b.rebuildExtentIndexWrite(in, tree, newExts, &allocated)
+		if err != nil {
 			b.rollbackAlloc(allocated)
 			return err
 		}
@@ -522,11 +536,13 @@ func (b *BrieFS) collapseRangeOp(in *briefs.Inode, off, size uint64) error {
 	}
 
 	S, L := off/bs, size/bs
-	exts, oldNodes, err := b.collectExtentsAndNodes(in)
+	tree, err := b.collectExtentTree(in)
 	if err != nil {
 		return err
 	}
-	newExts, freed := shiftExtents(exts, S, L, -1)
+	// shiftExtents reads the old list and builds the new one fresh, so the
+	// cached tree's extent list may be used without cloning.
+	newExts, freed := shiftExtents(tree.exts, S, L, -1)
 
 	in.FileSize -= size
 	sec, nsec := nowTime()
@@ -534,7 +550,8 @@ func (b *BrieFS) collapseRangeOp(in *briefs.Inode, off, size uint64) error {
 	in.CtimeSec, in.CtimeNsec = sec, nsec
 
 	var allocated runAccum
-	if err := b.rebuildExtentIndex(in, newExts, oldNodes, &allocated); err != nil {
+	oldNodes, err := b.rebuildExtentIndexWrite(in, tree, newExts, &allocated)
+	if err != nil {
 		b.rollbackAlloc(allocated)
 		return err
 	}
@@ -568,11 +585,13 @@ func (b *BrieFS) insertRangeOp(in *briefs.Inode, off, size uint64) error {
 	}
 
 	S, L := off/bs, size/bs
-	exts, oldNodes, err := b.collectExtentsAndNodes(in)
+	tree, err := b.collectExtentTree(in)
 	if err != nil {
 		return err
 	}
-	newExts, _ := shiftExtents(exts, S, L, +1)
+	// shiftExtents reads the old list and builds the new one fresh, so the
+	// cached tree's extent list may be used without cloning.
+	newExts, _ := shiftExtents(tree.exts, S, L, +1)
 
 	in.FileSize += size
 	sec, nsec := nowTime()
@@ -580,7 +599,8 @@ func (b *BrieFS) insertRangeOp(in *briefs.Inode, off, size uint64) error {
 	in.CtimeSec, in.CtimeNsec = sec, nsec
 
 	var allocated runAccum
-	if err := b.rebuildExtentIndex(in, newExts, oldNodes, &allocated); err != nil {
+	oldNodes, err := b.rebuildExtentIndexWrite(in, tree, newExts, &allocated)
+	if err != nil {
 		b.rollbackAlloc(allocated)
 		return err
 	}
@@ -624,11 +644,14 @@ func (b *BrieFS) zeroRangeOp(in *briefs.Inode, off, size uint64, mode uint32) er
 		}
 	}
 
-	exts, oldNodes, err := b.collectExtentsAndNodes(in)
+	tree, err := b.collectExtentTree(in)
 	if err != nil {
 		b.rollbackAlloc(allocated)
 		return err
 	}
+	// Read-only below (the conversion loop builds its raw list fresh), so
+	// the cached tree's extent list may be used without cloning.
+	exts := tree.exts
 
 	// Full-block bounds of the conversion middle.
 	sFull := (off + bs - 1) / bs
@@ -782,7 +805,8 @@ func (b *BrieFS) zeroRangeOp(in *briefs.Inode, off, size uint64, mode uint32) er
 	}
 
 	if converted {
-		if err := b.rebuildExtentIndex(in, newExts, oldNodes, &allocated); err != nil {
+		oldNodes, err := b.rebuildExtentIndexWrite(in, tree, newExts, &allocated)
+		if err != nil {
 			b.rollbackAlloc(allocated)
 			return err
 		}
@@ -1062,11 +1086,13 @@ func (b *BrieFS) truncateLocked(ctx context.Context, in *briefs.Inode, newSize u
 			return nil
 		}
 		startFree := (newSize + bs - 1) / bs
-		exts, oldNodes, err := b.collectExtentsAndNodes(in)
+		tree, err := b.collectExtentTree(in)
 		if err != nil {
 			return err
 		}
-		newExts, freed := freeExtentRange(exts, startFree, ^uint64(0))
+		// freeExtentRange reads the old list and builds the new one fresh,
+		// so the cached tree's extent list may be used without cloning.
+		newExts, freed := freeExtentRange(tree.exts, startFree, ^uint64(0))
 		in.FileSize = newSize
 		if newSize%bs != 0 && newSize > 0 {
 			if err := b.zeroEofTailBlock(newExts, newSize); err != nil {
@@ -1077,7 +1103,8 @@ func (b *BrieFS) truncateLocked(ctx context.Context, in *briefs.Inode, newSize u
 		in.MtimeSec, in.MtimeNsec = sec, nsec
 		in.CtimeSec, in.CtimeNsec = sec, nsec
 		var allocated runAccum
-		if err := b.rebuildExtentIndex(in, newExts, oldNodes, &allocated); err != nil {
+		oldNodes, err := b.rebuildExtentIndexWrite(in, tree, newExts, &allocated)
+		if err != nil {
 			b.rollbackAlloc(allocated)
 			return err
 		}
@@ -1088,11 +1115,12 @@ func (b *BrieFS) truncateLocked(ctx context.Context, in *briefs.Inode, newSize u
 	}
 	// Truncate up.
 	if oldSize%bs != 0 && oldSize > 0 && in.Flags&briefs.InodeFlagInlineData == 0 {
-		exts, _, err := b.collectExtentsAndNodes(in)
+		// Read-only use, so the cached tree's extent list is used directly.
+		tree, err := b.collectExtentTree(in)
 		if err != nil {
 			return err
 		}
-		if err := b.zeroEofTailBlock(exts, oldSize); err != nil {
+		if err := b.zeroEofTailBlock(tree.exts, oldSize); err != nil {
 			return err
 		}
 		// The tail zeroing is a page-cache write that the INODE_FULL record

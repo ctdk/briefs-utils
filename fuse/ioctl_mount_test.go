@@ -106,7 +106,7 @@ func TestFstrim(t *testing.T) {
 	writeFile(t, b, inGone.InodeNumber, pat, 0)
 
 	diGone, _ := b.inodes.ReadInode(inGone.InodeNumber)
-	exts, _, _ := b.collectExtentsAndNodes(diGone)
+	exts := extentListOf(t, b, diGone)
 	if len(exts) != 1 {
 		t.Fatalf("gone file extents: %+v", exts)
 	}

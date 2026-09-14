@@ -120,64 +120,60 @@ func (b *BrieFS) invalidateExtentTree(ino uint64) {
 	delete(b.extentTrees, ino)
 }
 
-// collectExtentTree walks @in's extent index with the same structure
-// checks collectExtentsAndNodes goes through (WalkBtree behind
-// IterateInodeExtents, checksums on), capturing the per-leaf chunks
-// the localized rebuild diffs against.  Tree-backed inodes are served
-// from the walked-tree cache when the entry validates against @in:
-// every rebuild allocates a fresh root block, so (root, total)
-// matching the freshly-read inode means the cached tree IS the
-// on-disk tree (a mutation by punch/truncate/collapse or this path
+// collectExtentTree walks @in's extent index through the shared
+// briefs.IterateInodeExtents (same dispatch, structure checks and
+// checksums as every other extent walk), capturing the per-leaf chunks the
+// localized rebuild diffs against through the visitor's leaf-chunk hook.
+// Tree-backed inodes are served from the walked-tree cache when the entry
+// validates against @in: every rebuild allocates a fresh root block, so
+// (root, total) matching the freshly-read inode means the cached tree IS
+// the on-disk tree (a mutation by punch/truncate/collapse or this path
 // itself always moved the root).
 func (b *BrieFS) collectExtentTree(in *briefs.Inode) (*extentTree, error) {
 	t := &extentTree{}
-	if in.Flags&briefs.InodeFlagInlineData != 0 {
-		return t, nil
-	}
-	if in.Flags&briefs.InodeFlagIndexed == 0 {
-		// Inline-only: mirror IterateInodeExtents's array walk.
-		inlineExtents := in.InlineExtents()
-		maxExtents := in.NumExtentsInline
-		if maxExtents > 8 {
-			maxExtents = 8
-		}
-		for ei := uint32(0); ei < maxExtents; ei++ {
-			t.exts = append(t.exts, inlineExtents[ei])
-		}
-		return t, nil
-	}
 	root := in.ExtentInlineBase
-	if root == 0 {
-		return t, nil
+	treeBacked := in.Flags&briefs.InodeFlagIndexed != 0 && root != 0
+	if treeBacked {
+		if cached := b.lookupExtentTree(in.InodeNumber); cached != nil &&
+			cached.root == root && cached.total == in.NumExtentsTotal {
+			return cached, nil
+		}
 	}
-	if cached := b.lookupExtentTree(in.InodeNumber); cached != nil &&
-		cached.root == root && cached.total == in.NumExtentsTotal {
-		return cached, nil
-	}
-	err := briefs.WalkBtree(b.dev.File(), root, briefs.BtreeWalkOptions{
-		BlockSize: b.blockSize,
-		VerifyCRC: true,
-	}, briefs.BtreeNodeVisitor{
-		VisitNode: func(info briefs.BtreeNodeInfo) error {
-			if !info.Hdr.IsLeaf() {
-				t.idx = append(t.idx, info.Block)
-			}
+
+	// VisitNode sees every node block (leaves included); the leaf set from
+	// the chunk hook separates the internal index blocks for t.idx.
+	var nodeBlocks []uint64
+	leafSet := make(map[uint64]bool)
+	err := briefs.IterateInodeExtents(b.dev.File(), in, b.blockSize, briefs.InodeExtentVisitor{
+		VisitNode: func(block uint64) error {
+			nodeBlocks = append(nodeBlocks, block)
 			return nil
 		},
-		VisitLeaf: func(info briefs.BtreeNodeInfo, extents []briefs.Extent) error {
+		VisitExtent: func(ext briefs.Extent) error {
+			t.exts = append(t.exts, ext)
+			return nil
+		},
+		VisitLeafChunk: func(block uint64, chunk []briefs.Extent) error {
 			// WalkBtree allocates a fresh slice per leaf, so the chunk
 			// may be kept without copying.
-			t.leaves = append(t.leaves, extentLeaf{block: info.Block, chunk: extents})
-			t.exts = append(t.exts, extents...)
+			leafSet[block] = true
+			t.leaves = append(t.leaves, extentLeaf{block: block, chunk: chunk})
 			return nil
 		},
 	})
 	if err != nil {
 		return nil, err
 	}
-	t.root = root
-	t.total = in.NumExtentsTotal
-	b.storeExtentTree(in.InodeNumber, t)
+	for _, blk := range nodeBlocks {
+		if !leafSet[blk] {
+			t.idx = append(t.idx, blk)
+		}
+	}
+	if treeBacked {
+		t.root = root
+		t.total = in.NumExtentsTotal
+		b.storeExtentTree(in.InodeNumber, t)
+	}
 	return t, nil
 }
 
@@ -210,39 +206,6 @@ func (t *extentTree) allNodes() []uint64 {
 	return append(nodes, t.idx...)
 }
 
-// chunkExtents splits exts into positional chunks of at most
-// briefs.BtreeLeafFanout, the exact chunking BuildBtreeLeaves uses.
-func chunkExtents(exts []briefs.Extent) [][]briefs.Extent {
-	var chunks [][]briefs.Extent
-	for start := 0; start < len(exts); start += briefs.BtreeLeafFanout {
-		end := start + briefs.BtreeLeafFanout
-		if end > len(exts) {
-			end = len(exts)
-		}
-		chunks = append(chunks, exts[start:end])
-	}
-	return chunks
-}
-
-// buildLeafBuf marshals one leaf chunk into a fresh block buffer wired
-// to @next (0 terminates the chain), checksummed like BuildBtreeLeaves
-// does.
-func (b *BrieFS) buildLeafBuf(chunk []briefs.Extent, next uint64) []byte {
-	buf := make([]byte, b.blockSize)
-	briefs.MarshalBtreeHeader(buf, briefs.BtreeNodeHeader{
-		Magic:    briefs.BtreeMagic,
-		Flags:    briefs.BtreeFlagLeaf,
-		Level:    0,
-		NumKeys:  uint16(len(chunk)),
-		NextLeaf: next,
-	})
-	for i, ext := range chunk {
-		briefs.PutBtreeLeafExtent(buf, i, ext)
-	}
-	briefs.SetBtreeNodeChecksum(buf, b.blockSize)
-	return buf
-}
-
 // rebuildExtentIndexWrite is the write path's extent-index store: the
 // localized (leaf-diff) rebuild for tree-backed inodes, falling back to
 // the full rebuild for every other shape (no old tree, inline fits,
@@ -269,7 +232,7 @@ func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, ext
 		return tree.allNodes(), nil
 	}
 
-	newChunks := chunkExtents(exts)
+	newChunks := briefs.ChunkBtreeExtents(exts)
 	oldLeaves := tree.leaves
 
 	// Longest equal-content chunk prefix.  Reuse drops the boundary
@@ -305,7 +268,7 @@ func (b *BrieFS) rebuildExtentIndexWrite(in *briefs.Inode, tree *extentTree, ext
 		if i+1 < len(newChunks) {
 			next = leafBlocks[i+1]
 		}
-		if err := b.dev.WriteBlock(leafBlocks[i], b.buildLeafBuf(newChunks[i], next)); err != nil {
+		if err := b.dev.WriteBlock(leafBlocks[i], briefs.BuildBtreeLeafBuf(newChunks[i], next, b.blockSize)); err != nil {
 			return nil, err
 		}
 	}
