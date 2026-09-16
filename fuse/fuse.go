@@ -182,6 +182,24 @@ type BrieFS struct {
 	// Further mutations are refused (EROFS) so a later Sync cannot commit them
 	// against a partially-applied state. Protected by mu.
 	readOnly bool
+
+	// shutdown is set by an XFS_IOC_GOINGDOWN ioctl (ioctl_mount.go
+	// shutdownOp), the analog of the kernel's BRIEFS_MF_SHUTDOWN + SB_RDONLY
+	// pair: mutations refuse EROFS like readOnly, but file reads and fsync
+	// fail EIO (kernel file.c:105-117, :556-566) and the unmount skips the
+	// journal checkpoint + flush so the live region survives for the next
+	// mount's replay (generic/052). Written once, read unguarded, like
+	// readOnly.
+	shutdown bool
+}
+
+// frozen reports whether the filesystem accepts no further mutations: a
+// post-journal write error (readOnly) or an explicit shutdown, which the
+// kernel mirrors by setting SB_RDONLY in both cases. The mutation gates
+// return EROFS for either; the callers that differ (reads, fsync) check
+// shutdown directly.
+func (b *BrieFS) frozen() bool {
+	return b.readOnly || b.shutdown
 }
 
 // MountOptions configures the FUSE mount.
@@ -438,7 +456,17 @@ func Mount(imagePath string, opts MountOptions) error {
 	// pending with no uncommitted records (its records were committed by an
 	// earlier sync, the blocks merged after it), and that content exists only
 	// in daemon memory until this drain.
-	if bfs.journal != nil {
+	//
+	// After a forced shutdown both journal steps are skipped (kernel
+	// put_super): the checkpoint would retire the live region and Close
+	// would flush the current block — either way log_start==log_end would
+	// appear, and NOLOGFLUSH shutdown semantics require the unflushed
+	// records to stay unpersisted. log_start < log_end survives for the
+	// next mount's replay (generic/052). The deferred-metadata drain and
+	// device sync still run, mirroring the kernel's put_super running
+	// briefs_journal_flush_owned and the superblock sync after a shutdown
+	// (generic/417).
+	if bfs.journal != nil && !bfs.shutdown {
 		_ = bfs.journal.Checkpoint()
 		_ = bfs.journal.Close()
 	}
@@ -729,6 +757,13 @@ func (n *brieFSNode) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, 
 }
 
 func (n *brieFSNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	if n.bfs.shutdown {
+		// Post-shutdown reads fail EIO even for data still in the daemon's
+		// block cache, mirroring briefs_read_iter (file.c:556-566,
+		// generic/730); the freeze's read-only state alone would keep
+		// serving them.
+		return nil, syscall.EIO
+	}
 	data, err := n.bfs.readFileData(n.ino, dest, off)
 	if err != nil {
 		return nil, syscall.EIO
@@ -882,6 +917,11 @@ func (n *brieFSNode) Write(ctx context.Context, f fs.FileHandle, data []byte, of
 // flush, and the deferred-map drain are internally synchronized, and Fsync
 // mutates nothing.
 func (n *brieFSNode) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) syscall.Errno {
+	if n.bfs.shutdown {
+		// Kernel fsync returns EIO after a forced shutdown (file.c:105-117),
+		// not the EROFS the read-only state alone would produce.
+		return syscall.EIO
+	}
 	if n.bfs.readOnly {
 		return syscall.EROFS
 	}
@@ -953,12 +993,13 @@ func (n *brieFSNode) Removexattr(ctx context.Context, name string) syscall.Errno
 	return errToErrno(n.bfs.removeXattr(n.ino, name))
 }
 
-// Ioctl handles the mount-level FITRIM / FS_IOC_{GET,SET}FSLABEL (ioctlMount,
-// mirroring the superblock-scoped cases of the kernel's briefs_ioctl) and the
-// per-inode FS_IOC_GETFLAGS/SETFLAGS (chattr/lsattr) and
-// FS_IOC_FSGETXATTR/FSSETXATTR (xfs_io/statx). Unknown ioctls return ENOTTY.
+// Ioctl handles the mount-level FITRIM / FS_IOC_{GET,SET}FSLABEL /
+// XFS_IOC_GOINGDOWN (ioctlMount, mirroring the superblock-scoped cases of
+// the kernel's briefs_ioctl) and the per-inode FS_IOC_GETFLAGS/SETFLAGS
+// (chattr/lsattr) and FS_IOC_FSGETXATTR/FSSETXATTR (xfs_io/statx). Unknown
+// ioctls return ENOTTY.
 func (n *brieFSNode) Ioctl(ctx context.Context, f fs.FileHandle, cmd uint32, arg uint64, input []byte, output []byte) (int32, syscall.Errno) {
-	if r, errno, handled := n.bfs.ioctlMount(ctx, cmd, input, output); handled {
+	if r, errno, handled := n.bfs.ioctlMount(ctx, cmd, arg, input, output); handled {
 		return r, errno
 	}
 	return n.bfs.ioctlFileattr(n.ino, cmd, input, output)

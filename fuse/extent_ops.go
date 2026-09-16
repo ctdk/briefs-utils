@@ -75,7 +75,7 @@ type fuseSetAttrIn struct {
 // range and shifts the tail down; INSERT_RANGE opens a hole and shifts the
 // tail up.
 func (b *BrieFS) fallocateOp(ctx context.Context, ino uint64, off, size uint64, mode uint32) error {
-	if b.readOnly {
+	if b.frozen() {
 		return syscall.EROFS
 	}
 	if mode&^(fallocKeepSize|fallocPunchHole|fallocCollapseRange|fallocZeroRange|fallocInsertRange) != 0 {
@@ -803,7 +803,7 @@ func (b *BrieFS) zeroRangeInline(in *briefs.Inode, off, end uint64, mode uint32)
 
 // truncateInode is the public truncate entry: lock + read + truncateLocked.
 func (b *BrieFS) truncateInode(ctx context.Context, ino uint64, newSize uint64) error {
-	if b.readOnly {
+	if b.frozen() {
 		return syscall.EROFS
 	}
 	lock := b.inodeBlockLock(ino)
@@ -841,7 +841,7 @@ func (b *BrieFS) zeroEofTailBlock(exts []briefs.Extent, size uint64) error {
 // SetAttrIn.Valid (FATTR_* bits). Truncate delegates to truncateInode's path;
 // metadata changes journal a fresh JRN_INODE_FULL.
 func (b *BrieFS) setattrOp(ctx context.Context, ino uint64, in *fuseSetAttrIn) error {
-	if b.readOnly {
+	if b.frozen() {
 		return syscall.EROFS
 	}
 	lock := b.inodeBlockLock(ino)

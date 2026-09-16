@@ -1,6 +1,7 @@
-// Package fuse: mount-level ioctls (FITRIM, FS_IOC_{GET,SET}FSLABEL).
+// Package fuse: mount-level ioctls (FITRIM, FS_IOC_{GET,SET}FSLABEL,
+// XFS_IOC_GOINGDOWN shutdown).
 //
-// Ports the corresponding cases of the kernel's briefs_ioctl (file.c:252-323).
+// Ports the corresponding cases of the kernel's briefs_ioctl (file.c:228-323).
 // These are superblock-scoped operations issued on any fd on the mount (fstrim
 // opens the mountpoint directory), so the FUSE Ioctl entry routes them here
 // before the per-inode FS_IOC_* (chattr) dispatch in fileattr.go.
@@ -8,6 +9,14 @@
 // Assessed but deliberately not forwarded:
 //   - O_TMPFILE: the 6.12 FUSE client has no support (no path in fs/fuse that
 //     translates it into a FUSE request), so it cannot reach the daemon.
+//   - FS_IOC_FIEMAP: never reaches the daemon either — do_vfs_ioctl
+//     intercepts the command and routes it to inode->i_op->fiemap
+//     (fs/ioctl.c ioctl_fiemap), which fs/fuse does not implement in 6.12,
+//     so the caller gets EOPNOTSUPP with no FUSE round trip (verified live on
+//     the 6.12.101 test kernel). Even on a client that forwarded it,
+//     restricted ioctl mode caps the transfer at _IOC_SIZE(cmd) = 32 bytes,
+//     the struct fiemap header alone; the fm_extents[] flex array cannot
+//     cross the wire. Same blocker class as O_TMPFILE.
 //   - BRIEFS_IOC_{EXCHANGE_RANGE,START_COMMIT,COMMIT_RANGE,SWAPEXT}: the kernel
 //     core (briefs_do_exchange, file.c:2450-2615) is a large two-inode port
 //     (freshness structs, promote, DRY_RUN, TO_EOF, exch_engine_same/diff,
@@ -37,12 +46,24 @@ var (
 	fiTrim          = ioc(iocRead|iocWrite, uint32('X'), 121, sizeFsTrimRange) // _IOWR('X', 121, struct fstrim_range)
 	fsIocGetfslabel = ioc(iocRead, 0x94, 49, fslabelMax)                       // _IOR(0x94, 49, char[FSLABEL_MAX])
 	fsIocSetfslabel = ioc(iocWrite, 0x94, 50, fslabelMax)                      // _IOW(0x94, 50, char[FSLABEL_MAX])
+	goDown          = ioc(iocRead, uint32('X'), 125, 4)                        // _IOR('X', 125, __u32) == XFS_IOC_GOINGDOWN == F2FS_IOC_SHUTDOWN == BRIEFS_IOC_GOINGDOWN
 )
 
-// ioctlMount dispatches the mount-level ioctls. The third return value is
-// false when cmd is not one of them, so the caller falls through to the
-// per-inode FS_IOC_* handling (ioctlFileattr).
-func (b *BrieFS) ioctlMount(ctx context.Context, cmd uint32, input, output []byte) (int32, syscall.Errno, bool) {
+// XFS_IOC_GOINGDOWN flag values (briefs.h:1145-1151; the same bits as
+// xfs_fs.h and f2fs.h).
+const (
+	shutdownFlagDefault    = 0x0
+	shutdownFlagLogFlush   = 0x1
+	shutdownFlagNoLogFlush = 0x2
+)
+
+// ioctlMount dispatches the mount-level ioctls. arg is the caller's ioctl
+// payload address (IoctlIn.Arg): _IOR commands like GOINGDOWN arrive with an
+// empty input buffer in restricted FUSE ioctl mode, so their payload must be
+// read from the caller's memory there. The third return value is false when
+// cmd is not one of them, so the caller falls through to the per-inode
+// FS_IOC_* handling (ioctlFileattr).
+func (b *BrieFS) ioctlMount(ctx context.Context, cmd uint32, arg uint64, input, output []byte) (int32, syscall.Errno, bool) {
 	switch cmd {
 	case fiTrim:
 		if !callerCapSysAdmin(ctx) {
@@ -67,8 +88,64 @@ func (b *BrieFS) ioctlMount(ctx context.Context, cmd uint32, input, output []byt
 			return 0, syscall.EPERM, true
 		}
 		return 0, errToErrno(b.fslabelSetOp(input)), true
+	case goDown:
+		if !callerCapSysAdmin(ctx) {
+			return 0, syscall.EPERM, true
+		}
+		flags, ok := callerU32At(ctx, arg)
+		if !ok {
+			// The kernel's get_user cannot fail here (it runs in the
+			// caller's context); the daemon's /proc read can, for a
+			// non-root caller under ptrace restrictions. Degrade to
+			// DEFAULT rather than EFAULT so desktop mounts stay
+			// shut-down-able.
+			flags = shutdownFlagDefault
+		}
+		return 0, errToErrno(b.shutdownOp(flags)), true
 	}
 	return 0, syscall.ENOTTY, false
+}
+
+// --- XFS_IOC_GOINGDOWN ---
+
+// shutdownOp implements forced shutdown (kernel briefs_shutdown,
+// inode.c:159, and the freeze-side effects of briefs_force_shutdown):
+// freeze the filesystem — mutations refused EROFS, file reads and fsync
+// EIO (file.c:105-117, :556-566), the unmount checkpoint skipped so the
+// live journal region survives for the next mount's replay.
+//
+// Idempotent, and checked before flag validation (kernel order): a second
+// call returns success whatever flags it carries. An already-frozen bridge
+// (readOnly) may still be shut down — the kernel proceeds past the
+// read-only mount's -EROFS (file.c:242-250, generic/599).
+//
+// LOGFLUSH flushes the journal without retiring the ring — Sync(false), the
+// analog of briefs_journal_sync_no_checkpoint — plus a device cache flush,
+// so committed-but-uncheckpointed records are durable and log_start <
+// log_end survives for the next mount's replay (generic/052). DEFAULT and
+// NOLOGFLUSH leave the journal as-is: the DEFAULT case's bdev
+// freeze/thaw has no FUSE analog, making it NOLOGFLUSH here. Anything else
+// is EINVAL.
+func (b *BrieFS) shutdownOp(flags uint32) error {
+	if b.shutdown {
+		return nil
+	}
+	switch flags {
+	case shutdownFlagDefault, shutdownFlagNoLogFlush:
+	case shutdownFlagLogFlush:
+		if b.journal != nil {
+			if err := b.journal.Sync(false); err != nil {
+				return err
+			}
+		}
+		if err := b.dev.Sync(); err != nil {
+			return err
+		}
+	default:
+		return syscall.EINVAL
+	}
+	b.shutdown = true
+	return nil
 }
 
 // --- FITRIM ---
@@ -108,6 +185,11 @@ func encodeFsTrimRange(out []byte, r fsTrimRange) {
 // only stale garbage, and the metadata regions precede the data region, so
 // punching never touches live data. Returns the trimmed byte count.
 func (b *BrieFS) fstrimOp(r fsTrimRange) (uint64, error) {
+	if b.frozen() {
+		// The kernel FITRIM needs a writer ref on the mount: EROFS once
+		// the freeze has set SB_RDONLY (file.c:258).
+		return 0, syscall.EROFS
+	}
 	bs := b.blockSize
 	maxBlks := b.dataAlloc.TotalBlocks()
 	start := r.start / bs
@@ -182,7 +264,7 @@ func (b *BrieFS) fslabelGetOp(out []byte) {
 // longer is EINVAL), null-padded, block 0 persisted through the journal's
 // superblock path.
 func (b *BrieFS) fslabelSetOp(input []byte) error {
-	if b.readOnly {
+	if b.frozen() {
 		return syscall.EROFS
 	}
 	if len(input) == 0 {

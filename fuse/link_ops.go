@@ -42,7 +42,7 @@ const symlinkMaxLen = 2550
 // bump the target's nlink + ctime, advance the parent mtime/ctime. Locking:
 // global dir lock + the parent and target inode-block shards.
 func (b *BrieFS) linkInDir(parentIno uint64, name string, targetIno uint64) (_ *briefs.Inode, err error) {
-	if b.readOnly {
+	if b.frozen() {
 		return nil, syscall.EROFS
 	}
 	b.mu.Lock()
@@ -301,7 +301,7 @@ func (b *BrieFS) finishCrossDirMove(oldParent, newParent *briefs.Inode, oldParen
 // renameInDir renames @oldName in @oldParentIno to @newName in @newParentIno,
 // dispatching on the renameat2 flags. Mirrors briefs_rename (dir.c:1162).
 func (b *BrieFS) renameInDir(oldParentIno uint64, oldName string, newParentIno uint64, newName string, flags uint32) error {
-	if b.readOnly {
+	if b.frozen() {
 		return syscall.EROFS
 	}
 	if flags&renameExchange != 0 {

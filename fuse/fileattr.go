@@ -124,7 +124,7 @@ func (b *BrieFS) fileattrGet(ino uint64) (flags, xflags uint32, nextents uint64,
 // (FSSETXATTR). Mirrors briefs_fileattr_set (file.c:243). Locking: the
 // inode-block shard lock, like a file write.
 func (b *BrieFS) fileattrSet(ino uint64, setFlags bool, flags uint32, setXflags bool, xflags, extsize, projid, cowextsize uint32) error {
-	if b.readOnly {
+	if b.frozen() {
 		return syscall.EROFS
 	}
 	lock := b.inodeBlockLock(ino)

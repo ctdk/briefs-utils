@@ -231,7 +231,7 @@ func (b *BrieFS) dirIsEmpty(di *briefs.Inode) bool {
 // or in one data block plus a JRN_SYMLINK_DATA record. The caller must hold
 // b.mu (taken here) — it is a directory operation.
 func (b *BrieFS) createNamedInode(parentIno uint64, name string, mode, uid, gid uint32, excl bool, rdev uint64, symlinkTarget string, umask uint32) (*briefs.Inode, error) {
-	if b.readOnly {
+	if b.frozen() {
 		return nil, syscall.EROFS
 	}
 	// briefs_symlink rejects empty and oversized targets up front with
@@ -471,7 +471,7 @@ func (b *BrieFS) symlinkInDir(parentIno uint64, name string, target string, uid,
 // and child inode-block locks (parent then child; the global lock serializes
 // dir ops so the order cannot deadlock).
 func (b *BrieFS) unlinkInDir(parentIno uint64, name string, isRmdir bool) (err error) {
-	if b.readOnly {
+	if b.frozen() {
 		return syscall.EROFS
 	}
 	b.mu.Lock()

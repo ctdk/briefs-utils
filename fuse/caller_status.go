@@ -22,6 +22,7 @@ package fuse
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"strconv"
@@ -141,6 +142,35 @@ func (cc callerCheck) inGroup(gid uint32) bool {
 // bridge must.
 func callerCapSysAdmin(ctx context.Context) bool {
 	return loadCallerCheck(ctx).hasCap(capSysAdminBit)
+}
+
+// callerU32At reads the 4-byte word the caller placed at an ioctl payload
+// address. Restricted FUSE ioctl mode (fs/fuse/ioctl.c:263-284) copies user
+// memory into the request only when _IOC_DIR(cmd) has _IOC_WRITE, so _IOR
+// commands — XFS_IOC_GOINGDOWN among them — arrive with an empty input
+// buffer and the payload exists only at this address in the caller. The
+// caller is blocked inside the syscall while the daemon services the ioctl,
+// so the word cannot change underneath the read. /proc/<pid>/mem requires
+// the same PTRACE_MODE_ATTACH the kernel would not need for get_user; the
+// root daemon passes it, and the not-ok fallback (non-root daemon caller,
+// exited caller, other pid namespace) is the caller's business to degrade
+// on — XFS_IOC_GOINGDOWN treats it as DEFAULT flags.
+func callerU32At(ctx context.Context, addr uint64) (uint32, bool) {
+	caller, ok := fuse.FromContext(ctx)
+	if !ok || caller == nil || caller.Pid == 0 || addr == 0 {
+		return 0, false
+	}
+	f, err := os.Open(fmt.Sprintf("/proc/%d/mem", caller.Pid))
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+	var buf [4]byte
+	// Userspace addresses fit in int64 by construction.
+	if _, err := f.ReadAt(buf[:], int64(addr)); err != nil {
+		return 0, false
+	}
+	return binary.LittleEndian.Uint32(buf[:]), true
 }
 
 // callerUmask returns the caller's umask. An unreadable status means no

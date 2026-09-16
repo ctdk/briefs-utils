@@ -203,7 +203,7 @@ func (b *BrieFS) writeFileData(ctx context.Context, ino uint64, data []byte, off
 	if len(data) == 0 {
 		return 0, nil
 	}
-	if b.readOnly {
+	if b.frozen() {
 		return 0, syscall.EROFS
 	}
 	// Lock the file's inode-table block for the whole op. The direct inode RMW

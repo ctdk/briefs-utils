@@ -71,14 +71,14 @@ func TestFslabel(t *testing.T) {
 	// Dispatch: GET works without a caller context, SET is EPERM without
 	// one (FUSE does not re-check capabilities for the daemon).
 	out := make([]byte, fslabelMax)
-	_, errno, handled := b.ioctlMount(context.Background(), fsIocGetfslabel, nil, out)
+	_, errno, handled := b.ioctlMount(context.Background(), fsIocGetfslabel, 0, nil, out)
 	if !handled || errno != 0 {
 		t.Fatalf("ioctl GETFSLABEL dispatch: handled=%v errno=%v", handled, errno)
 	}
 	if strings.TrimRight(string(out), "\x00") != long {
 		t.Fatalf("ioctl GETFSLABEL output mismatch")
 	}
-	_, errno, handled = b.ioctlMount(context.Background(), fsIocSetfslabel, []byte("x"), nil)
+	_, errno, handled = b.ioctlMount(context.Background(), fsIocSetfslabel, 0, []byte("x"), nil)
 	if !handled || errno != syscall.EPERM {
 		t.Fatalf("ioctl SETFSLABEL without caller: handled=%v errno=%v", handled, errno)
 	}
@@ -180,7 +180,7 @@ func TestFstrim(t *testing.T) {
 	// Dispatch: no FUSE caller context -> EPERM.
 	in := make([]byte, sizeFsTrimRange)
 	encodeFsTrimRange(in, fsTrimRange{start: 0, length: ^uint64(0)})
-	_, errno, handled := b.ioctlMount(context.Background(), fiTrim, in, make([]byte, sizeFsTrimRange))
+	_, errno, handled := b.ioctlMount(context.Background(), fiTrim, 0, in, make([]byte, sizeFsTrimRange))
 	if !handled || errno != syscall.EPERM {
 		t.Fatalf("ioctl FITRIM without caller: handled=%v errno=%v", handled, errno)
 	}

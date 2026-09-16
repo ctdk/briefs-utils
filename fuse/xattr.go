@@ -135,7 +135,7 @@ func (b *BrieFS) setXattr(ino uint64, name string, value []byte, flags uint32) e
 	if len(value) > xattrMaxValueLen {
 		return syscall.E2BIG
 	}
-	if b.readOnly {
+	if b.frozen() {
 		return syscall.EROFS
 	}
 	lock := b.inodeBlockLock(ino)
@@ -174,7 +174,7 @@ func (b *BrieFS) setXattrOp(ctx context.Context, ino uint64, name string, value 
 	if len(value) > xattrMaxValueLen {
 		return syscall.E2BIG
 	}
-	if b.readOnly {
+	if b.frozen() {
 		return syscall.EROFS
 	}
 	lock := b.inodeBlockLock(ino)
