@@ -29,12 +29,24 @@
   xfstests-fuse-status.md. (The 2026-08-06 subset records were invalid —
   the harness was mounting via the kernel module; see the correction note
   in xfstests-fuse-status.md.)
-* Implement the remaining ioctls in the FUSE bridge: fiemap (FS_IOC_FIEMAP,
-  which gates generic/032 to NOT RUN) and the file-range exchange ioctls
-  (XFS_IOC_EXCHANGE_RANGE/SWAP_RANGE and COMMIT_RANGE — a ~500-line
-  two-inode port of the kernel's briefs_do_exchange; rationale in
-  fuse/ioctl_mount.go). O_TMPFILE is not bridge-addressable: the 6.12 FUSE
-  client has no O_TMPFILE support.
+* [Done] Forced shutdown: XFS_IOC_GOINGDOWN (== BRIEFS_IOC_GOINGDOWN) rides
+  FUSE_IOCTL to the daemon; the bridge ports the kernel's briefs_shutdown
+  (LOGFLUSH/NOLOGFLUSH/DEFAULT flags, CAP_SYS_ADMIN, idempotent, post-
+  shutdown EROFS mutations and EIO reads/fsync, checkpoint-skipping
+  unmount). The flags word is recovered from the caller's memory at
+  IoctlIn.Arg via /proc/<pid>/mem because restricted ioctl mode copies
+  no input for _IOR commands.
+* Implement the remaining ioctls in the FUSE bridge: the file-range
+  exchange ioctls (XFS_IOC_EXCHANGE_RANGE/SWAP_RANGE and COMMIT_RANGE —
+  a ~500-line two-inode port of the kernel's briefs_do_exchange;
+  rationale in fuse/ioctl_mount.go). O_TMPFILE is not bridge-addressable
+  (the 6.12 FUSE client has no O_TMPFILE support), and neither is
+  FS_IOC_FIEMAP: the 6.12 VFS intercepts it (do_vfs_ioctl routes it to
+  inode->i_op->fiemap, which fs/fuse does not implement) so the caller
+  gets EOPNOTSUPP with no FUSE round trip, and even a forwarding client
+  would cap the restricted-mode transfer at _IOC_SIZE(cmd) = 32 bytes,
+  the struct fiemap header alone. generic/032 stays NOT RUN, same
+  blocker class as O_TMPFILE.
 * [Done] Port the kernel's replay trie-block reuse pool + per-directory
   partial-pool seeding (briefs_trie_seed_pool) into the FUSE replay, so
   crash-replay on a near-full filesystem reuses JRN_TRIE_ALLOC blocks
