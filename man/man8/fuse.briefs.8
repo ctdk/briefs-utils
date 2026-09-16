@@ -20,6 +20,7 @@ fuse.briefs
 [--debug|-d]
 [--help|-h]
 [--image|-i]=[value]
+[--mount-opts]=[value]
 [--mountpoint|-m]=[value]
 [--version|-v]
 
@@ -53,6 +54,9 @@ fuse.briefs [global options]
 
 .PP
 \fB--image, -i\fP="": filesystem image file or block device
+
+.PP
+\fB--mount-opts\fP="": comma-separated mount options to apply to the FUSE mount (as forwarded by mount.fuse.briefs from \fB\fCmount -t fuse.briefs -o <opts>\fR); [no]suid/[no]dev/[no]exec override the kernel-parity defaults, anything unrecognized is passed to the kernel mount, which rejects it
 
 .PP
 \fB--mountpoint, -m\fP="": mount point directory

@@ -14,27 +14,34 @@
   setattr/killpriv), Go journal port, per-inode-block locking. Still
   experimental — see xfstests-fuse-status.md for the xfstests pass/fail
   record and known issues.
-* The FUSE bridge should support the same mount options as the kernel module.
-* Expand xfstests coverage for BrieFS under FUSE: the replay-sensitive subset
-  (generic/003, 029, 030, 032, 321, 322, 547, 640, 475, 011) currently gives
-  7 PASS / 2 FAIL (generic/547, 011) / 1 NOT RUN (generic/032, fiemap
-  unsupported) under the FUSE bridge — the 2026-08-06 record; the bridge has
-  since gained the fallocate modes, ACLs, and FITRIM/FSLABEL ioctls on
-  bu-refactor-1, not yet re-run under xfstests. (A prior "10/10 PASS" result
-  was invalid — the harness was mounting via the kernel module, not the FUSE
-  bridge; see the correction note in xfstests-fuse-status.md.) Broaden to
-  the full generic group.
+* [Done] The FUSE bridge should support the same mount options as the kernel
+  module. `mount.fuse.briefs` forwards `-o <opts>` to the daemon via
+  `--mount-opts`; [no]suid/[no]dev/[no]exec override the kernel-parity
+  defaults and unrecognized options reach the kernel mount, which rejects
+  them (9bd009c; remount and bind/make-* forms pass through verbatim,
+  055081e). Validated by generic/128, 361 and 696.
+* [Done] Expand xfstests coverage for BrieFS under FUSE: broadened to the
+  full generic group — 793 tests, one mkfs/mount per test through the FUSE
+  wrappers, run archives in the briefs repo's tests/xfstests/runs/. Latest
+  record 328 PASS / 32 FAIL / 0 HANG (run-20260914-021234), re-validated
+  byte-identical per-test at the 2026-09-15 re-review HEAD
+  (run-20260915-212640); every residual failure is triaged in
+  xfstests-fuse-status.md. (The 2026-08-06 subset records were invalid —
+  the harness was mounting via the kernel module; see the correction note
+  in xfstests-fuse-status.md.)
 * Implement the remaining ioctls in the FUSE bridge: fiemap (FS_IOC_FIEMAP,
   which gates generic/032 to NOT RUN) and the file-range exchange ioctls
   (XFS_IOC_EXCHANGE_RANGE/SWAP_RANGE and COMMIT_RANGE — a ~500-line
   two-inode port of the kernel's briefs_do_exchange; rationale in
   fuse/ioctl_mount.go). O_TMPFILE is not bridge-addressable: the 6.12 FUSE
   client has no O_TMPFILE support.
-* Port the kernel's replay trie-block reuse pool + per-directory partial-pool
-  seeding (briefs_trie_seed_pool) into the FUSE replay, so crash-replay on a
-  near-full filesystem reuses JRN_TRIE_ALLOC blocks instead of allocating fresh
-  ones (avoids orphan trie blocks / -ENOSPC; matches the kernel's generic/475
-  full-fs behaviour).
+* [Done] Port the kernel's replay trie-block reuse pool + per-directory
+  partial-pool seeding (briefs_trie_seed_pool) into the FUSE replay, so
+  crash-replay on a near-full filesystem reuses JRN_TRIE_ALLOC blocks
+  instead of allocating fresh ones (avoids orphan trie blocks / -ENOSPC;
+  matches the kernel's generic/475 full-fs behaviour). Landed as 01734ab
+  (trieSeedPool at first DIR_UPDATE touch + replayTrieBlocks LIFO pop;
+  generic/073 fixed).
 * [Done for xfstests] mkfs.briefs and fsck.briefs command line flags are
   sufficiently xfstests-compatible (force flag `-f`, check-only default,
   `-r -y` repair shape). Further standards alignment may be useful.

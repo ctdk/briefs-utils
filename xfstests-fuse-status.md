@@ -8,9 +8,11 @@ ports the kernel journal write path + journal-replay-on-mount to Go, making a
 FUSE-written volume crash-consistent, recoverable, and kernel-mountable.
 
 This document records the xfstests status for the FUSE-mounted BrieFS as of
-2026-09-14 — the close of the 09-06→09-14 campaign series, which took the
+2026-09-15 — the close of the 09-06→09-14 campaign series, which took the
 full generic suite from 188 PASS / 110 FAIL / 63 HANG to
-328 / 32 / 0 (see "Current status").
+328 / 32 / 0, plus the 2026-09-15 re-validation of the 18-commit
+re-review refactor series at byte-identical per-test status
+(see "Current status").
 
 > **Correction history — two harness bugs, two invalid records.**
 >
@@ -37,16 +39,17 @@ full generic suite from 188 PASS / 110 FAIL / 63 HANG to
 > kernel module **removed** so any residual kernel mount fails loudly instead
 > of silently succeeding.
 
-## Current status (2026-09-14)
+## Current status (2026-09-15)
 
 Full generic suite (793 tests, kernel module removed, one mkfs/mount per
-test via the wrappers). The three most recent full runs:
+test via the wrappers). The four most recent full runs:
 
 | Run | PASS | FAIL | NOT RUN | SKIP | HANG |
 |-----|-----:|-----:|--------:|-----:|-----:|
 | 20260912-132029 (baseline, post 09-08..09-12 campaigns) | 300 | 59 | 431 | 2 | 1 |
 | 20260913-201548 (Family 1 fixed) | 327 | 33 | 431 | 2 | 0 |
 | 20260914-021234 (closing run, `-o` plumbing fixed) | **328** | **32** | 431 | 2 | **0** |
+| 20260915-212640 (re-review refactor series a24c72d re-validated) | **328** | **32** | 431 | 2 | **0** |
 
 - **NOT RUN 431** is a constant set across all three runs (430 in the
   2026-09-07 first honest run) — tests whose prerequisites the FUSE
@@ -312,6 +315,7 @@ and the rename journal-ordering scenario genuinely under FUSE.
 | 2026-09-12 (full suite) | 289/67/4, then 300/59/1 | re-run #2 after the OOM/replay-anchor fixes; run #3 is the Family-1 baseline (all closures held; 476 raised to a 900 s budget and solo PASS) |
 | 2026-09-13 (full suite) | 327/33/0 (run-20260913-201548) | Family 1 closed — 27 promotions, 476 HANG→PASS, one regression generic/128 (root cause R8, fixed after the run) |
 | 2026-09-14 (full suite) | **328/32/0 (run-20260914-021234)** | closing record — 128 fixed by the `-o` plumbing, zero baseline regressions |
+| 2026-09-15 (full suite) | 328/32/0 (run-20260915-212640) | re-validation of the 18-commit re-review refactor series (symlink parity, dead code, dedups, O1-O8 optimizations) at a24c72d — per-test status byte-identical to the closing run across all 793 tests; zero behavioral change |
 
 ## Kernel interop
 

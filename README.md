@@ -88,7 +88,7 @@ GLOBAL OPTIONS:
 fuse.briefs
 -----------
 
-A FUSE bridge for BrieFS so you can mount BrieFS volumes without the commitment of loading and/or battling with a kernel module. The FUSE bridge is **read-write** (full kernel parity) but **experimental**: it implements all directory and file operations (create, mkdir, unlink, rmdir, link, symlink, mknod, rename with renameat2 EXCHANGE/WHITEOUT), extended attributes (user/trusted/security), POSIX ACLs, fileattr/chattr (FS_IOC_GETFLAGS/SETFLAGS, FS_IOC_FSGETXATTR/FSSETXATTR), fallocate (all five modes: KEEP_SIZE preallocate with unwritten extents, PUNCH_HOLE, ZERO_RANGE, COLLAPSE_RANGE, INSERT_RANGE), FITRIM and FS_IOC_{GET,SET}FSLABEL, setattr (chmod/chown/utimes/truncate), and killpriv (suid/sgid + security.capability stripping). Like the kernel's `meta_shield`, it reserves B+ tree metadata for unwritten extents, so converting a preallocated block to written cannot ENOSPC on a full filesystem. It also ports the kernel journal write path to Go and replays the journal on mount, making FUSE-written volumes crash-consistent and recoverable (a crashed/dirty volume remounts with the same consistency the kernel module provides) and kernel-mountable. However, it has not yet been tested across the full xfstests suite — see the `xfstests-fuse-status.md` document for the current pass/fail record and known issues.
+A FUSE bridge for BrieFS so you can mount BrieFS volumes without the commitment of loading and/or battling with a kernel module. The FUSE bridge is **read-write** (full kernel parity) but **experimental**: it implements all directory and file operations (create, mkdir, unlink, rmdir, link, symlink, mknod, rename with renameat2 EXCHANGE/WHITEOUT), extended attributes (user/trusted/security), POSIX ACLs, fileattr/chattr (FS_IOC_GETFLAGS/SETFLAGS, FS_IOC_FSGETXATTR/FSSETXATTR), fallocate (all five modes: KEEP_SIZE preallocate with unwritten extents, PUNCH_HOLE, ZERO_RANGE, COLLAPSE_RANGE, INSERT_RANGE), FITRIM and FS_IOC_{GET,SET}FSLABEL, setattr (chmod/chown/utimes/truncate), and killpriv (suid/sgid + security.capability stripping). Like the kernel's `meta_shield`, it reserves B+ tree metadata for unwritten extents, so converting a preallocated block to written cannot ENOSPC on a full filesystem. It also ports the kernel journal write path to Go and replays the journal on mount, making FUSE-written volumes crash-consistent and recoverable (a crashed/dirty volume remounts with the same consistency the kernel module provides) and kernel-mountable. It has been validated across the full generic xfstests suite (793 tests; latest run 2026-09-15: 328 PASS / 32 FAIL / 0 HANG, every residual failure triaged) — see the `xfstests-fuse-status.md` document for the pass/fail record and known issues.
 
 ### Mounting with `mount -t fuse.briefs`
 
@@ -125,11 +125,12 @@ DESCRIPTION:
    Mount a BrieFS filesystem image as a FUSE filesystem.  The bridge is read-write with full kernel parity: all directory and file operations, extended attributes, chattr/fileattr, renameat2 (EXCHANGE/WHITEOUT), fallocate, setattr, and killpriv.  It ports the kernel journal to Go and replays it on mount, so FUSE-written volumes are crash-consistent and kernel-mountable.  The bridge is experimental; see xfstests-fuse-status.md for the xfstests pass/fail record.
 
 GLOBAL OPTIONS:
-   --image string, -i string       filesystem image file or block device
-   --mountpoint string, -m string  mount point directory
-   --debug, -d                     enable FUSE debug output
-   --help, -h                      show help
-   --version, -v                   print the version
+   --image string, -i string                    filesystem image file or block device
+   --mountpoint string, -m string               mount point directory
+   --debug, -d                                  enable FUSE debug output
+   --mount-opts mount -t fuse.briefs -o <opts>  comma-separated mount options to apply to the FUSE mount (as forwarded by mount.fuse.briefs from mount -t fuse.briefs -o <opts>); [no]suid/[no]dev/[no]exec override the kernel-parity defaults, anything unrecognized is passed to the kernel mount, which rejects it
+   --help, -h                                   show help
+   --version, -v                                print the version
 ```
 
 On-disk format codegen
