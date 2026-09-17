@@ -203,7 +203,20 @@ func (b *BrieFS) writeFileData(ctx context.Context, ino uint64, data []byte, off
 	if len(data) == 0 {
 		return 0, nil
 	}
-	if b.frozen() {
+	if b.shutdown {
+		// Post-shutdown data writes fail EIO, not EROFS: this path is
+		// reachable from page writeback (the mmap-dirty flush fsync
+		// triggers), where the kernel's writepages check returns early
+		// -EIO (generic/623, the xfs_io mmap+shutdown test). The kernel
+		// module's EROFS for a plain post-shutdown write comes from the
+		// VFS SB_RDONLY check, which never reaches the filesystem — and
+		// the FUSE write request cannot reach the daemon's eye either,
+		// write_flags is dropped by go-fuse's fs API — so the
+		// fs-level contract is the one reproduced here. The
+		// journal-failure freeze below keeps EROFS.
+		return 0, syscall.EIO
+	}
+	if b.readOnly {
 		return 0, syscall.EROFS
 	}
 	// Lock the file's inode-table block for the whole op. The direct inode RMW

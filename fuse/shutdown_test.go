@@ -123,6 +123,22 @@ func TestShutdownRefusals(t *testing.T) {
 	if errno := n.Fsync(context.Background(), nil, 0); errno != syscall.EIO {
 		t.Fatalf("Fsync after shutdown: got %v, want EIO", errno)
 	}
+	// Data writes fail EIO, not EROFS: the path is reachable from page
+	// writeback (the mmap-dirty flush inside fsync), where the kernel's
+	// writepages check returns early -EIO (generic/623). The EROFS a plain
+	// kernel write gets is the VFS SB_RDONLY check, which never reaches the
+	// filesystem and cannot be distinguished in the FUSE write request.
+	if _, err := b.writeFileData(context.Background(), f.InodeNumber, make([]byte, 8), 0); err != syscall.EIO {
+		t.Fatalf("write after shutdown: got %v, want EIO", err)
+	}
+	// The journal-failure freeze keeps EROFS (failWrite's contract). A
+	// separate bridge: shutdown and readOnly are different freezes, and
+	// the shutdown one wins the gate order above.
+	b3 := openBridge(t, mkfsImage(t, mkfs, 5000))
+	b3.readOnly = true
+	if _, err := b3.writeFileData(context.Background(), 3, make([]byte, 8), 0); err != syscall.EROFS {
+		t.Fatalf("write after journal failure: got %v, want EROFS", err)
+	}
 }
 
 // TestShutdownLogflushReplay is the generic/052 shape: create a file,
