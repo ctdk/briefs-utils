@@ -8,10 +8,12 @@ ports the kernel journal write path + journal-replay-on-mount to Go, making a
 FUSE-written volume crash-consistent, recoverable, and kernel-mountable.
 
 This document records the xfstests status for the FUSE-mounted BrieFS as of
-2026-09-15 — the close of the 09-06→09-14 campaign series, which took the
+2026-09-20 — the close of the 09-06→09-14 campaign series, which took the
 full generic suite from 188 PASS / 110 FAIL / 63 HANG to
-328 / 32 / 0, plus the 2026-09-15 re-validation of the 18-commit
-re-review refactor series at byte-identical per-test status
+328 / 32 / 0, the 2026-09-15 re-validation of the 18-commit
+re-review refactor series at byte-identical per-test status, and the
+09-16→09-20 forced-shutdown campaign (`XFS_IOC_GOINGDOWN`) which ended at
+349 / 33 / 0 with zero regressions
 (see "Current status").
 
 > **Correction history — two harness bugs, two invalid records.**
@@ -39,10 +41,10 @@ re-review refactor series at byte-identical per-test status
 > kernel module **removed** so any residual kernel mount fails loudly instead
 > of silently succeeding.
 
-## Current status (2026-09-15)
+## Current status (2026-09-20)
 
 Full generic suite (793 tests, kernel module removed, one mkfs/mount per
-test via the wrappers). The four most recent full runs:
+test via the wrappers). The seven most recent full runs:
 
 | Run | PASS | FAIL | NOT RUN | SKIP | HANG |
 |-----|-----:|-----:|--------:|-----:|-----:|
@@ -50,30 +52,44 @@ test via the wrappers). The four most recent full runs:
 | 20260913-201548 (Family 1 fixed) | 327 | 33 | 431 | 2 | 0 |
 | 20260914-021234 (closing run, `-o` plumbing fixed) | **328** | **32** | 431 | 2 | **0** |
 | 20260915-212640 (re-review refactor series a24c72d re-validated) | **328** | **32** | 431 | 2 | **0** |
+| 20260916-192804 (forced shutdown @69a4dfe) | 346 | 35 | 410 | 2 | 0 |
+| 20260917-012004 (post-shutdown write-errno fix @855fb23) | 347 | 34 | 410 | 2 | 0 |
+| 20260920-185047 (final pre-push closing run, @855fb23) | **349** | **33** | 409 | 2 | **0** |
 
-- **NOT RUN 431** is a constant set across all three runs (430 in the
-  2026-09-07 first honest run) — tests whose prerequisites the FUSE
-  harness cannot meet (fiemap, exchange-range, O_TMPFILE, quota, dax, …).
+- **NOT RUN 431** through 09-15 (430 in the 2026-09-07 first honest
+  run) — tests whose prerequisites the FUSE harness cannot meet (fiemap,
+  exchange-range, O_TMPFILE, quota, dax, …). The shutdown campaign made
+  21 of them runnable (godown/shutdown-dependent tests), taking NOT RUN
+  to 410; generic/081 flipped at the 09-20 closing run for 409.
 - **SKIP (2)**: generic/475 (dm-error soak wedge — see Known issues) and
   generic/492.
 - Closing run vs baseline: 27 FAIL→PASS (the 20 Family-1 tests plus
   126 237 294 317 318 452 547), 476 HANG→PASS, and **zero PASS→FAIL
-  regressions** — the campaign's acceptance criterion.
+  regressions** — the campaign's acceptance criterion. The shutdown
+  campaign (09-16, `XFS_IOC_GOINGDOWN` via FUSE_IOCTL, plus the
+  post-shutdown EIO write-errno fix) held that standard: the per-test
+  diff vs the 09-15 baseline was exactly the 21-test shutdown set plus
+  the two new known gaps (622, 705), zero regressions elsewhere; the
+  09-20 closing run added only improvements (081 NOT RUN→PASS,
+  108 FAIL→PASS, both dm-error-path tests with nondeterministic dm
+  setup and no bridge change between runs).
 
-### The 32 remaining FAILs
+### The 33 remaining FAILs
 
-All 32 were failing at the 2026-09-12 baseline and are untouched by the
-Family-1 campaign — previously triaged residue, no new failures:
+31 were failing at the 2026-09-12 baseline and are untouched by the
+campaigns — previously triaged residue — plus two new known
+shutdown-set gaps (622, 705):
 
 ```
-003 026 079 099 108 184 192 213 250 252 285 306 319 423 424 426
-434 441 467 477 484 500 504 512 520 537 563 589 631 732 741 756
+003 026 079 099 184 192 213 250 252 285 306 319 423 424 426
+434 441 467 477 484 500 504 512 520 537 563 589 622 631 705
+732 741 756
 ```
 
 Known characterizations:
 
-- **003** — atime never updated on read (open bridge gap; see Known
-  issues).
+- **003, 622** — atime never updated (open bridge gap; see Known
+  issues; 622 is the same in-memory atime family).
 - **250, 252** — DIO stress shapes that the kernel module passes and the
   bridge does not.
 - **520** — `sync(2)` is a structural no-op on a non-fuseblk FUSE mount
@@ -81,6 +97,11 @@ Known characterizations:
 - **563** — cgroup writeback; the kernel module also accepts this failure
   (`SB_I_CGROUPWB` dropped for the 6.12 CVE-2026-31703 iput race).
 - **537** — the ro/dax mount-option family.
+- **705** — FIEMAP is not bridge-addressable on the 6.12 FUSE client
+  (VFS intercepts, EOPNOTSUPP before FUSE), and `filefrag -v` silently
+  reports "0 extents found" (rc 0) for any bridge file, so its extent
+  check is unaddressable — the failure looks like extent loss but is
+  not.
 
 ### Family 1 — permission/setid/privilege tests (closed 2026-09-13)
 
@@ -549,6 +570,6 @@ The FUSE bridge implements all BrieFS operations at full kernel parity
 
 | Repo | Branch | Role |
 |------|--------|------|
-| `~/src/briefs` (kernel) | `bu-refactor-1` | Kernel module + xfstests wrappers (`tests/xfstests/fuse-briefs-*`, `run-suite.sh`, `run-fuse-subset.sh`), campaign record + run archives (`tests/xfstests/xfstests-fuse-status.md`, `runs/`) |
-| `~/go/src/github.com/ctdk/briefs-utils` | `bu-refactor-1` | Go FUSE bridge (`cmd/fuse`), mkfs (`cmd/mkfs`), fsck (`cmd/fsck`), shared format (`briefs/`), `mount.fuse.briefs` helper (current dev branch; the read-write bridge work is in `master`) |
+| `~/src/briefs` (kernel) | `briefs-compat` | Kernel module + xfstests wrappers (`tests/xfstests/fuse-briefs-*`, `run-suite.sh`, `run-fuse-subset.sh`), campaign record + run archives (`tests/xfstests/xfstests-fuse-status.md`, `runs/`) |
+| `~/go/src/github.com/ctdk/briefs-utils` | `briefs-compat` | Go FUSE bridge (`cmd/fuse`), mkfs (`cmd/mkfs`), fsck (`cmd/fsck`), shared format (`briefs/`), `mount.fuse.briefs` helper (the consolidated dev branch: the refactor series and the forced-shutdown work are both in its history; `master` is the last pushed state) |
 | `~/src/xfstests-dev` | — | xfstests source + configs (`configs/briefs-fuse.config`), `common/rc` + `common/config` FUSE harness fixes |
