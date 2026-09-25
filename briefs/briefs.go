@@ -167,10 +167,15 @@ const (
 	// const at least helps keep the magic numbers down.
 	BrieFSVolLabelLen = 64
 
-	// BrieFS version numbers for this version of briefs-utils
+	// BrieFS version numbers for this version of briefs-utils.
+	// Keep in lockstep with the same three numbers in the kernel
+	// module's briefs.h (_BRIEFS_MAJOR_VER etc.): mkfs stamps them
+	// into the superblock, and only the minor is enforced anywhere
+	// (ReadSuperblock here, the mount gate in the kernel) -- the
+	// major and patch are declaration-only.
 	BrieFSMajorVersion = 0
 	BrieFSMinorVersion = 9
-	BrieFSPatchVersion = 6
+	BrieFSPatchVersion = 7
 
 	// feature_incompat bits (superblock FeatIncompat field). A clean break gates
 	// the on-disk format: mkfs sets the bits for the features it writes;
