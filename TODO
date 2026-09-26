@@ -1,41 +1,4 @@
 * Add more filesystem options to mkfs.briefs as they become available.
-* [Done] Make man pages.  Each command has a hidden --generate-man-page
-  flag (wired through urfave/cli-docs/v3) that writes a section-8 man page
-  to man/man8/<name>.8; `make man` regenerates all three.
-* [Done] The codebase was feeling a bit hairy, so it got another round of
-  refactoring: the bu-refactor-1 branch (27 commits, not yet merged) deduplicated
-  the trie/btree/journal/xattr walkers into shared briefs helpers, wired up
-  fsck --verbose, removed the dead code, fixed the fsck scan hot spots, ported
-  the kernel's replay generation guards and trie sibling-chain caps, and closed
-  the FUSE feature gaps (all five fallocate modes, POSIX ACLs, FITRIM/FSLABEL
-  ioctls, the unwritten-extent metadata reserve).
-* [Done] The FUSE bridge is read-write: full kernel parity
-  (all dir/file ops, xattrs, ACLs, fileattr/chattr, renameat2, fallocate/
-  setattr/killpriv), Go journal port, per-inode-block locking. Still
-  experimental — see xfstests-fuse-status.md for the xfstests pass/fail
-  record and known issues.
-* [Done] The FUSE bridge should support the same mount options as the kernel
-  module. `mount.fuse.briefs` forwards `-o <opts>` to the daemon via
-  `--mount-opts`; [no]suid/[no]dev/[no]exec override the kernel-parity
-  defaults and unrecognized options reach the kernel mount, which rejects
-  them (9bd009c; remount and bind/make-* forms pass through verbatim,
-  055081e). Validated by generic/128, 361 and 696.
-* [Done] Expand xfstests coverage for BrieFS under FUSE: broadened to the
-  full generic group — 793 tests, one mkfs/mount per test through the FUSE
-  wrappers, run archives in the briefs repo's tests/xfstests/runs/. Latest
-  record 328 PASS / 32 FAIL / 0 HANG (run-20260914-021234), re-validated
-  byte-identical per-test at the 2026-09-15 re-review HEAD
-  (run-20260915-212640); every residual failure is triaged in
-  xfstests-fuse-status.md. (The 2026-08-06 subset records were invalid —
-  the harness was mounting via the kernel module; see the correction note
-  in xfstests-fuse-status.md.)
-* [Done] Forced shutdown: XFS_IOC_GOINGDOWN (== BRIEFS_IOC_GOINGDOWN) rides
-  FUSE_IOCTL to the daemon; the bridge ports the kernel's briefs_shutdown
-  (LOGFLUSH/NOLOGFLUSH/DEFAULT flags, CAP_SYS_ADMIN, idempotent, post-
-  shutdown EROFS mutations and EIO reads/fsync, checkpoint-skipping
-  unmount). The flags word is recovered from the caller's memory at
-  IoctlIn.Arg via /proc/<pid>/mem because restricted ioctl mode copies
-  no input for _IOR commands.
 * Implement the remaining ioctls in the FUSE bridge: the file-range
   exchange ioctls (XFS_IOC_EXCHANGE_RANGE/SWAP_RANGE and COMMIT_RANGE —
   a ~500-line two-inode port of the kernel's briefs_do_exchange;
@@ -47,14 +10,6 @@
   would cap the restricted-mode transfer at _IOC_SIZE(cmd) = 32 bytes,
   the struct fiemap header alone. generic/032 stays NOT RUN, same
   blocker class as O_TMPFILE.
-* [Done] Port the kernel's replay trie-block reuse pool + per-directory
-  partial-pool seeding (briefs_trie_seed_pool) into the FUSE replay, so
-  crash-replay on a near-full filesystem reuses JRN_TRIE_ALLOC blocks
-  instead of allocating fresh ones (avoids orphan trie blocks / -ENOSPC;
-  matches the kernel's generic/475 full-fs behaviour). Landed as 01734ab
-  (trieSeedPool at first DIR_UPDATE touch + replayTrieBlocks LIFO pop;
-  generic/073 fixed).
 * [Done for xfstests] mkfs.briefs and fsck.briefs command line flags are
   sufficiently xfstests-compatible (force flag `-f`, check-only default,
   `-r -y` repair shape). Further standards alignment may be useful.
-* [Done] Make journal size configurable.
