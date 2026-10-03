@@ -33,6 +33,35 @@ func stderrIsTerminal() bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
+// fsSignature is one foreign-filesystem superblock magic that lives
+// outside the first block, where the block-0 nonzero probe cannot see
+// it.
+type fsSignature struct {
+	name  string
+	off   int64
+	magic string
+}
+
+// offBlockSignatures lists the filesystems whose primary superblock is
+// not written into the first 4KiB of the device: btrfs puts its
+// superblock copy 0 at 64KiB and writes nothing at LBA 0, jfs at 32KiB,
+// the reiserfs family just above 64KiB, and UDF's anchor volume
+// descriptor at sector 256.  Everything else commonly found on a disk
+// (xfs, ext2/3/4, minix, cramfs, vfat, ntfs, swap, GPT) keeps its
+// signature inside the first block, so the block-0 nonzero check below
+// already refuses those.
+var offBlockSignatures = []fsSignature{
+	{"jfs", 0x8000, "JFS1"},
+	{"udf", 0x8008, "NSR02"},
+	{"udf", 0x8008, "NSR03"},
+	{"udf", 0x8008, "BEA01"},
+	{"reiser4", 0x10010, "ReIsEr4"},
+	{"reiserfs", 0x10020, "ReIsErFs"},
+	{"reiserfs", 0x10020, "ReIsEr2Fs"},
+	{"reiserfs", 0x10020, "ReIsEr3Fs"},
+	{"btrfs", 0x10040, "_BHRfS_M"},
+}
+
 func main() {
 	app := &cli.Command{
 		Name:     "mkfs.briefs",
@@ -331,12 +360,14 @@ func main() {
 			// --- Refuse to overwrite an existing filesystem unless forced ---
 			// mkfs.briefs must not silently clobber a device that already
 			// holds a filesystem (its own or a foreign one); xfstests
-			// generic/740 checks exactly this.  A fresh device reads back as
-			// all zeros, while every filesystem writes a non-zero superblock
-			// into block 0.  os.Create() truncates regular files (so they
-			// read back zero and are always allowed), but block devices are
-			// not truncated, so an existing filesystem is detected and
-			// refused unless --force/-f was given.
+			// generic/740 checks exactly this.  A fresh device reads back
+			// as all zeros.  Two probes are needed: most filesystems write
+			// a non-zero superblock into block 0 (os.Create() truncates
+			// regular files, so those read back zero and are always
+			// allowed, but block devices are not truncated), and a few --
+			// btrfs and jfs among them -- place their primary superblock
+			// at 32KiB/64KiB and leave block 0 untouched, so their known
+			// magics are checked at their canonical offsets instead.
 			if !force {
 				first := make([]byte, blockSize)
 				n, err := file.ReadAt(first, 0)
@@ -352,6 +383,18 @@ func main() {
 				}
 				if nonzero {
 					return fmt.Errorf("%s already contains a filesystem or data; use --force/-f to overwrite", path)
+				}
+				for _, sig := range offBlockSignatures {
+					buf := make([]byte, len(sig.magic))
+					if _, err := file.ReadAt(buf, sig.off); err != nil {
+						if err == io.EOF {
+							continue // device smaller than the probe offset
+						}
+						return fmt.Errorf("read %s signature at offset %d: %w", sig.name, sig.off, err)
+					}
+					if string(buf) == sig.magic {
+						return fmt.Errorf("%s already contains a %s filesystem; use --force/-f to overwrite", path, sig.name)
+					}
 				}
 			}
 
