@@ -332,6 +332,14 @@ var offDirTrieRoot = inodeFieldOffset(func(in *briefs.Inode) {
 	in.DirTrieRoot = 0xdeadbeefcafebabe
 })
 
+// offSnapshotSeq is the byte offset of the snapshot_seq materialization
+// stamp within the on-disk inode (448 on the current layout; kernel commit
+// "inode: add the snapshot_seq materialization stamp").  Replay reads it
+// directly from raw snapshots to order INODE_FULL records against slots.
+var offSnapshotSeq = inodeFieldOffset(func(in *briefs.Inode) {
+	in.SnapshotSeq = 0xdeadbeefcafebabe
+})
+
 // xattrRecNextBlock extracts the next_block pointer from a JRN_XATTR_DATA
 // content record's block bytes via the shared header codec. v1 blocks have no
 // next pointer (the codec reads it as 0); a block whose header does not
@@ -519,6 +527,23 @@ func (b *BrieFS) replayInodeFull(ino uint64, data []byte) error {
 	if snapGen != slotGen {
 		rlog("  inode-full ino=%d skipped: stale snapshot (snap gen %d != slot gen %d)", ino, snapGen, slotGen)
 		return nil
+	}
+	// Snapshot-sequence guard (kernel journal_replay.c): refuse an older
+	// snapshot against a slot whose content is newer.  The kernel stamps
+	// every journal capture and slot persist with a strictly-increasing
+	// per-inode version carried inside the image, and replay orders by it
+	// instead of window order.  A ZERO stamp is unversioned and always
+	// applies: this bridge and pre-stamp kernels write zero stamps, and
+	// ordering them below kernel-stamped slots would drop FUSE-side
+	// updates on a kernel replay of a mixed image.
+	if len(raw) >= int(offSnapshotSeq)+8 &&
+		offSnapshotSeq+8 <= b.inodes.sb.InodeSize {
+		snapSeq := binary.LittleEndian.Uint64(raw[offSnapshotSeq:])
+		slotSeq := binary.LittleEndian.Uint64(buf[off+offSnapshotSeq:])
+		if snapSeq != 0 && snapSeq < slotSeq {
+			rlog("  inode-full ino=%d skipped: older snapshot (snap seq %d < slot seq %d)", ino, snapSeq, slotSeq)
+			return nil
+		}
 	}
 	copy(buf[off:off+512], raw)
 	b.saveBlock(blk, buf)

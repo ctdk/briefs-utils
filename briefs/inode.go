@@ -44,7 +44,18 @@ type Inode struct {
 	Rdev             uint64
 	Generation       uint64 // inode generation for stable NFS file handles
 	UserFlags        uint32
-	Reserved         [68]byte
+	// _Pad1 mirrors the on-disk pad: it keeps SnapshotSeq 8-aligned at
+	// offset 448 inside the old 68-byte reserved area, so UserFlags
+	// keeps its original offset 440 and every pre-existing field keeps
+	// its on-disk position (old images read zeros here).
+	_Pad1            uint32
+	// SnapshotSeq is the materialization stamp: a strictly increasing
+	// per-inode version issued at every journal capture and every
+	// direct-slot persist (kernel briefs_snapshot_disk_inode /
+	// briefs_persist_disk_inode).  Replay orders INODE_FULL records by
+	// it.  Zero on images written by older kernels and on fresh mkfs.
+	SnapshotSeq      uint64
+	Reserved         [56]byte
 }
 
 // InlineData returns the 256-byte raw inline data region of the inode.
